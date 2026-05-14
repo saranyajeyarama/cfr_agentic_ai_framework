@@ -4,14 +4,12 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently --names \"API,UI\" --prefix-colors \"cyan,magenta\" \"node server.js\" \"vite\"",
-    "dev:ui": "vite",
-    "dev:api": "node server.js",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
-  },
+  "dev": "vite --port=3000 --host=0.0.0.0",
+  "build": "vite build",
+  "start": "node server.js",
+  "clean": "rm -rf dist",
+  "lint": "tsc --noEmit"
+	},
   "dependencies": {
     "@anthropic-ai/sdk": "^0.96.0",
     "@google/genai": "^1.29.0",
