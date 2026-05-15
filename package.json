@@ -4,11 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently --names \"API,UI\" --prefix-colors \"cyan,magenta\" \"node server.js\" \"vite\"",
-    "dev:ui": "vite",
-    "dev:api": "node server.js",
+    "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
-    "preview": "vite preview",
+    "start": "node server.js",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
