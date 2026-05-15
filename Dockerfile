@@ -1,17 +1,26 @@
-FROM node:20-bullseye
+FROM node:22-bullseye AS builder
 
 WORKDIR /app
 
 COPY package*.json ./
-
-RUN rm -rf node_modules package-lock.json && \
-    npm install --legacy-peer-deps
+RUN npm install --legacy-peer-deps
 
 COPY . .
 
 ENV TAILWIND_DISABLE_OXIDE=1
-
 RUN npm run build
+RUN npm prune --omit=dev --legacy-peer-deps
+
+FROM node:22-bullseye AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server.js ./server.js
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package*.json ./
 
 EXPOSE 8080
 
