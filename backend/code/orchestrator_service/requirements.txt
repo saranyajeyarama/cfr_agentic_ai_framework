@@ -1,0 +1,33 @@
+# Tiger Foods Customer Supply Agentic AI — orchestrator (v2.02b)
+#
+# Conflict-free against google-adk 1.0.0. Resolved + dry-run verified:
+# pip installs this set with zero dependency conflicts.
+#
+# IMPORTANT — do not re-pin the Google Cloud libraries that google-adk
+# governs (aiplatform, secret-manager, speech, storage, genai). ADK 1.0.0
+# requires aiplatform>=1.87.0, secret-manager>=2.22.0, uvicorn>=0.34.0,
+# fastapi>=0.115.0. Pinning those below ADK's floor is what caused the
+# v2.02.0 build failure. Let ADK pull its own compatible versions.
+#
+# vertexai (used by the /chat route) ships INSIDE google-cloud-aiplatform,
+# which google-adk installs — no separate pin needed.
+
+# Web framework — versions at/above ADK's floor
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+pydantic==2.11.3
+
+# Vertex AI Agent Development Kit — this drives the google-cloud-*
+# versions (aiplatform, secret-manager, speech, storage, genai, etc.)
+google-adk==1.0.0
+
+# Data libraries ADK does not constrain — safe to pin
+google-cloud-bigquery==3.31.0
+google-cloud-firestore==2.20.1
+
+# Runtime dependency google-adk imports but does not declare. Without
+# this the container builds fine but crashes on first ADK import.
+deprecated==1.2.18
+
+# Utilities
+python-dateutil==2.9.0.post0

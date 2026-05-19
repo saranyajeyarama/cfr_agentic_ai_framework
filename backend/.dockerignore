@@ -1,0 +1,27 @@
+# Credentials — MUST NEVER enter the image
+code/orchestrator_service/tiger-agents-sa-key.json
+*-sa-key.json
+*.json.key
+*-key.json
+
+# Python bytecache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Documentation / reference — not needed in image
+briefs/
+reference/
+
+# Local dev scripts and infra
+infra/
+run_local.sh
+README.md
+
+# Git
+.git
+.gitignore
+
+# Environment files
+.env*
