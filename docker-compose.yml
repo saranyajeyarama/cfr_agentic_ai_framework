@@ -37,6 +37,19 @@ services:
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/sa-key.json
       GOOGLE_GENAI_USE_VERTEXAI: "1"
       OTEL_SDK_DISABLED: "true"
+      # Cap concurrent agent runs across the whole process. 1 = strictest
+      # (full serialization across sessions). 3 = ~3 sessions can run
+      # their current agent in parallel without OOM under typical RAM.
+      AGENT_CONCURRENCY: "1"
+      # Tool result row cap. ADK keeps every tool response in session
+      # memory; capping keeps the per-agent footprint bounded.
+      TOOL_ROW_CAP: "50"
+    # Memory budget. Docker Desktop on WSL2 by default lets containers
+    # use most of the VM's RAM; under cumulative agent load that has
+    # OOM-killed this container. 4 GiB is generous for the agent flow
+    # and leaves room for the frontend + the WSL host.
+    mem_limit: 4g
+    mem_reservation: 1g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

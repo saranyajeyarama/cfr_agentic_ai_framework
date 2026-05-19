@@ -16,6 +16,65 @@ type HealthStatus = {
   providerName?: string;
 };
 
+// ─── Markdown formatter ──────────────────────────────────────────────────────
+// Gemini returns markdown; the seed/error messages are already HTML. We render
+// markdown → HTML for plain markdown messages, and pass HTML through unchanged.
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function applyInline(s: string): string {
+  return escapeHtml(s)
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`\n]+)`/g, '<code class="bg-slate-200 px-1 rounded font-mono text-[10px] text-slate-800">$1</code>')
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+}
+
+function formatMessage(text: string): string {
+  // Messages authored as HTML (the seed greeting, error hints) pass through.
+  if (/<(span|div|code|strong|em|p|br|ul|ol|li)\b/i.test(text)) return text;
+
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const out: string[] = [];
+  let listKind: 'ul' | 'ol' | null = null;
+
+  const closeList = () => {
+    if (listKind) {
+      out.push(`</${listKind}>`);
+      listKind = null;
+    }
+  };
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    const bullet = line.match(/^\s*[-*]\s+(.*)/);
+    const numbered = line.match(/^\s*\d+\.\s+(.*)/);
+    const heading = line.match(/^(#{1,4})\s+(.*)/);
+
+    if (bullet) {
+      if (listKind !== 'ul') { closeList(); out.push('<ul class="list-disc pl-4 my-1 space-y-0.5">'); listKind = 'ul'; }
+      out.push(`<li>${applyInline(bullet[1])}</li>`);
+    } else if (numbered) {
+      if (listKind !== 'ol') { closeList(); out.push('<ol class="list-decimal pl-4 my-1 space-y-0.5">'); listKind = 'ol'; }
+      out.push(`<li>${applyInline(numbered[1])}</li>`);
+    } else if (heading) {
+      closeList();
+      out.push(`<div class="font-bold text-slate-800 mt-2 mb-0.5">${applyInline(heading[2])}</div>`);
+    } else if (line.trim() === '') {
+      closeList();
+    } else {
+      closeList();
+      out.push(`<p class="my-1">${applyInline(line)}</p>`);
+    }
+  }
+  closeList();
+  return out.join('');
+}
+
 // ─── System Prompt ────────────────────────────────────────────────────────────
 
 function buildSystemPrompt(data: DashboardData): string {
@@ -214,12 +273,12 @@ export function RightSidebar({ data }: { data: DashboardData }) {
             <div className={`space-y-1 w-full flex flex-col ${message.role === 'user' ? 'items-end' : 'items-start'}`}>
               <div
                 className={cn(
-                  'p-3 text-xs leading-relaxed',
+                  'p-3 text-xs leading-relaxed prose-sm max-w-none [&_strong]:font-semibold [&_strong]:text-slate-900',
                   message.role === 'agent'
                     ? 'bg-slate-100 rounded-tr-xl rounded-bl-xl rounded-br-xl text-slate-700'
-                    : 'bg-[#DB033B] rounded-tl-xl rounded-bl-xl rounded-br-xl text-white'
+                    : 'bg-[#DB033B] rounded-tl-xl rounded-bl-xl rounded-br-xl text-white [&_strong]:text-white'
                 )}
-                dangerouslySetInnerHTML={{ __html: message.text }}
+                dangerouslySetInnerHTML={{ __html: formatMessage(message.text) }}
               />
             </div>
           </div>

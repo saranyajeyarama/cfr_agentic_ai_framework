@@ -26,7 +26,11 @@ REGION="${REGION:-us-central1}"
 REPO="${REPO:-tiger-agents}"
 TAG="${TAG:-latest}"
 BACKEND_SA="tiger-agents-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+# Provider matches the local docker-compose stack (Vertex AI Gemini).
+AI_PROVIDER="${AI_PROVIDER:-gemini}"
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+AGENT_CONCURRENCY="${AGENT_CONCURRENCY:-1}"
+TOOL_ROW_CAP="${TOOL_ROW_CAP:-50}"
 
 REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}"
 BACKEND_IMAGE="${REGISTRY}/orchestrator:${TAG}"
@@ -58,21 +62,39 @@ echo "[2/5] Pushing frontend image..."
 docker push "${FRONTEND_IMAGE}"
 
 # ── Step 3: Deploy backend (private) ──────────────────────────────────────────
-echo "[3/5] Deploying backend Cloud Run service (private)..."
+# Env vars match the local docker-compose stack so behavior is consistent.
+# Vertex AI Gemini is the default; switch to Claude by setting
+# AI_PROVIDER=claude (and exporting ANTHROPIC_API_KEY) on the host.
+BACKEND_ENV="PROJECT_ID=${PROJECT_ID}"
+BACKEND_ENV="${BACKEND_ENV},GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
+BACKEND_ENV="${BACKEND_ENV},GOOGLE_CLOUD_LOCATION=${REGION}"
+BACKEND_ENV="${BACKEND_ENV},REGION=${REGION}"
+BACKEND_ENV="${BACKEND_ENV},PROMPTS_DIR=/app/agents"
+BACKEND_ENV="${BACKEND_ENV},AI_PROVIDER=${AI_PROVIDER}"
+BACKEND_ENV="${BACKEND_ENV},GOOGLE_GENAI_USE_VERTEXAI=1"
+BACKEND_ENV="${BACKEND_ENV},OTEL_SDK_DISABLED=true"
+BACKEND_ENV="${BACKEND_ENV},AGENT_CONCURRENCY=${AGENT_CONCURRENCY}"
+BACKEND_ENV="${BACKEND_ENV},TOOL_ROW_CAP=${TOOL_ROW_CAP}"
+if [[ -n "${ANTHROPIC_API_KEY}" ]]; then
+  BACKEND_ENV="${BACKEND_ENV},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+fi
+
+echo "[3/5] Deploying backend Cloud Run service (private, AI_PROVIDER=${AI_PROVIDER})..."
 gcloud run deploy "${BACKEND_SERVICE}" \
   --image="${BACKEND_IMAGE}" \
   --region="${REGION}" \
   --project="${PROJECT_ID}" \
   --platform=managed \
+  --service-account="${BACKEND_SA}" \
   --no-allow-unauthenticated \
   --port=8080 \
-  --memory=2Gi \
+  --memory=4Gi \
   --cpu=2 \
-  --timeout=300 \
-  --concurrency=80 \
+  --timeout=600 \
+  --concurrency=10 \
   --min-instances=0 \
   --max-instances=10 \
-  --set-env-vars="PROJECT_ID=${PROJECT_ID},PROMPTS_DIR=/app/agents,AI_PROVIDER=claude${ANTHROPIC_API_KEY:+,ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}}" \
+  --set-env-vars="${BACKEND_ENV}" \
   --clear-secrets \
   --quiet
 
@@ -96,7 +118,7 @@ gcloud run deploy "${FRONTEND_SERVICE}" \
   --port=8080 \
   --memory=512Mi \
   --cpu=1 \
-  --timeout=60 \
+  --timeout=600 \
   --concurrency=1000 \
   --min-instances=0 \
   --max-instances=5 \

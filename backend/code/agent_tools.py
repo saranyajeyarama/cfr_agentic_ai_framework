@@ -46,7 +46,7 @@ import json as _json
 import os
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
 from google.adk.tools import FunctionTool
@@ -66,13 +66,21 @@ DEMO_MATERIAL = os.environ.get("DEMO_MATERIAL")      # e.g. "MAT-..."
 _bq = bigquery.Client(project=PROJECT_ID)
 
 
+# Tool results are kept in the ADK session memory for the duration of the
+# agent run. Without a cap, large views (forecasts, demand drivers, etc.)
+# can push the container over its memory budget across all the tool calls
+# a multi-agent run makes. Cap row counts globally so the agent gets
+# representative context without ballooning RAM.
+_ROW_CAP = int(os.environ.get("TOOL_ROW_CAP", "100"))
+
+
 def _run_query(sql: str, params: list) -> list[dict]:
     """Single chokepoint to BigQuery. All read tools route through this so
     tool calls can be audited via the orchestrator's Firestore step writes.
-    Returns rows as a list of plain dicts (dates ISO-stringified)."""
+    Returns up to _ROW_CAP rows as a list of plain dicts (dates ISO-stringified)."""
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     job = _bq.query(sql, job_config=job_config)
-    rows = job.result()
+    rows = job.result(max_results=_ROW_CAP)
     out: list[dict] = []
     for r in rows:
         d = dict(r)
@@ -80,6 +88,8 @@ def _run_query(sql: str, params: list) -> list[dict]:
             if isinstance(v, (date, datetime)):
                 d[k] = v.isoformat()
         out.append(d)
+        if len(out) >= _ROW_CAP:
+            break
     return out
 
 
@@ -492,6 +502,7 @@ def get_otif_performance(
     sold_to: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    lookback_days: Optional[int] = None,
     group_by: Optional[Literal["customer", "carrier", "week"]] = None,
 ) -> dict:
     """OTIF performance from fct_otif, aggregated.
@@ -503,10 +514,14 @@ def get_otif_performance(
     Args:
         sold_to: SAP sold-to. None = all customers.
         start_date / end_date: ISO dates, inclusive. Default = current month.
+        lookback_days: alternative to start_date — N days back from today.
+            Overrides start_date if both are given.
         group_by: customer | carrier | week.
     """
     if group_by is None:
         group_by = "customer"
+    if lookback_days is not None and lookback_days > 0:
+        start_date = (date.today() - timedelta(days=int(lookback_days))).isoformat()
     where = ["ship_date_actual BETWEEN @start AND @end"]
     params = [
         _p("start", "DATE",
@@ -1242,14 +1257,14 @@ def get_forecast_accuracy(
         params.append(_p("matnr", "STRING", material_number))
         zrep_cte = f"""
           WITH zrep AS (
-            SELECT COALESCE(zrep_parent_material, material_number) AS zrep
+            SELECT COALESCE(zrep_parent_material, material_number) AS zrep_id
             FROM `{SEMANTIC_DS}.dim_material`
             WHERE material_number = @matnr
             LIMIT 1
           )
         """
         zrep_filter = ("AND fa.material_zrep_number = "
-                       "(SELECT zrep FROM zrep)")
+                       "(SELECT zrep_id FROM zrep)")
     else:
         zrep_cte = ""
         zrep_filter = ""
@@ -1459,43 +1474,80 @@ def dce_write(
 # BigQuery tool. dce_write is NOT bound to any agent — the orchestrator
 # calls it after human approval.
 # ===========================================================================
+import inspect as _inspect
+import functools as _functools
+
+
+def _tolerant(fn):
+    """Wrap a tool function so unknown kwargs are dropped (not raised).
+    Gemini occasionally hallucinates parameter names that look plausible
+    but don't exist on the actual function — without this wrapper, those
+    raise TypeError inside ADK and 500 the whole session. With it, we log
+    the unknown kwarg in the return value and call the function with what
+    we recognized.
+    """
+    sig = _inspect.signature(fn)
+    accepted = set(sig.parameters.keys())
+    accepts_var_kw = any(
+        p.kind is _inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+    @_functools.wraps(fn)
+    def wrapper(**kwargs):
+        if accepts_var_kw:
+            return fn(**kwargs)
+        recognized = {k: v for k, v in kwargs.items() if k in accepted}
+        ignored = sorted(set(kwargs) - accepted)
+        result = fn(**recognized) or {}
+        if ignored and isinstance(result, dict):
+            result.setdefault("_ignored_kwargs", ignored)
+        return result
+
+    return wrapper
+
+
+def _T(fn):
+    """FunctionTool wrapper that uses the kwarg-tolerant shim."""
+    return FunctionTool(func=_tolerant(fn))
+
+
 CUSTOMER_SUPPLY_TOOLS = [
-    FunctionTool(func=get_open_sales_orders),
-    FunctionTool(func=get_finished_goods_inventory),
-    FunctionTool(func=get_customer_compliance_rules),
-    FunctionTool(func=classify_order_vs_forecast),
-    FunctionTool(func=get_allocation_history),
+    _T(get_open_sales_orders),
+    _T(get_finished_goods_inventory),
+    _T(get_customer_compliance_rules),
+    _T(classify_order_vs_forecast),
+    _T(get_allocation_history),
 ]
 
 SUPPLY_PLANNING_TOOLS = [
-    FunctionTool(func=get_finished_goods_inventory),
-    FunctionTool(func=get_safety_stock_position),
-    FunctionTool(func=get_production_orders),
-    FunctionTool(func=get_raw_materials_status),
-    FunctionTool(func=get_procurement_orders),
-    FunctionTool(func=get_shelf_life_risk),
+    _T(get_finished_goods_inventory),
+    _T(get_safety_stock_position),
+    _T(get_production_orders),
+    _T(get_raw_materials_status),
+    _T(get_procurement_orders),
+    _T(get_shelf_life_risk),
 ]
 
 DEMAND_PLANNING_TOOLS = [
-    FunctionTool(func=get_order_history),
-    FunctionTool(func=classify_order_vs_forecast),
-    FunctionTool(func=get_forecast_accuracy),
-    FunctionTool(func=get_promotional_context),
+    _T(get_order_history),
+    _T(classify_order_vs_forecast),
+    _T(get_forecast_accuracy),
+    _T(get_promotional_context),
 ]
 
 TRANSPORTATION_TOOLS = [
-    FunctionTool(func=get_otif_performance),
-    FunctionTool(func=get_carrier_otp),
-    FunctionTool(func=get_lane_transit_profile),
-    FunctionTool(func=get_chargeback_risk),
-    FunctionTool(func=get_active_alerts),
+    _T(get_otif_performance),
+    _T(get_carrier_otp),
+    _T(get_lane_transit_profile),
+    _T(get_chargeback_risk),
+    _T(get_active_alerts),
 ]
 
 RETAIL_INTELLIGENCE_TOOLS = [
-    FunctionTool(func=get_consumer_takeaway),
-    FunctionTool(func=get_promotional_context),
-    FunctionTool(func=get_order_history),
-    FunctionTool(func=get_customer_compliance_rules),
+    _T(get_consumer_takeaway),
+    _T(get_promotional_context),
+    _T(get_order_history),
+    _T(get_customer_compliance_rules),
 ]
 
 # Registry — every callable tool by name (excludes dce_write by design).

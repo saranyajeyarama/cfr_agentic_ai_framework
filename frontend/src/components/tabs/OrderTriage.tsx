@@ -61,8 +61,6 @@ type AgentEvalState = {
   rec?: AgentRec;
 };
 
-const POLL_INTERVAL_MS = 4000;
-const MAX_POLL_ATTEMPTS = 25; // 25 × 4s = 100s timeout
 
 /**
  * Adapt a PO row to the shared startSession contract. The real SAP
@@ -102,88 +100,61 @@ export function OrderTriage({ data }: { data: DashboardData }) {
     };
   }, []);
 
-  const pollSession = useCallback((sessionId: string, poId: string, attempt = 0) => {
-    const run = async () => {
-      if (!isMounted.current) return;
-      if (attempt >= MAX_POLL_ATTEMPTS) {
-        setAgentEvals(prev => ({ ...prev, [poId]: { status: 'error', sessionId } }));
-        return;
-      }
-      try {
-        const res = await fetch(`/api/sessions/${sessionId}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const sess = await res.json();
-
-        if (sess.status === 'awaiting_approval' && sess.final_action_card) {
-          const card = sess.final_action_card;
-          const r = card.recommendation ?? {};
-          const chain = card.reasoning_chain ?? {};
-          if (isMounted.current) {
-            setAgentEvals(prev => ({
-              ...prev,
-              [poId]: {
-                status: 'done',
-                sessionId,
-                rec: {
-                  action: r.action ?? 'ACCEPT',
-                  fulfill_qty_cs: r.fulfill_qty_cs ?? 0,
-                  confidence: r.confidence ?? 0,
-                  expected_outcome: r.expected_outcome ?? '',
-                  key_trade_offs: chain.key_trade_offs ?? [],
-                  what_would_change: chain.what_would_change_the_decision ?? '',
-                },
-              },
-            }));
-          }
-          return;
-        }
-
-        if (sess.status === 'error') {
-          if (isMounted.current)
-            setAgentEvals(prev => ({ ...prev, [poId]: { status: 'error', sessionId } }));
-          return;
-        }
-
-        // Still running — schedule next poll
-        timeoutRefs.current[poId] = setTimeout(
-          () => pollSession(sessionId, poId, attempt + 1),
-          POLL_INTERVAL_MS,
-        );
-      } catch {
-        timeoutRefs.current[poId] = setTimeout(
-          () => pollSession(sessionId, poId, attempt + 1),
-          POLL_INTERVAL_MS,
-        );
-      }
-    };
-    run();
-  }, []);
 
   const startAgentEval = useCallback(async (po: PO) => {
     setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'evaluating' } }));
     try {
-      const res = await fetch('/api/sessions', {
+      // Synchronous flow: backend runs the 4 specialists + synthesizer
+      // inline and returns the completed session document in one response.
+      // No polling, no orphaned sessions. Request blocks ~60-180s.
+      const res = await fetch('/api/sessions/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildStartSessionRequest(poToOrder(po))),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const { session_id } = await res.json();
-      if (isMounted.current) {
-        setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'evaluating', sessionId: session_id } }));
-        pollSession(session_id, po.id);
+      const sess = await res.json();
+      if (!isMounted.current) return;
+
+      const card = sess.final_action_card;
+      if (!card) {
+        setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'error', sessionId: sess.session_id } }));
+        return;
       }
+      const r = card.recommendation ?? {};
+      const chain = card.reasoning_chain ?? {};
+      setAgentEvals(prev => ({
+        ...prev,
+        [po.id]: {
+          status: 'done',
+          sessionId: sess.session_id,
+          rec: {
+            action: r.action ?? 'ACCEPT',
+            fulfill_qty_cs: r.fulfill_qty_cs ?? 0,
+            confidence: r.confidence ?? 0,
+            expected_outcome: r.expected_outcome ?? '',
+            key_trade_offs: chain.key_trade_offs ?? [],
+            what_would_change: chain.what_would_change_the_decision ?? '',
+          },
+        },
+      }));
     } catch {
       if (isMounted.current)
         setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'error' } }));
     }
-  }, [pollSession]);
-
-  // Kick off agent evaluation for every PO on mount
-  useEffect(() => {
-    PURCHASE_ORDERS.forEach(po => startAgentEval(po));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Auto-evaluate only the currently selected PO. Firing one session per
+  // row on mount blasted the backend with ~20 simultaneous POST /sessions
+  // and OOM'd the container under sequential agent execution. Other POs
+  // can be evaluated on demand when the user opens them.
+  useEffect(() => {
+    if (!activePoId) return;
+    if (agentEvals[activePoId]) return;  // already started/done for this row
+    const po = PURCHASE_ORDERS.find(p => p.id === activePoId);
+    if (po) startAgentEval(po);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePoId]);
 
   const activePo = PURCHASE_ORDERS.find(po => po.id === activePoId) || PURCHASE_ORDERS[0];
   const activeEval = agentEvals[activePoId];
