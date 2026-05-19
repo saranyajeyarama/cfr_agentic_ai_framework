@@ -1,0 +1,129 @@
+# =============================================================================
+# Tiger Foods Agentic AI — Cloud Build CI/CD pipeline
+# =============================================================================
+# Builds backend + frontend in parallel, deploys backend first to get its URL,
+# then deploys frontend with BACKEND_URL wired in via env var.
+#
+# Submit manually:
+#   gcloud builds submit . --config=cloudbuild.yaml \
+#     --substitutions=_TAG=v2.0.0,_REGION=us-central1
+#
+# Or connect a Cloud Build trigger to the repository root.
+# =============================================================================
+
+substitutions:
+  _REGION: us-central1
+  _REPO: tiger-agents
+  _BACKEND_SERVICE: tiger-orchestrator
+  _FRONTEND_SERVICE: tiger-frontend
+  _BACKEND_SA: tiger-agents-sa@resilience-riskradar.iam.gserviceaccount.com
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+steps:
+
+  # ── 1. Build backend image ─────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build-backend
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/orchestrator:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/orchestrator:latest
+      - ./backend
+    waitFor: ['-']
+
+  # ── 2. Build frontend image ────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build-frontend
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:latest
+      - ./frontend
+    waitFor: ['-']
+
+  # ── 3. Push backend image ──────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push-backend
+    args: [push, --all-tags, ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/orchestrator]
+    waitFor: [build-backend]
+
+  # ── 4. Push frontend image ─────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push-frontend
+    args: [push, --all-tags, ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend]
+    waitFor: [build-frontend]
+
+  # ── 5. Deploy backend (private Cloud Run service) ─────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-backend
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_BACKEND_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/orchestrator:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --service-account=${_BACKEND_SA}
+      - --no-allow-unauthenticated
+      - --port=8080
+      - --memory=2Gi
+      - --cpu=2
+      - --timeout=300
+      - --concurrency=80
+      - --min-instances=0
+      - --max-instances=10
+      - --set-env-vars=PROJECT_ID=$PROJECT_ID,PROMPTS_DIR=/app/agents,AI_PROVIDER=claude
+      - --quiet
+    waitFor: [push-backend]
+
+  # ── 6. Capture backend URL into shared workspace ───────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: get-backend-url
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        BACKEND_URL=$(gcloud run services describe ${_BACKEND_SERVICE} \
+          --region=${_REGION} --project=$PROJECT_ID \
+          --format="value(status.url)")
+        echo "$$BACKEND_URL" > /workspace/backend_url.txt
+        echo "Backend URL: $$BACKEND_URL"
+    waitFor: [deploy-backend]
+
+  # ── 7. Deploy frontend (public Cloud Run service) ─────────────────────────
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-frontend
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        BACKEND_URL=$(cat /workspace/backend_url.txt)
+        gcloud run deploy ${_FRONTEND_SERVICE} \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:$SHORT_SHA \
+          --region=${_REGION} \
+          --platform=managed \
+          --allow-unauthenticated \
+          --port=8080 \
+          --memory=512Mi \
+          --cpu=1 \
+          --timeout=60 \
+          --concurrency=1000 \
+          --min-instances=0 \
+          --max-instances=5 \
+          --set-env-vars="BACKEND_URL=$$BACKEND_URL" \
+          --quiet
+    waitFor: [push-frontend, get-backend-url]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/orchestrator:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/orchestrator:latest
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/frontend:latest

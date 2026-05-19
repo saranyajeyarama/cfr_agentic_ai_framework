@@ -1,0 +1,60 @@
+# =============================================================================
+# Tiger Foods Agentic AI — local development
+# =============================================================================
+# Usage:
+#   docker compose up --build
+#
+# GCP service account key is mounted from:
+#   ./backend/resilience-riskradar-2c010597a83b.json
+# This authenticates Firestore, BigQuery, and Vertex AI (Gemini).
+# =============================================================================
+
+services:
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: tiger-orchestrator:local
+    ports:
+      - "8080:8080"
+    # WSL2 + Docker Desktop sometimes fails to inherit usable upstream DNS
+    # from the host (resolv.conf ends up with "ExtServers: [invalid IP]").
+    # Pin public resolvers so BigQuery / Firestore / Vertex calls can
+    # resolve googleapis.com from inside the container.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - ./backend/resilience-riskradar-2c010597a83b.json:/secrets/sa-key.json:ro
+    environment:
+      PROJECT_ID: resilience-riskradar
+      GOOGLE_CLOUD_PROJECT: resilience-riskradar
+      GOOGLE_CLOUD_LOCATION: us-central1
+      REGION: us-central1
+      PROMPTS_DIR: /app/agents
+      AI_PROVIDER: gemini
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/sa-key.json
+      GOOGLE_GENAI_USE_VERTEXAI: "1"
+      OTEL_SDK_DISABLED: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: tiger-frontend:local
+    ports:
+      - "3001:8080"
+    environment:
+      PORT: "8080"
+      # Docker Compose internal DNS — proxies /api/* to backend container
+      BACKEND_URL: http://backend:8080
+    depends_on:
+      backend:
+        condition: service_healthy
