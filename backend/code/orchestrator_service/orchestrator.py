@@ -1,0 +1,446 @@
+"""
+Tiger Foods Customer Supply agentic AI — orchestrator (v2.02b).
+
+STANDALONE. The complete 5-agent orchestration. Not a patch.
+
+Flow:
+  1. Trigger adapter resolves a CustomerOrderEvent (demo payload or EDI 850)
+  2. 4 specialists fire IN PARALLEL via asyncio.gather
+  3. Deterministic 3-rule conflict detection on the returned signals
+  4. Debate-on-conflict between disputant pairs (max 2 follow-up rounds)
+  5. Customer Supply Agent synthesizes the final recommendation
+  6. Recommendation parked in Firestore awaiting human approval
+  7. On approve/reject → dce_write into the real fct_allocation_decisions
+
+Conflict rules (deterministic Python, not LLM):
+  R1  any specialist returns hard_block=true
+  R2  two specialists return opposing dispositions (PROCEED vs BLOCK)
+  R3  confidence asymmetry: one >= 0.85 and another <= 0.50 on differing
+      dispositions
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+import traceback
+import uuid
+from typing import Any
+
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types as genai_types
+
+from agents import get_agent, SPECIALIST_AGENTS
+from agent_tools import CustomerOrderEvent, dce_write
+from firestore_client import StepWriter, update_session
+from schemas import CustomerSupplyDecision, Conflict
+
+
+MAX_DEBATE_ROUNDS = 2          # follow-up rounds AFTER the initial fan-out
+ORCHESTRATOR_VERSION = "v2.02b"
+AGENT_MODEL_VERSIONS = "gemini-2.5-pro,gemini-2.5-flash"
+
+# One shared ADK session service for the process. ADK requires a session
+# to be created on the service before Runner.run_async is called with it.
+_SESSION_SERVICE = InMemorySessionService()
+_ADK_USER_ID = "orchestrator"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _conf(signal: dict) -> float:
+    """Read a specialist signal's confidence as a float. The schema declares
+    it float, but Gemini sometimes emits a quoted string ("0.85") since we
+    can't use ADK output_schema alongside tools — coerce defensively."""
+    v = signal.get("confidence", 0.0)
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_json(text: str) -> dict | None:
+    """Parse a JSON object out of an agent's final text.
+
+    The agents are instructed to emit a bare JSON object (they cannot use
+    ADK output_schema — see agents.py). Models sometimes still wrap it in
+    ```json fences or add stray prose, so this is tolerant: it strips
+    fences, then falls back to the outermost {...} span.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    # strip ```json ... ``` or ``` ... ``` fences
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
+        s = re.sub(r"\n?```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # fallback: outermost brace span
+    start, end = s.find("{"), s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(s[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Specialist / synthesizer invocation
+# ---------------------------------------------------------------------------
+async def _invoke_agent(
+    agent_name: str,
+    prompt_payload: dict,
+    writer: StepWriter,
+    round_idx: int,
+) -> dict:
+    """Invoke one agent, streaming its tool calls and final response to
+    Firestore. Returns the parsed structured JSON response.
+
+    ADK 1.0.0 specifics handled here:
+      - the ADK session must be created on the session service before
+        run_async is called (Bug #5);
+      - new_message must be a genai types.Content, not a string (Bug #4);
+      - Event has no is_tool_call/tool_call/final_response attributes —
+        tool activity comes from get_function_calls()/get_function_
+        responses(), the final text from event.content on the event where
+        is_final_response() is true (Bug #6).
+    """
+    agent = get_agent(agent_name)
+    app_name = f"tiger-agents-v2-02-{agent_name}"
+    # Unique per invocation. round_idx alone is not unique when one agent
+    # appears in two conflicts that debate in the same round, so a uuid
+    # suffix guarantees a fresh ADK session every call.
+    adk_session_id = (f"adk-{writer.session_id}-{agent_name}"
+                      f"-r{round_idx}-{uuid.uuid4().hex[:8]}")
+
+    runner = Runner(
+        app_name=app_name,
+        agent=agent,
+        session_service=_SESSION_SERVICE,
+    )
+
+    # Bug #5 — the session must exist before run_async uses it.
+    await _SESSION_SERVICE.create_session(
+        app_name=app_name,
+        user_id=_ADK_USER_ID,
+        session_id=adk_session_id,
+    )
+
+    # Bug #4 — new_message is a types.Content, not a raw string.
+    user_msg = genai_types.Content(
+        role="user",
+        parts=[genai_types.Part.from_text(text=json.dumps(prompt_payload))],
+    )
+
+    t0 = _now_ms()
+    response_json: dict | None = None
+
+    async for event in runner.run_async(
+        user_id=_ADK_USER_ID,
+        session_id=adk_session_id,
+        new_message=user_msg,
+    ):
+        # Bug #6 — real ADK Event API.
+        for fc in event.get_function_calls():
+            writer.write(
+                agent=agent_name, round_idx=round_idx, action="tool_call",
+                tool_name=fc.name,
+                tool_args=dict(fc.args) if fc.args else {},
+                notes=f"{agent_name} called {fc.name}",
+            )
+        for fr in event.get_function_responses():
+            resp = fr.response
+            result = resp if isinstance(resp, dict) else {"value": resp}
+            rc = result.get("row_count")
+            summary = (f"{fr.name} returned {rc} rows" if rc is not None
+                       else f"{fr.name} returned a result")
+            writer.write(
+                agent=agent_name, round_idx=round_idx, action="tool_call",
+                tool_name=fr.name, tool_result_summary=summary,
+                tool_result_full=result,
+            )
+        if event.is_final_response() and event.content and \
+                event.content.parts:
+            text = "".join(
+                p.text for p in event.content.parts
+                if getattr(p, "text", None))
+            response_json = _extract_json(text)
+
+    writer.write(
+        agent=agent_name, round_idx=round_idx, action="response",
+        model_response_json=response_json, latency_ms=_now_ms() - t0,
+    )
+    if response_json is None:
+        # Graceful error envelope — the synthesizer expects this shape.
+        return {
+            "agent": agent_name,
+            "disposition": "CAUTION",
+            "confidence": 0.0,
+            "hard_block": False,
+            "signal": {"error": f"{agent_name} produced no response"},
+            "evidence": [],
+            "reasoning_summary":
+                f"{agent_name} did not return a structured response.",
+        }
+    return response_json
+
+
+# ---------------------------------------------------------------------------
+# Conflict detection (deterministic)
+# ---------------------------------------------------------------------------
+def _detect_conflicts(signals: dict[str, dict]) -> list[Conflict]:
+    conflicts: list[Conflict] = []
+    items = list(signals.items())
+
+    # R1 — hard block
+    for name, s in items:
+        if not s.get("hard_block"):
+            continue
+        proceeders = [n for n, ss in items
+                      if ss.get("disposition") == "PROCEED"
+                      and not ss.get("hard_block")]
+        if proceeders:
+            conflicts.append(Conflict(
+                type="HARD_BLOCK",
+                disputants=[name, proceeders[0]],
+                summary=(f"{name} returned hard_block; {proceeders[0]} is "
+                         f"PROCEED — needs reconciliation."),
+            ))
+
+    # R2 — disposition divergence
+    proceed = [n for n, s in items if s.get("disposition") == "PROCEED"]
+    block = [n for n, s in items if s.get("disposition") == "BLOCK"]
+    for pa in proceed:
+        for ba in block:
+            if any(set(c.disputants) == {pa, ba} for c in conflicts):
+                continue
+            conflicts.append(Conflict(
+                type="DISPOSITION_DIVERGENCE",
+                disputants=[pa, ba],
+                summary=(f"{pa} says PROCEED, {ba} says BLOCK — opposing "
+                         f"reads of the same order."),
+            ))
+
+    # R3 — confidence asymmetry on differing dispositions
+    for i, (n_a, s_a) in enumerate(items):
+        for n_b, s_b in items[i + 1:]:
+            d_a, d_b = s_a.get("disposition"), s_b.get("disposition")
+            c_a = _conf(s_a)
+            c_b = _conf(s_b)
+            if d_a != d_b and ((c_a >= 0.85 and c_b <= 0.50)
+                               or (c_b >= 0.85 and c_a <= 0.50)):
+                if any(set(c.disputants) == {n_a, n_b} for c in conflicts):
+                    continue
+                conflicts.append(Conflict(
+                    type="CONFIDENCE_ASYMMETRY",
+                    disputants=[n_a, n_b],
+                    summary=(f"{n_a} (conf {c_a:.2f}) vs {n_b} "
+                             f"(conf {c_b:.2f}) — confidence asymmetry on "
+                             f"differing dispositions."),
+                ))
+    return conflicts
+
+
+def _is_conflict_resolved(conflict: Conflict,
+                          signals: dict[str, dict]) -> bool:
+    a, b = conflict.disputants
+    sa, sb = signals[a], signals[b]
+    if conflict.type == "HARD_BLOCK":
+        return not (sa.get("hard_block") or sb.get("hard_block"))
+    if conflict.type == "DISPOSITION_DIVERGENCE":
+        return sa.get("disposition") != "BLOCK" \
+            or sb.get("disposition") != "BLOCK"
+    same_d = sa.get("disposition") == sb.get("disposition")
+    return same_d or abs(_conf(sa) - _conf(sb)) < 0.30
+
+
+# ---------------------------------------------------------------------------
+# Debate round
+# ---------------------------------------------------------------------------
+async def _run_debate_round(conflict: Conflict, signals: dict[str, dict],
+                            writer: StepWriter,
+                            round_idx: int) -> dict[str, dict]:
+    a, b = conflict.disputants
+    writer.write(agent="orchestrator", round_idx=round_idx, action="route",
+                 notes=(f"Debate round {round_idx} on {conflict.type}: "
+                        f"{a} <-> {b}"))
+    instruction = ("Read the disputant's position. REVISE if their data is "
+                   "materially new; otherwise HOLD with the specific data "
+                   "they did not have.")
+    new_a, new_b = await asyncio.gather(
+        _invoke_agent(a, {"your_previous_signal": signals[a],
+                          "disputant_position": signals[b],
+                          "round_number": round_idx,
+                          "instruction": instruction},
+                      writer, round_idx),
+        _invoke_agent(b, {"your_previous_signal": signals[b],
+                          "disputant_position": signals[a],
+                          "round_number": round_idx,
+                          "instruction": instruction},
+                      writer, round_idx),
+    )
+    return {a: new_a, b: new_b}
+
+
+# ---------------------------------------------------------------------------
+# Synthesis
+# ---------------------------------------------------------------------------
+async def _synthesize(order_event: CustomerOrderEvent,
+                      signals: dict[str, dict],
+                      conflicts: list[Conflict],
+                      writer: StepWriter) -> dict:
+    payload = {
+        "order": order_event.to_dict(),
+        "specialist_signals": signals,
+        "conflicts_detected": [c.model_dump() for c in conflicts],
+        "session_id": writer.session_id,
+        "instruction": ("Synthesize the four specialist signals into a "
+                        "recommendation. Honor conflict resolutions; "
+                        "surface deadlocks explicitly."),
+    }
+    return await _invoke_agent("customer_supply", payload, writer,
+                               round_idx=0)
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoint
+# ---------------------------------------------------------------------------
+async def run_session(session_id: str, trigger_type: str,
+                      order_event: CustomerOrderEvent) -> None:
+    """Run the 5-agent N-to-N parallel + debate-on-conflict flow."""
+    writer = StepWriter(session_id)
+    writer.write(agent="orchestrator", action="route",
+                 notes=(f"Session started (trigger_source="
+                        f"{order_event.trigger_source}) — fanning out to "
+                        f"4 specialists"))
+    if order_event._is_placeholder:
+        writer.write(agent="orchestrator", action="route",
+                     notes=("WARNING: placeholder order event in use — "
+                            "tiger_semantic dataset not loaded."))
+
+    try:
+        order_payload = {
+            "order": order_event.to_dict(),
+            "round_number": 1,
+            "instruction": ("Evaluate this order in your domain. Return "
+                            "your structured signal."),
+        }
+        results = await asyncio.gather(*[
+            _invoke_agent(name, order_payload, writer, round_idx=1)
+            for name in SPECIALIST_AGENTS
+        ])
+        signals: dict[str, dict] = dict(zip(SPECIALIST_AGENTS, results))
+        writer.write(agent="orchestrator", round_idx=1, action="route",
+                     notes="Fan-out complete. Running conflict detection.")
+
+        conflicts = _detect_conflicts(signals)
+        for c in conflicts:
+            writer.write(agent="orchestrator", round_idx=1, action="route",
+                         notes=(f"Conflict: {c.type} between "
+                                f"{' and '.join(c.disputants)} — {c.summary}"))
+
+        for conflict in conflicts:
+            for r in range(2, 2 + MAX_DEBATE_ROUNDS):
+                signals.update(
+                    await _run_debate_round(conflict, signals, writer, r))
+                conflict.debate_rounds_used = r - 1
+                if _is_conflict_resolved(conflict, signals):
+                    conflict.resolution = "RESOLVED"
+                    writer.write(agent="orchestrator", round_idx=r,
+                                 action="route",
+                                 notes=(f"Conflict {conflict.type} resolved "
+                                        f"at round {r}."))
+                    break
+            else:
+                conflict.resolution = "DEADLOCK"
+                writer.write(agent="orchestrator", action="route",
+                             notes=(f"Conflict {conflict.type} DEADLOCKED "
+                                    f"after {MAX_DEBATE_ROUNDS} rounds."))
+
+        writer.write(agent="orchestrator", action="route",
+                     notes="Synthesizing — Customer Supply Agent.")
+        decision = await _synthesize(order_event, signals, conflicts, writer)
+
+        # Schema enforcement moved orchestrator-side in v2.02A (ADK 1.0.0
+        # forbids output_schema alongside tools — see agents.py). Validate
+        # the synthesizer's JSON against CustomerSupplyDecision, but do NOT
+        # crash the session on a mismatch: the recommendation content is
+        # still useful to the human reviewer. Record the mismatch instead.
+        try:
+            CustomerSupplyDecision.model_validate(decision)
+            decision["_schema_valid"] = True
+        except Exception as ve:
+            decision["_schema_valid"] = False
+            decision["_schema_error"] = str(ve)[:500]
+            writer.write(
+                agent="orchestrator", action="route",
+                notes=(f"Synthesizer output did not fully match "
+                       f"CustomerSupplyDecision schema: {str(ve)[:200]}"))
+
+        decision.setdefault("agent_model_versions", AGENT_MODEL_VERSIONS)
+        decision.setdefault("orchestrator_version", ORCHESTRATOR_VERSION)
+        decision["trigger_type"] = trigger_type
+
+        update_session(session_id, status="awaiting_approval",
+                       final_action_card=decision)
+        writer.write(agent="orchestrator", action="route",
+                     notes="Recommendation ready. Awaiting human approval.")
+
+    except Exception as exc:
+        writer.write(agent="orchestrator", action="error",
+                     notes=(f"{type(exc).__name__}: {exc}\n"
+                            f"{traceback.format_exc()[:1000]}"))
+        update_session(session_id, status="error", ended_at="NOW")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Human approval / rejection
+# ---------------------------------------------------------------------------
+def _finalize(session_id: str, action_card: dict, user_id: str,
+              user_decision: str, rejection_reason: str | None) -> str:
+    payload = dict(action_card)
+    payload.setdefault("orchestrator_version", ORCHESTRATOR_VERSION)
+    payload.setdefault("agent_model_versions", AGENT_MODEL_VERSIONS)
+
+    result = dce_write(
+        session_id=session_id,
+        decision_payload_json=json.dumps(payload),
+        user_decision=user_decision,
+        user_id=user_id,
+        rejection_reason=rejection_reason,
+    )
+    if "error" in result:
+        raise RuntimeError(f"dce_write failed: {result['error']}")
+
+    writer = StepWriter(session_id)
+    writer.write(agent="human", action=user_decision,
+                 notes=(f"{user_decision} by {user_id}"
+                        + (f": {rejection_reason}" if rejection_reason
+                           else "")))
+    update_session(session_id, status=("approved"
+                                       if user_decision == "approved"
+                                       else "rejected"),
+                   decision_id=result["decision_id"], user_id=user_id,
+                   ended_at="NOW")
+    return result["decision_id"]
+
+
+def approve_session(session_id: str, action_card: dict, user_id: str,
+                    approval_notes: str | None) -> str:
+    return _finalize(session_id, action_card, user_id, "approved", None)
+
+
+def reject_session(session_id: str, action_card: dict, user_id: str,
+                   rejection_reason: str) -> str:
+    return _finalize(session_id, action_card, user_id, "rejected",
+                     rejection_reason)
