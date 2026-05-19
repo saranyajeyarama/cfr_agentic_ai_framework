@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 import traceback
@@ -48,6 +49,15 @@ AGENT_MODEL_VERSIONS = "gemini-2.5-pro,gemini-2.5-flash"
 _SESSION_SERVICE = InMemorySessionService()
 _ADK_USER_ID = "orchestrator"
 
+# Cap concurrent agent invocations across the process. Each _invoke_agent
+# call makes multiple Gemini turns via ADK; with no cap, several sessions
+# starting at once (UI fan-out) blasts Vertex AI past its per-minute
+# quota and httpx pools start failing with ReadError/ConnectError after
+# the first wave. Default 1 = strictly serialized across sessions to
+# match the within-session sequential flow. Raise via AGENT_CONCURRENCY
+# env var if local Vertex quota permits.
+_AGENT_CONCURRENCY = asyncio.Semaphore(int(os.environ.get("AGENT_CONCURRENCY", "1")))
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -62,6 +72,97 @@ def _conf(signal: dict) -> float:
         return float(v) if v is not None else 0.0
     except (TypeError, ValueError):
         return 0.0
+
+
+_QUAL_TO_CONF = {"HIGH": 0.85, "MEDIUM": 0.65, "MED": 0.65, "LOW": 0.4}
+
+
+def _coerce_confidence(v) -> float:
+    if v is None:
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, str) and v.strip().upper() in _QUAL_TO_CONF:
+        return _QUAL_TO_CONF[v.strip().upper()]
+    return 0.0
+
+
+def _avg_specialist_confidence(d: dict) -> float:
+    sigs = (d.get("specialist_signals") or {}).values()
+    confs = [_coerce_confidence(s.get("confidence")) for s in sigs if isinstance(s, dict)]
+    confs = [c for c in confs if c > 0]
+    return round(sum(confs) / len(confs), 2) if confs else 0.0
+
+
+def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
+    """Reshape Gemini's frequent flat synthesizer output into the nested
+    CustomerSupplyDecision shape the front-end expects. Mutates in place.
+
+    Common drift patterns this fixes:
+      recommendation : "REJECT"  ->  {action: "REJECT", ...}
+      reasoning_chain: ["...","..."]  ->  {key_trade_offs: [...], ...}
+      confidence     : "HIGH"  ->  0.85
+    """
+    # recommendation: flat string -> wrapped dict.
+    # Agents emit ACCEPT / MODIFY / REJECT / DEFER; map DEFER to MODIFY
+    # since the schema only knows the three canonical actions, and a
+    # DEFER usually maps to "hold / shorten quantity" in the UI.
+    rec = d.get("recommendation")
+    if isinstance(rec, str):
+        action_str = rec.strip().upper()
+        canonical = {"ACCEPT", "MODIFY", "REJECT"}
+        if action_str == "DEFER":
+            mapped = "MODIFY"
+            qty = 0
+        elif action_str in canonical:
+            mapped = action_str
+            qty = float(getattr(order_event, "ordered_quantity_cases", 0) or 0)
+            if mapped == "REJECT":
+                qty = 0
+        else:
+            mapped = "ACCEPT"
+            qty = float(getattr(order_event, "ordered_quantity_cases", 0) or 0)
+        conf = _coerce_confidence(d.get("confidence")) or _avg_specialist_confidence(d)
+        d["recommendation"] = {
+            "action": mapped,
+            "raw_action": action_str,  # preserve the agent's original verb
+            "fulfill_qty_cs": qty,
+            "confidence": conf,
+            "expected_outcome": "",
+        }
+    elif isinstance(rec, dict):
+        rec["confidence"] = _coerce_confidence(rec.get("confidence")) or _avg_specialist_confidence(d)
+        rec.setdefault("action", "ACCEPT")
+        rec.setdefault("fulfill_qty_cs", 0)
+        rec.setdefault("expected_outcome", "")
+        d["recommendation"] = rec
+    else:
+        d["recommendation"] = {"action": "ACCEPT", "fulfill_qty_cs": 0,
+                               "confidence": _avg_specialist_confidence(d), "expected_outcome": ""}
+
+    # reasoning_chain: list of strings -> nested dict
+    rc = d.get("reasoning_chain")
+    if isinstance(rc, list):
+        d["reasoning_chain"] = {
+            "key_trade_offs": [str(x) for x in rc],
+            "what_would_change_the_decision": "",
+            "evidence_by_agent": {},
+        }
+    elif isinstance(rc, dict):
+        rc.setdefault("key_trade_offs", [])
+        rc.setdefault("what_would_change_the_decision", "")
+        rc.setdefault("evidence_by_agent", {})
+    else:
+        d["reasoning_chain"] = {"key_trade_offs": [],
+                                "what_would_change_the_decision": "",
+                                "evidence_by_agent": {}}
+
+    # session_id is required by the schema; the synthesizer doesn't know
+    # it, so fill it in here.
+    if not d.get("session_id"):
+        d["session_id"] = session_id
 
 
 def _extract_json(text: str) -> dict | None:
@@ -144,36 +245,52 @@ async def _invoke_agent(
     t0 = _now_ms()
     response_json: dict | None = None
 
-    async for event in runner.run_async(
-        user_id=_ADK_USER_ID,
-        session_id=adk_session_id,
-        new_message=user_msg,
-    ):
-        # Bug #6 — real ADK Event API.
-        for fc in event.get_function_calls():
-            writer.write(
-                agent=agent_name, round_idx=round_idx, action="tool_call",
-                tool_name=fc.name,
-                tool_args=dict(fc.args) if fc.args else {},
-                notes=f"{agent_name} called {fc.name}",
+    # Hold the concurrency permit for the entire ADK run, including all
+    # tool calls and follow-up LLM turns inside the async generator.
+    async with _AGENT_CONCURRENCY:
+      try:
+        async for event in runner.run_async(
+            user_id=_ADK_USER_ID,
+            session_id=adk_session_id,
+            new_message=user_msg,
+        ):
+            # Bug #6 — real ADK Event API.
+            for fc in event.get_function_calls():
+                writer.write(
+                    agent=agent_name, round_idx=round_idx, action="tool_call",
+                    tool_name=fc.name,
+                    tool_args=dict(fc.args) if fc.args else {},
+                    notes=f"{agent_name} called {fc.name}",
+                )
+            for fr in event.get_function_responses():
+                resp = fr.response
+                result = resp if isinstance(resp, dict) else {"value": resp}
+                rc = result.get("row_count")
+                summary = (f"{fr.name} returned {rc} rows" if rc is not None
+                           else f"{fr.name} returned a result")
+                writer.write(
+                    agent=agent_name, round_idx=round_idx, action="tool_call",
+                    tool_name=fr.name, tool_result_summary=summary,
+                    tool_result_full=result,
+                )
+            if event.is_final_response() and event.content and \
+                    event.content.parts:
+                text = "".join(
+                    p.text for p in event.content.parts
+                    if getattr(p, "text", None))
+                response_json = _extract_json(text)
+      finally:
+        # Drop the ADK session immediately — InMemorySessionService keeps
+        # every session forever otherwise. With sequential sessions + 4
+        # agents each that's the OOM source.
+        try:
+            await _SESSION_SERVICE.delete_session(
+                app_name=app_name,
+                user_id=_ADK_USER_ID,
+                session_id=adk_session_id,
             )
-        for fr in event.get_function_responses():
-            resp = fr.response
-            result = resp if isinstance(resp, dict) else {"value": resp}
-            rc = result.get("row_count")
-            summary = (f"{fr.name} returned {rc} rows" if rc is not None
-                       else f"{fr.name} returned a result")
-            writer.write(
-                agent=agent_name, round_idx=round_idx, action="tool_call",
-                tool_name=fr.name, tool_result_summary=summary,
-                tool_result_full=result,
-            )
-        if event.is_final_response() and event.content and \
-                event.content.parts:
-            text = "".join(
-                p.text for p in event.content.parts
-                if getattr(p, "text", None))
-            response_json = _extract_json(text)
+        except Exception:
+            pass
 
     writer.write(
         agent=agent_name, round_idx=round_idx, action="response",
@@ -276,18 +393,20 @@ async def _run_debate_round(conflict: Conflict, signals: dict[str, dict],
     instruction = ("Read the disputant's position. REVISE if their data is "
                    "materially new; otherwise HOLD with the specific data "
                    "they did not have.")
-    new_a, new_b = await asyncio.gather(
-        _invoke_agent(a, {"your_previous_signal": signals[a],
-                          "disputant_position": signals[b],
-                          "round_number": round_idx,
-                          "instruction": instruction},
-                      writer, round_idx),
-        _invoke_agent(b, {"your_previous_signal": signals[b],
-                          "disputant_position": signals[a],
-                          "round_number": round_idx,
-                          "instruction": instruction},
-                      writer, round_idx),
-    )
+    # Sequential — same reasoning as the fan-out: parallel Vertex calls
+    # under cumulative load fail with httpx ReadError/ConnectError.
+    new_a = await _invoke_agent(
+        a, {"your_previous_signal": signals[a],
+            "disputant_position": signals[b],
+            "round_number": round_idx,
+            "instruction": instruction},
+        writer, round_idx)
+    new_b = await _invoke_agent(
+        b, {"your_previous_signal": signals[b],
+            "disputant_position": signals[a],
+            "round_number": round_idx,
+            "instruction": instruction},
+        writer, round_idx)
     return {a: new_a, b: new_b}
 
 
@@ -334,10 +453,14 @@ async def run_session(session_id: str, trigger_type: str,
             "instruction": ("Evaluate this order in your domain. Return "
                             "your structured signal."),
         }
-        results = await asyncio.gather(*[
-            _invoke_agent(name, order_payload, writer, round_idx=1)
-            for name in SPECIALIST_AGENTS
-        ])
+        # Specialists run sequentially. Parallel fan-out via asyncio.gather
+        # blasts Vertex AI past its per-minute connection budget when
+        # several sessions are in flight, producing httpx ReadError /
+        # ConnectError mid-stream. Sequential is slower but deterministic.
+        results = []
+        for name in SPECIALIST_AGENTS:
+            results.append(
+                await _invoke_agent(name, order_payload, writer, round_idx=1))
         signals: dict[str, dict] = dict(zip(SPECIALIST_AGENTS, results))
         writer.write(agent="orchestrator", round_idx=1, action="route",
                      notes="Fan-out complete. Running conflict detection.")
@@ -369,6 +492,11 @@ async def run_session(session_id: str, trigger_type: str,
         writer.write(agent="orchestrator", action="route",
                      notes="Synthesizing — Customer Supply Agent.")
         decision = await _synthesize(order_event, signals, conflicts, writer)
+
+        # Normalize Gemini's frequent flat shapes into the nested schema
+        # the front-end expects. Idempotent — re-runs on already-nested
+        # outputs are no-ops.
+        _normalize_decision(decision, order_event, session_id)
 
         # Schema enforcement moved orchestrator-side in v2.02A (ADK 1.0.0
         # forbids output_schema alongside tools — see agents.py). Validate

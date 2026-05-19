@@ -198,7 +198,7 @@ async def start_session(
                          "trigger_source": req.trigger_source},
     )
     background_tasks.add_task(
-        run_session, session_id, req.trigger_type, order_event)
+        _run_session_tracked, session_id, req.trigger_type, order_event)
 
     return StartSessionResponse(
         session_id=session_id,
@@ -209,11 +209,80 @@ async def start_session(
     )
 
 
+@app.post("/sessions/sync")
+async def start_session_sync(req: StartSessionRequest) -> dict:
+    """Run the full 5-agent flow inline and return the completed session
+    document (including final_action_card). One HTTP request, one
+    response — no polling, no orphans, no race conditions.
+
+    The trade-off is that the request blocks for ~60-180s depending on
+    BigQuery + Gemini latency. Use this for demos / debugging on a slow
+    UI; the background-task POST /sessions stays for production volume.
+    """
+    try:
+        if req.trigger_source == "edi_850":
+            if not req.isa_control_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="trigger_source=edi_850 requires isa_control_id")
+            order_event: CustomerOrderEvent = from_edi_purchase_order(
+                req.isa_control_id)
+        else:
+            payload = req.demo_order.model_dump(exclude_none=True) \
+                if req.demo_order else {}
+            order_event = (from_demo_payload(payload) if payload
+                           else resolve_demo_scenario())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"Could not resolve order: {exc}")
+
+    session_id = _new_session_id()
+    create_session(
+        session_id=session_id,
+        trigger_type=req.trigger_type,
+        trigger_payload={**order_event.to_dict(),
+                         "trigger_source": req.trigger_source},
+    )
+    await _run_session_tracked(session_id, req.trigger_type, order_event)
+    sess = get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=500,
+                            detail="Session was created but cannot be read back")
+    return sess
+
+
+# Sessions whose background task was kicked off by THIS process. Any
+# `active` session NOT in this set is orphaned (the task it belonged
+# to is in a previous, dead container). Clock-independent, so it works
+# under WSL2/Docker clock drift.
+_LIVE_SESSIONS: set[str] = set()
+
+
+async def _run_session_tracked(session_id: str, *args, **kwargs):
+    _LIVE_SESSIONS.add(session_id)
+    try:
+        await run_session(session_id, *args, **kwargs)
+    finally:
+        _LIVE_SESSIONS.discard(session_id)
+
+
 @app.get("/sessions/{session_id}")
 def read_session(session_id: str) -> dict:
     sess = get_session(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    # Zombie fence: an `active` session that this process is NOT running
+    # must be orphaned (its task is in a dead container). Mark error so
+    # the front-end stops counting it as in-flight.
+    if (sess.get("status") == "active"
+            and not sess.get("ended_at")
+            and session_id not in _LIVE_SESSIONS):
+        sess["status"] = "error"
+        sess["error"] = ("Session task is no longer running "
+                         "(orphaned by a backend restart). "
+                         "Re-evaluate to retry.")
     return sess
 
 

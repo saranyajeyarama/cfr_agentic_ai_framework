@@ -16,6 +16,10 @@ if (BACKEND_URL) {
     createProxyMiddleware({
       target: BACKEND_URL,
       changeOrigin: true,
+      // /api/sessions/sync runs all agents inline (~60-180s). Default
+      // proxy/socket timeouts are too short; bump to 10 min.
+      proxyTimeout: 10 * 60 * 1000,
+      timeout: 10 * 60 * 1000,
       // Strip /api prefix: frontend calls /api/health → backend receives /health
       pathRewrite: { '^/api': '' },
       on: {
