@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, Check, CheckCircle2, ChevronRight, CornerDownRight, X, Info, ShieldAlert, Bot, Loader2 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { buildStartSessionRequest } from '../../lib/api';
+import type { AgentEvalState, AgentEvalMap } from '../../lib/agentEvals';
 import type { DashboardData } from '../../types/dashboard';
 
 type Severity = 'critical' | 'warning' | 'neutral';
@@ -44,22 +45,6 @@ type DecisionEntry = {
   outcome: string;
 };
 
-type AgentEvalStatus = 'idle' | 'evaluating' | 'done' | 'error';
-
-type AgentRec = {
-  action: string;
-  fulfill_qty_cs: number;
-  confidence: number;
-  expected_outcome: string;
-  key_trade_offs: string[];
-  what_would_change: string;
-};
-
-type AgentEvalState = {
-  status: AgentEvalStatus;
-  sessionId?: string;
-  rec?: AgentRec;
-};
 
 
 /**
@@ -79,7 +64,15 @@ function poToOrder(po: PO) {
   };
 }
 
-export function OrderTriage({ data }: { data: DashboardData }) {
+export function OrderTriage({
+  data,
+  agentEvals,
+  setAgentEvals,
+}: {
+  data: DashboardData;
+  agentEvals: AgentEvalMap;
+  setAgentEvals: React.Dispatch<React.SetStateAction<AgentEvalMap>>;
+}) {
   const PURCHASE_ORDERS: PO[] = data.purchaseOrders as PO[];
   const [activePoId, setActivePoId] = useState<string>(PURCHASE_ORDERS[0]?.id || '');
   const [decision, setDecision] = useState<'accept' | 'modify' | 'reject' | null>(null);
@@ -87,18 +80,7 @@ export function OrderTriage({ data }: { data: DashboardData }) {
   const [showRationale, setShowRationale] = useState(false);
   const [decisionLog, setDecisionLog] = useState<DecisionEntry[]>(data.decisionCaptureLog);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [agentEvals, setAgentEvals] = useState<Record<string, AgentEvalState>>({});
 
-  const isMounted = useRef(true);
-  const timeoutRefs = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
-
-  useEffect(() => {
-    isMounted.current = true;
-    return () => {
-      isMounted.current = false;
-      Object.values(timeoutRefs.current).forEach(clearTimeout);
-    };
-  }, []);
 
 
   const startAgentEval = useCallback(async (po: PO) => {
@@ -107,6 +89,8 @@ export function OrderTriage({ data }: { data: DashboardData }) {
       // Synchronous flow: backend runs the 4 specialists + synthesizer
       // inline and returns the completed session document in one response.
       // No polling, no orphaned sessions. Request blocks ~60-180s.
+      // setAgentEvals is App-level state — it's safe to call even after
+      // this tab unmounts, so the in-flight eval still lands.
       const res = await fetch('/api/sessions/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -114,8 +98,6 @@ export function OrderTriage({ data }: { data: DashboardData }) {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const sess = await res.json();
-      if (!isMounted.current) return;
-
       const card = sess.final_action_card;
       if (!card) {
         setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'error', sessionId: sess.session_id } }));
@@ -139,10 +121,9 @@ export function OrderTriage({ data }: { data: DashboardData }) {
         },
       }));
     } catch {
-      if (isMounted.current)
-        setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'error' } }));
+      setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'error' } }));
     }
-  }, []);
+  }, [setAgentEvals]);
 
   // Auto-evaluate only the currently selected PO. Firing one session per
   // row on mount blasted the backend with ~20 simultaneous POST /sessions

@@ -15,11 +15,15 @@ import { RootCauseHub } from './components/tabs/RootCauseHub';
 import { SafetyStockOptimizer } from './components/tabs/SafetyStockOptimizer';
 import mockData from './data/mockData.json';
 import type { DashboardData } from './types/dashboard';
+import { useAgentEvalsStore } from './lib/agentEvals';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('watchtower');
   const [dashboardData, setDashboardData] = useState<DashboardData>(mockData as DashboardData);
   const [isLiveData, setIsLiveData] = useState<boolean>(false);
+  // Lifted so tab switches don't unmount OrderTriage and lose its
+  // evaluation results. Backed by sessionStorage so reloads keep them.
+  const [agentEvals, setAgentEvals] = useAgentEvalsStore();
 
   useEffect(() => {
     fetch('/api/dashboard-data')
@@ -51,7 +55,13 @@ export default function App() {
               className="h-full"
             >
               {activeTab === 'watchtower' && <Watchtower data={dashboardData} />}
-              {activeTab === 'triage' && <OrderTriage data={dashboardData} />}
+              {activeTab === 'triage' && (
+                <OrderTriage
+                  data={dashboardData}
+                  agentEvals={agentEvals}
+                  setAgentEvals={setAgentEvals}
+                />
+              )}
               {activeTab === 'simulator' && <FulfillmentSimulator data={dashboardData} />}
               {activeTab === 'rootcause' && <RootCauseHub data={dashboardData} />}
               {activeTab === 'optimizer' && <SafetyStockOptimizer data={dashboardData} />}
