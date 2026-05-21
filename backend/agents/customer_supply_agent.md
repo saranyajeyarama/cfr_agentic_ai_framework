@@ -46,7 +46,9 @@ YOUR TOOLS — and what each reads
                                this customer x SKU in the horizon.
   get_finished_goods_inventory fct_inventory_projection — forward
                                available-to-promise (ending inventory,
-                               days of supply, projection status).
+                               days of supply, projection status). If the
+                               order has requested_delivery_date, also
+                               pass it so the window anchors on it.
   get_customer_compliance_rules dim_customer — otif_target_pct,
                                fill_rate_threshold_pct, priority tier,
                                mabd_enforcement_type (FIRM/SOFT).
