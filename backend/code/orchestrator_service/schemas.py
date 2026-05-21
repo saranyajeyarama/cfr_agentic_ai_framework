@@ -377,3 +377,108 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     text: str
+
+
+# ---------------------------------------------------------------------------
+# Fulfillment Simulator — Phase 1 LP optimizer endpoints
+# Field names match the front-end Scenario / Incident types exactly so the
+# UI can render the response object without any field renames.
+# ---------------------------------------------------------------------------
+class FulfillmentScenario(BaseModel):
+    id: str
+    name: str
+    tagline: str
+    arrival: str
+    dcSource: str
+    freightCost: float
+    fine: float
+    netImpact: float
+    savingsVsDefault: float = 0
+    isRecommended: bool = False
+    rationale: Optional[str] = None
+    # Delivery-enriched fields (from dim_plant + fct_shipments + dim_carrier).
+    transitHours: Optional[float] = None
+    carrierName: Optional[str] = None
+    plantDetails: Optional[list[dict[str, Any]]] = None  # [{code, name, city, type, qty}]
+
+
+class FulfillmentSimulateRequest(BaseModel):
+    sold_to: str
+    material_number: str
+    ordered_quantity_cases: float
+    requested_delivery_date: Optional[str] = None
+    origin_plant: Optional[str] = None
+    customer_region: Optional[str] = None
+    blocked_plants: list[str] = Field(default_factory=list)
+
+
+class FulfillmentSimulateMeta(BaseModel):
+    solver_status: str
+    elapsed_ms: int
+    no_alternate_reason: Optional[str] = None
+    freight_costs_used: dict[str, float] = Field(default_factory=dict)
+    penalty_per_case: float = 0
+    ordered_qty: float = 0
+    origin_plant: Optional[str] = None
+    customer_region: Optional[str] = None
+    inventory_by_plant: dict[str, dict[str, float]] = Field(default_factory=dict)
+    is_demo_seed: bool = False
+
+
+class FulfillmentSimulateResponse(BaseModel):
+    scenarios: list[FulfillmentScenario]
+    meta: FulfillmentSimulateMeta
+
+
+class FulfillmentIncidentScenario(FulfillmentScenario):
+    """Same as FulfillmentScenario; alias kept for clarity in the
+    incidents response (where scenarios is intentionally an empty list
+    in Phase 1 — populated lazily by POST /fulfillment/simulate)."""
+    pass
+
+
+class FulfillmentIncident(BaseModel):
+    id: str
+    title: str
+    customer: str
+    skuCode: str
+    skuName: str
+    soldTo: Optional[str] = None
+    materialNumber: Optional[str] = None
+    orderedQty: Optional[float] = None
+    mabd: Optional[str] = None
+    description: str
+    riskProbability: int
+    fineAtRisk: float
+    otifRulebook: str
+    originPlant: Optional[str] = None
+    # Delivery-enriched origin plant metadata (from dim_plant + fct_shipments).
+    originPlantName: Optional[str] = None
+    originPlantCity: Optional[str] = None
+    originPlantType: Optional[str] = None
+    avgTransitHours: Optional[float] = None
+    primaryCarrier: Optional[str] = None
+    recentFillRate: Optional[float] = None
+    # Extended risk data from BigQuery enrichment (Phase 1).
+    otifTarget: Optional[float] = None
+    otifProgram: Optional[str] = None
+    otifFailRate: Optional[float] = None
+    recentFails: Optional[int] = None
+    totalDeliveries: Optional[int] = None
+    maxDaysLate: Optional[int] = None
+    avgDaysLate: Optional[float] = None
+    lastFailReason: Optional[str] = None
+    lastRootCause: Optional[str] = None
+    avgChargebackUsd: Optional[float] = None
+    totalChargebackUsd: Optional[float] = None
+    chargebackCount: Optional[int] = None
+    mabdEnforcement: Optional[str] = None
+    otifAggressive: Optional[bool] = None
+    scenarios: list[FulfillmentIncidentScenario] = Field(default_factory=list)
+    executionSteps: list[str] = Field(default_factory=list)
+    _demo_seed: bool = False
+
+
+class FulfillmentIncidentsResponse(BaseModel):
+    incidents: list[FulfillmentIncident]
+    meta: dict[str, Any] = Field(default_factory=dict)

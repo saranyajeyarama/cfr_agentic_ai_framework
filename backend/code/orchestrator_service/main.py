@@ -31,6 +31,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
+from google.cloud import bigquery
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,6 +43,8 @@ from agent_tools import (
     from_edi_purchase_order,
     resolve_demo_scenario,
     get_demo_scenario_candidates,
+    get_network_inventory,
+    get_customer_penalty_profile,
 )
 from firestore_client import create_session, get_session
 from orchestrator import run_session, approve_session, reject_session
@@ -49,7 +52,10 @@ from schemas import (
     StartSessionRequest, StartSessionResponse,
     ApprovalRequest, RejectionRequest, DecisionResponse,
     ChatRequest, ChatResponse,
+    FulfillmentSimulateRequest, FulfillmentSimulateResponse,
+    FulfillmentIncidentsResponse,
 )
+from fulfillment_optimizer import simulate as _simulate_fulfillment
 
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "resilience-riskradar")
@@ -110,6 +116,232 @@ def dashboard_data() -> dict:
     partially-populated warehouse still yields a renderable response."""
     from data_pipeline import fetch_dashboard_data
     return fetch_dashboard_data()
+
+
+# ---------------------------------------------------------------------------
+# Fulfillment Simulator — Phase 1 LP optimizer endpoints [v2.02b]
+# Split out from /dashboard-data so the other dashboard tabs aren't slowed
+# by the Order-Triage-approval join, and so the LP can be called once per
+# user click rather than per dashboard load.
+# ---------------------------------------------------------------------------
+@app.get("/fulfillment/incidents", response_model=FulfillmentIncidentsResponse)
+def fulfillment_incidents() -> FulfillmentIncidentsResponse:
+    """At-risk approved orders eligible for fulfillment simulation.
+
+    Filter pipeline (data_pipeline._fetch_fulfillment_incidents):
+      1. Take orders that were ACCEPT or PARTIAL_FULFILL in Order Triage
+         (`tiger_decisions.fct_allocation_decisions`).
+      2. Join against execution-risk signals (recent OTIF failures,
+         low ATP, late production orders) — only orders with at least
+         one active risk surface as incidents.
+      3. If the decision log is empty, fall back to a small demo seed
+         from `fct_otif` history so the UI is never blank.
+
+    Scenarios are NOT included here — the front-end calls
+    POST /fulfillment/simulate per incident on click.
+    """
+    from data_pipeline import fetch_fulfillment_incidents
+    payload = fetch_fulfillment_incidents()
+    return FulfillmentIncidentsResponse(**payload)
+
+
+@app.post("/fulfillment/simulate", response_model=FulfillmentSimulateResponse)
+def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulateResponse:
+    """Run the LP optimizer for one at-risk order and return two scenario
+    cards (Default + Optimal Alternate) ready for the front-end.
+
+    Synchronous, no LLM involved. Typical latency: 0.5-2s dominated by
+    the two BigQuery lookups (network inventory + penalty profile)."""
+    # 1) Per-plant available inventory from BigQuery (commitment-aware).
+    inv_resp = get_network_inventory(
+        material_number=req.material_number,
+        sold_to=req.sold_to,
+    )
+    available_by_plant: dict[str, float] = {}
+    inventory_by_plant: dict[str, dict[str, float]] = {}
+    for row in inv_resp.get("rows", []):
+        plant = row.get("plant_code") or ""
+        if not plant:
+            continue
+        avail = float(row.get("available") or 0)
+        available_by_plant[plant] = avail
+        inventory_by_plant[plant] = {
+            "ending": float(row.get("ending") or 0),
+            "committed": float(row.get("committed") or 0),
+            "available": avail,
+        }
+
+    # 2) Per-customer penalty rate ($/case) + region for freight lookup.
+    penalty_profile = get_customer_penalty_profile(sold_to=req.sold_to)
+    penalty_per_case = float(penalty_profile.get("penalty_per_case_usd") or 25.0)
+
+    # Auto-resolve customer region from dim_customer if the frontend didn't
+    # send one.  The penalty_profile query already hit dim_customer, but
+    # region_state isn't exposed there — do a fast lookup.
+    customer_region = req.customer_region
+    if not customer_region and req.sold_to:
+        try:
+            from data_pipeline import _bq_client
+            bq = _bq_client()
+            rows = list(bq.query(
+                f"SELECT customer_region_state FROM `tiger_semantic.dim_customer` "
+                f"WHERE customer_number = @st LIMIT 1",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("st", "STRING", req.sold_to),
+                    ]
+                ),
+            ).result())
+            if rows:
+                customer_region = rows[0].get("customer_region_state")
+        except Exception:
+            pass  # graceful fallback — use plant defaults
+
+    # 3) Make sure the origin plant is present in the inventory map (it may
+    # have zero available — that's still a valid LP input).
+    origin_plant = req.origin_plant or next(iter(available_by_plant), "ORIGIN")
+    if origin_plant not in available_by_plant:
+        available_by_plant[origin_plant] = 0.0
+        inventory_by_plant.setdefault(origin_plant,
+                                      {"ending": 0.0, "committed": 0.0, "available": 0.0})
+
+    # 4) Delivery context: plant metadata + transit times + carriers.
+    #    Queries dim_plant, fct_shipments, dim_carrier from tiger_semantic.
+    plant_meta: dict[str, dict] = {}
+    try:
+        from data_pipeline import _bq_client as _bq_sem
+        bq_sem = _bq_sem()
+        plant_codes = list(available_by_plant.keys())
+
+        # 4a) dim_plant — names, cities, types for all candidate plants
+        plant_rows = list(bq_sem.query(
+            "SELECT plant_code, plant_name, plant_city, plant_region, plant_type "
+            "FROM `tiger_semantic.dim_plant` "
+            "WHERE plant_code IN UNNEST(@plants)",
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("plants", "STRING", plant_codes),
+                ]
+            ),
+        ).result())
+        for pr in plant_rows:
+            plant_meta[pr["plant_code"]] = {
+                "name": pr.get("plant_name") or "",
+                "city": pr.get("plant_city") or "",
+                "region": pr.get("plant_region") or "",
+                "type": pr.get("plant_type") or "",
+            }
+
+        # 4b) fct_shipments — avg transit hours and primary carrier per
+        #     (origin_plant, destination_region) for the customer's region.
+        #     fct_shipments uses mixed-case regions ("Southeast", "Mountain",
+        #     "Mid-Atlantic", "Central", "Pacific") — map from our normalized
+        #     keys to fct_shipments region names.
+        from fulfillment_optimizer import _normalize_region
+        dest_region = _normalize_region(customer_region)
+        _REGION_TO_SHIPMENT_REGIONS = {
+            "SOUTH": ["South"],
+            "SOUTHEAST": ["Southeast"],
+            "NORTHEAST": ["Northeast", "Mid-Atlantic"],
+            "MIDWEST": ["Central"],
+            "WEST": ["West", "Mountain", "Pacific"],
+        }
+        dest_ship_regions = _REGION_TO_SHIPMENT_REGIONS.get(dest_region or "", [])
+        if dest_ship_regions:
+            ship_rows = list(bq_sem.query(
+                "SELECT origin_plant, "
+                "  ROUND(AVG(transit_duration_hours), 1) AS avg_transit_hours, "
+                "  APPROX_TOP_COUNT(carrier_name, 1)[OFFSET(0)].value AS primary_carrier, "
+                "  COUNT(*) AS shipment_count "
+                "FROM `tiger_semantic.fct_shipments` "
+                "WHERE origin_plant IN UNNEST(@plants) "
+                "  AND destination_region IN UNNEST(@dests) "
+                "GROUP BY origin_plant",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("plants", "STRING", plant_codes),
+                        bigquery.ArrayQueryParameter("dests", "STRING", dest_ship_regions),
+                    ]
+                ),
+            ).result())
+            for sr in ship_rows:
+                p = sr["origin_plant"]
+                pm = plant_meta.setdefault(p, {})
+                pm["avg_transit_hours"] = float(sr.get("avg_transit_hours") or 0) or None
+                pm["primary_carrier"] = sr.get("primary_carrier")
+                pm["shipment_count"] = int(sr.get("shipment_count") or 0)
+        elif plant_codes:
+            # No region → just get overall average per plant.
+            ship_rows = list(bq_sem.query(
+                "SELECT origin_plant, "
+                "  ROUND(AVG(transit_duration_hours), 1) AS avg_transit_hours, "
+                "  APPROX_TOP_COUNT(carrier_name, 1)[OFFSET(0)].value AS primary_carrier, "
+                "  COUNT(*) AS shipment_count "
+                "FROM `tiger_semantic.fct_shipments` "
+                "WHERE origin_plant IN UNNEST(@plants) "
+                "GROUP BY origin_plant",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("plants", "STRING", plant_codes),
+                    ]
+                ),
+            ).result())
+            for sr in ship_rows:
+                p = sr["origin_plant"]
+                pm = plant_meta.setdefault(p, {})
+                pm["avg_transit_hours"] = float(sr.get("avg_transit_hours") or 0) or None
+                pm["primary_carrier"] = sr.get("primary_carrier")
+                pm["shipment_count"] = int(sr.get("shipment_count") or 0)
+
+        # 4c) dim_carrier — on-time performance target for each carrier
+        carriers_seen = {
+            pm.get("primary_carrier")
+            for pm in plant_meta.values()
+            if pm.get("primary_carrier")
+        }
+        if carriers_seen:
+            carrier_rows = list(bq_sem.query(
+                "SELECT carrier_name, carrier_scac_code, transportation_mode, "
+                "  on_time_performance_target_pct "
+                "FROM `tiger_semantic.dim_carrier` "
+                "WHERE carrier_name IN UNNEST(@names)",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("names", "STRING", list(carriers_seen)),
+                    ]
+                ),
+            ).result())
+            carrier_info = {cr["carrier_name"]: dict(cr) for cr in carrier_rows}
+            for pm in plant_meta.values():
+                c = pm.get("primary_carrier")
+                if c and c in carrier_info:
+                    ci = carrier_info[c]
+                    pm["carrier_scac"] = ci.get("carrier_scac_code")
+                    pm["carrier_mode"] = ci.get("transportation_mode")
+                    pm["carrier_otp_target"] = ci.get("on_time_performance_target_pct")
+    except Exception as exc:
+        # Delivery context is best-effort — optimizer still works without it.
+        import traceback
+        print(f"[fulfillment-simulate] delivery context error (non-fatal): "
+              f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}", flush=True)
+
+    # 5) Solve.
+    result = _simulate_fulfillment(
+        ordered_qty=float(req.ordered_quantity_cases),
+        origin_plant=origin_plant,
+        customer_region=customer_region,
+        available_by_plant=available_by_plant,
+        penalty_per_case=penalty_per_case,
+        blocked_plants=req.blocked_plants or (),
+        plant_meta=plant_meta,
+    )
+
+    meta = dict(result.get("meta") or {})
+    meta["inventory_by_plant"] = inventory_by_plant
+    return FulfillmentSimulateResponse(
+        scenarios=result.get("scenarios") or [],
+        meta=meta,
+    )
 
 
 # ---------------------------------------------------------------------------

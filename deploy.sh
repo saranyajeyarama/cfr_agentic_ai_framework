@@ -85,8 +85,7 @@ gcloud run deploy "${BACKEND_SERVICE}" \
   --region="${REGION}" \
   --project="${PROJECT_ID}" \
   --platform=managed \
-  --service-account="${BACKEND_SA}" \
-  --no-allow-unauthenticated \
+  --allow-unauthenticated \
   --port=8080 \
   --memory=4Gi \
   --cpu=2 \
