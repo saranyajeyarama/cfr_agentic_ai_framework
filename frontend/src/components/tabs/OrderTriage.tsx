@@ -102,6 +102,8 @@ export function OrderTriage({
       }
       const r = card.recommendation ?? {};
       const chain = card.reasoning_chain ?? {};
+      console.log('[DEBUG][frontend #5] full recommendation from API:', r);
+      console.log('[DEBUG][frontend #6] fulfill_qty_cs from API:', r.fulfill_qty_cs);
       setAgentEvals(prev => ({
         ...prev,
         [po.id]: {
@@ -146,6 +148,7 @@ export function OrderTriage({
   const proposedAllocation = displayRec
     ? `${displayRec.fulfill_qty_cs.toLocaleString()} cs`
     : activePo.proposedAllocation;
+  console.log('[DEBUG][frontend #7] proposedAllocation display value:', proposedAllocation, '| displayRec:', displayRec ? { fulfill_qty_cs: displayRec.fulfill_qty_cs, action: displayRec.action } : 'none (using static)');
   const proposedHold = displayRec
     ? `${Math.max(0, activePo.requestedQty - displayRec.fulfill_qty_cs).toLocaleString()} cs`
     : activePo.proposedHold;
