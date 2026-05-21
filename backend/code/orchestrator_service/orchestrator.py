@@ -110,6 +110,7 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
     # DEFER. Agents sometimes emit MODIFY (an older verb) — map it to
     # PARTIAL_FULFILL, which is the closest schema-valid action.
     rec = d.get("recommendation")
+    print(f"[DEBUG][normalize #2] raw recommendation from agent: type={type(rec).__name__}, value={rec!r}")
     if isinstance(rec, str):
         action_str = rec.strip().upper()
         canonical = {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}
@@ -133,6 +134,7 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
             "expected_outcome": "",
         }
     elif isinstance(rec, dict):
+        print(f"[DEBUG][normalize #3] agent returned dict. fulfill_qty_cs present={('fulfill_qty_cs' in rec)}, value={rec.get('fulfill_qty_cs')!r}")
         rec["confidence"] = _coerce_confidence(rec.get("confidence")) or _avg_specialist_confidence(d)
         # Replace missing OR explicitly-null values, not just absent keys.
         if rec.get("action") not in {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}:
@@ -251,6 +253,31 @@ def _extract_json(text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Raw response persistence (debug)
+# ---------------------------------------------------------------------------
+_RAW_RESPONSE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "agent_raw_responses"
+)
+
+def _save_raw_response(agent_name: str, adk_session_id: str,
+                       raw_text: str, parsed: dict | None) -> None:
+    os.makedirs(_RAW_RESPONSE_DIR, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"{ts}_{agent_name}_{adk_session_id}.json"
+    filepath = os.path.join(_RAW_RESPONSE_DIR, filename)
+    payload = {
+        "timestamp": ts,
+        "agent": agent_name,
+        "adk_session_id": adk_session_id,
+        "raw_text": raw_text,
+        "parsed_json": parsed,
+    }
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+    print(f"[DEBUG] raw response saved → {filepath}")
+
+
+# ---------------------------------------------------------------------------
 # Specialist / synthesizer invocation
 # ---------------------------------------------------------------------------
 async def _invoke_agent(
@@ -312,10 +339,14 @@ async def _invoke_agent(
         ):
             # Bug #6 — real ADK Event API.
             for fc in event.get_function_calls():
+                _args = dict(fc.args) if fc.args else {}
+                # ───────── DEBUG-RDD: log every tool call ─────────
+                print(f"[DEBUG-RDD][orchestrator] {agent_name} → "
+                      f"{fc.name}({_args})")
                 writer.write(
                     agent=agent_name, round_idx=round_idx, action="tool_call",
                     tool_name=fc.name,
-                    tool_args=dict(fc.args) if fc.args else {},
+                    tool_args=_args,
                     notes=f"{agent_name} called {fc.name}",
                 )
             for fr in event.get_function_responses():
@@ -324,6 +355,9 @@ async def _invoke_agent(
                 rc = result.get("row_count")
                 summary = (f"{fr.name} returned {rc} rows" if rc is not None
                            else f"{fr.name} returned a result")
+                # ───────── DEBUG-RDD: log every tool response ─────────
+                print(f"[DEBUG-RDD][orchestrator] {agent_name} ← "
+                      f"{fr.name} returned row_count={rc}")
                 writer.write(
                     agent=agent_name, round_idx=round_idx, action="tool_call",
                     tool_name=fr.name, tool_result_summary=summary,
@@ -335,6 +369,10 @@ async def _invoke_agent(
                     p.text for p in event.content.parts
                     if getattr(p, "text", None))
                 response_json = _extract_json(text)
+                try:
+                    _save_raw_response(agent_name, adk_session_id, text, response_json)
+                except Exception as _save_err:
+                    print(f"[DEBUG] failed to save raw response: {_save_err}")
       finally:
         # Drop the ADK session immediately — InMemorySessionService keeps
         # every session forever otherwise. With sequential sessions + 4
@@ -548,11 +586,13 @@ async def run_session(session_id: str, trigger_type: str,
         writer.write(agent="orchestrator", action="route",
                      notes="Synthesizing — Customer Supply Agent.")
         decision = await _synthesize(order_event, signals, conflicts, writer)
+        print(f"[DEBUG][synthesize #1] raw agent decision recommendation: {decision.get('recommendation')!r}")
 
         # Normalize Gemini's frequent flat shapes into the nested schema
         # the front-end expects. Idempotent — re-runs on already-nested
         # outputs are no-ops.
         _normalize_decision(decision, order_event, session_id)
+        print(f"[DEBUG][normalize #4] after _normalize_decision, fulfill_qty_cs={decision.get('recommendation', {}).get('fulfill_qty_cs')!r}")
 
         # Schema enforcement moved orchestrator-side in v2.02A (ADK 1.0.0
         # forbids output_schema alongside tools — see agents.py). Validate
