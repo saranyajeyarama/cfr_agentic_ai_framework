@@ -629,6 +629,7 @@ def get_active_alerts(
 def get_finished_goods_inventory(
     material_number: str,
     plant_code: Optional[str] = None,
+    requested_delivery_date: Optional[str] = None,
 ) -> dict:
     """Forward available-to-promise position for a FERT SKU.
 
@@ -641,12 +642,48 @@ def get_finished_goods_inventory(
     Args:
         material_number: FERT material number.
         plant_code: optional plant filter.
+        requested_delivery_date: optional ISO date 'YYYY-MM-DD'. When
+            provided, the projection window is anchored on this date as
+            [delivery - 4 weeks, delivery + 1 week]. If omitted or invalid,
+            the tool falls back to the original CURRENT_DATE() window.
     """
+    # ───────── DEBUG-RDD: tool entry log ─────────
+    print(f"[DEBUG-RDD][get_finished_goods_inventory] called with "
+          f"material_number={material_number!r}, plant_code={plant_code!r}, "
+          f"requested_delivery_date={requested_delivery_date!r}")
+
+    # Original behavior preserved EXACTLY — runs as the default and is only
+    # overridden inside the try block below if a valid delivery date arrives.
     where = ["material_fert_number = @matnr",
              "projection_week_start_date BETWEEN "
              "DATE_SUB(CURRENT_DATE(), INTERVAL 1 WEEK) "
              "AND DATE_ADD(CURRENT_DATE(), INTERVAL 4 WEEK)"]
     params = [_p("matnr", "STRING", material_number)]
+    _window_strategy = "fallback_current_date"  # for debug logging
+
+    # ───────── DEBUG-RDD: rdd-anchored window override ─────────
+    if requested_delivery_date:
+        try:
+            from datetime import date as _date
+            _date.fromisoformat(requested_delivery_date)  # validate format
+            where = ["material_fert_number = @matnr",
+                     "projection_week_start_date BETWEEN "
+                     "DATE_SUB(DATE(@rdd), INTERVAL 4 WEEK) "
+                     "AND DATE_ADD(DATE(@rdd), INTERVAL 1 WEEK)"]
+            params = [_p("matnr", "STRING", material_number),
+                      _p("rdd", "STRING", requested_delivery_date)]
+            _window_strategy = "rdd_anchored"
+            print(f"[DEBUG-RDD][get_finished_goods_inventory] using "
+                  f"rdd-anchored window: [{requested_delivery_date} - 4w, "
+                  f"{requested_delivery_date} + 1w]")
+        except Exception as e:
+            print(f"[DEBUG-RDD][get_finished_goods_inventory] rdd "
+                  f"validation failed ({e!r}); falling back to "
+                  f"CURRENT_DATE() window")
+    else:
+        print(f"[DEBUG-RDD][get_finished_goods_inventory] no rdd "
+              f"provided; using CURRENT_DATE() window")
+
     if plant_code:
         where.append("plant_code = @plant")
         params.append(_p("plant", "STRING", plant_code))
@@ -664,7 +701,41 @@ def get_finished_goods_inventory(
       ORDER BY plant_code, projection_week_start_date ASC
       LIMIT 100
     """
-    rows = _run_query(sql, params)
+    try:
+        rows = _run_query(sql, params)
+    except Exception as e:
+        # ───────── DEBUG-RDD: query failed; fall back to original ─────────
+        print(f"[DEBUG-RDD][get_finished_goods_inventory] query failed "
+              f"with strategy={_window_strategy}, error={e!r}; "
+              f"retrying with original CURRENT_DATE() window")
+        where = ["material_fert_number = @matnr",
+                 "projection_week_start_date BETWEEN "
+                 "DATE_SUB(CURRENT_DATE(), INTERVAL 1 WEEK) "
+                 "AND DATE_ADD(CURRENT_DATE(), INTERVAL 4 WEEK)"]
+        params = [_p("matnr", "STRING", material_number)]
+        if plant_code:
+            where.append("plant_code = @plant")
+            params.append(_p("plant", "STRING", plant_code))
+        sql = f"""
+          SELECT plan_version_id, material_fert_number,
+                 plant_code, storage_location,
+                 projection_week_start_date,
+                 opening_inventory_cases, production_receipts_cases,
+                 transfer_receipts_cases, shipments_demand_cases,
+                 ending_inventory_cases, days_of_supply,
+                 safety_stock_target_cases, projection_status
+          FROM `{SEMANTIC_DS}.fct_inventory_projection`
+          WHERE {' AND '.join(where)}
+          ORDER BY plant_code, projection_week_start_date ASC
+          LIMIT 100
+        """
+        rows = _run_query(sql, params)
+        _window_strategy = "fallback_after_error"
+
+    # ───────── DEBUG-RDD: result log ─────────
+    print(f"[DEBUG-RDD][get_finished_goods_inventory] returned "
+          f"row_count={len(rows)}, strategy={_window_strategy}")
+
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_inventory_projection",
             "row_count": len(rows)}
@@ -673,16 +744,57 @@ def get_finished_goods_inventory(
 def get_safety_stock_position(
     material_number: str,
     plant_code: Optional[str] = None,
+    requested_delivery_date: Optional[str] = None,
 ) -> dict:
     """Forward inventory vs safety-stock target, current projection week.
 
     Reads fct_inventory_projection: ending_inventory_cases against
     safety_stock_target_cases, with projection_status (OK / BELOW_SS /
     STOCKOUT) as the headline flag.
+
+    Args:
+        material_number: FERT material number.
+        plant_code: optional plant filter.
+        requested_delivery_date: optional ISO date 'YYYY-MM-DD'. When
+            provided, the projection window is anchored on this date as
+            [delivery - 4 weeks, delivery + 1 week]. If omitted or invalid,
+            the tool falls back to projection_week_start_date >= CURRENT_DATE().
     """
+    # ───────── DEBUG-RDD: tool entry log ─────────
+    print(f"[DEBUG-RDD][get_safety_stock_position] called with "
+          f"material_number={material_number!r}, plant_code={plant_code!r}, "
+          f"requested_delivery_date={requested_delivery_date!r}")
+
+    # Original behavior preserved EXACTLY — runs as the default and is only
+    # overridden inside the try block below if a valid delivery date arrives.
     where = ["material_fert_number = @matnr",
              "projection_week_start_date >= CURRENT_DATE()"]
     params = [_p("matnr", "STRING", material_number)]
+    _window_strategy = "fallback_current_date"
+
+    # ───────── DEBUG-RDD: rdd-anchored window override ─────────
+    if requested_delivery_date:
+        try:
+            from datetime import date as _date
+            _date.fromisoformat(requested_delivery_date)
+            where = ["material_fert_number = @matnr",
+                     "projection_week_start_date BETWEEN "
+                     "DATE_SUB(DATE(@rdd), INTERVAL 4 WEEK) "
+                     "AND DATE_ADD(DATE(@rdd), INTERVAL 1 WEEK)"]
+            params = [_p("matnr", "STRING", material_number),
+                      _p("rdd", "STRING", requested_delivery_date)]
+            _window_strategy = "rdd_anchored"
+            print(f"[DEBUG-RDD][get_safety_stock_position] using "
+                  f"rdd-anchored window: [{requested_delivery_date} - 4w, "
+                  f"{requested_delivery_date} + 1w]")
+        except Exception as e:
+            print(f"[DEBUG-RDD][get_safety_stock_position] rdd "
+                  f"validation failed ({e!r}); falling back to "
+                  f"CURRENT_DATE() window")
+    else:
+        print(f"[DEBUG-RDD][get_safety_stock_position] no rdd "
+              f"provided; using CURRENT_DATE() window")
+
     if plant_code:
         where.append("plant_code = @plant")
         params.append(_p("plant", "STRING", plant_code))
@@ -699,7 +811,38 @@ def get_safety_stock_position(
       ORDER BY plant_code, projection_week_start_date ASC
       LIMIT 50
     """
-    rows = _run_query(sql, params)
+    try:
+        rows = _run_query(sql, params)
+    except Exception as e:
+        # ───────── DEBUG-RDD: query failed; fall back to original ─────────
+        print(f"[DEBUG-RDD][get_safety_stock_position] query failed "
+              f"with strategy={_window_strategy}, error={e!r}; "
+              f"retrying with original CURRENT_DATE() window")
+        where = ["material_fert_number = @matnr",
+                 "projection_week_start_date >= CURRENT_DATE()"]
+        params = [_p("matnr", "STRING", material_number)]
+        if plant_code:
+            where.append("plant_code = @plant")
+            params.append(_p("plant", "STRING", plant_code))
+        sql = f"""
+          SELECT plant_code, material_fert_number,
+                 projection_week_start_date,
+                 ending_inventory_cases, safety_stock_target_cases,
+                 days_of_supply, projection_status,
+                 ending_inventory_cases < safety_stock_target_cases
+                    AS below_safety_stock
+          FROM `{SEMANTIC_DS}.fct_inventory_projection`
+          WHERE {' AND '.join(where)}
+          ORDER BY plant_code, projection_week_start_date ASC
+          LIMIT 50
+        """
+        rows = _run_query(sql, params)
+        _window_strategy = "fallback_after_error"
+
+    # ───────── DEBUG-RDD: result log ─────────
+    print(f"[DEBUG-RDD][get_safety_stock_position] returned "
+          f"row_count={len(rows)}, strategy={_window_strategy}")
+
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_inventory_projection",
             "row_count": len(rows)}
