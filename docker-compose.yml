@@ -27,6 +27,7 @@ services:
       - 1.1.1.1
     volumes:
       - ./backend/resilience-riskradar-2c010597a83b.json:/secrets/sa-key.json:ro
+      - ./backend/agent_raw_responses:/app/agent_raw_responses
     environment:
       PROJECT_ID: resilience-riskradar
       GOOGLE_CLOUD_PROJECT: resilience-riskradar
