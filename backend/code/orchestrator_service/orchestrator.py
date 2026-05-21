@@ -106,21 +106,21 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
       confidence     : "HIGH"  ->  0.85
     """
     # recommendation: flat string -> wrapped dict.
-    # Agents emit ACCEPT / MODIFY / REJECT / DEFER; map DEFER to MODIFY
-    # since the schema only knows the three canonical actions, and a
-    # DEFER usually maps to "hold / shorten quantity" in the UI.
+    # The schema's valid actions are ACCEPT / REJECT / PARTIAL_FULFILL /
+    # DEFER. Agents sometimes emit MODIFY (an older verb) — map it to
+    # PARTIAL_FULFILL, which is the closest schema-valid action.
     rec = d.get("recommendation")
     print(f"[DEBUG][normalize #2] raw recommendation from agent: type={type(rec).__name__}, value={rec!r}")
     if isinstance(rec, str):
         action_str = rec.strip().upper()
-        canonical = {"ACCEPT", "MODIFY", "REJECT"}
-        if action_str == "DEFER":
-            mapped = "MODIFY"
-            qty = 0
+        canonical = {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}
+        if action_str == "MODIFY":
+            mapped = "PARTIAL_FULFILL"
+            qty = 0  # human will set the real fulfill qty
         elif action_str in canonical:
             mapped = action_str
             qty = float(getattr(order_event, "ordered_quantity_cases", 0) or 0)
-            if mapped == "REJECT":
+            if mapped in {"REJECT", "DEFER"}:
                 qty = 0
         else:
             mapped = "ACCEPT"
@@ -136,10 +136,20 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
     elif isinstance(rec, dict):
         print(f"[DEBUG][normalize #3] agent returned dict. fulfill_qty_cs present={('fulfill_qty_cs' in rec)}, value={rec.get('fulfill_qty_cs')!r}")
         rec["confidence"] = _coerce_confidence(rec.get("confidence")) or _avg_specialist_confidence(d)
-        rec.setdefault("action", "ACCEPT")
-        rec.setdefault("fulfill_qty_cs", 0)
-        rec.setdefault("expected_outcome", "")
-        print(f"[DEBUG][normalize #3] after setdefault, fulfill_qty_cs={rec.get('fulfill_qty_cs')!r}")
+        # Replace missing OR explicitly-null values, not just absent keys.
+        if rec.get("action") not in {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}:
+            raw = (rec.get("action") or "").strip().upper()
+            rec["raw_action"] = raw or rec.get("raw_action")
+            rec["action"] = "PARTIAL_FULFILL" if raw == "MODIFY" else "ACCEPT"
+        if rec.get("fulfill_qty_cs") is None:
+            order_qty = float(getattr(order_event, "ordered_quantity_cases", 0) or 0)
+            rec["fulfill_qty_cs"] = 0 if rec["action"] in {"REJECT", "DEFER"} else order_qty
+        try:
+            rec["fulfill_qty_cs"] = float(rec["fulfill_qty_cs"])
+        except (TypeError, ValueError):
+            rec["fulfill_qty_cs"] = 0.0
+        if rec.get("expected_outcome") is None:
+            rec["expected_outcome"] = ""
         d["recommendation"] = rec
     else:
         d["recommendation"] = {"action": "ACCEPT", "fulfill_qty_cs": 0,
@@ -161,6 +171,51 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
         d["reasoning_chain"] = {"key_trade_offs": [],
                                 "what_would_change_the_decision": "",
                                 "evidence_by_agent": {}}
+
+    # escalations: list of free-form dicts -> Escalations schema dict.
+    # Synthesizer emits items like {raised_by, escalation_reason,
+    # escalation_type, escalated_to?}; the schema expects
+    # {to_transportation_manager, to_demand_planning_team,
+    # to_supply_planning_team}, each an Escalation {summary, severity,
+    # recommended_action}. Route each item to a bucket by content and
+    # synthesize the expected fields. The raw list is preserved under
+    # _raw_escalations so the UI / human reviewer can still see it.
+    esc = d.get("escalations")
+    if isinstance(esc, list):
+        raw = esc
+        buckets: dict[str, dict | None] = {
+            "to_transportation_manager": None,
+            "to_demand_planning_team": None,
+            "to_supply_planning_team": None,
+        }
+        _sev_for = {"CRITICAL": "CRITICAL", "DEADLOCK": "HIGH",
+                    "DATA_GAP": "MEDIUM", "INFO": "LOW"}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            target = ((item.get("escalated_to") or "") + " "
+                      + (item.get("raised_by") or "")).lower()
+            if "transport" in target:
+                key = "to_transportation_manager"
+            elif "demand" in target:
+                key = "to_demand_planning_team"
+            else:
+                key = "to_supply_planning_team"
+            etype = str(item.get("escalation_type") or "").upper()
+            esc_obj = {
+                "summary": (item.get("escalation_reason")
+                            or item.get("reason")
+                            or item.get("summary") or "")[:1000],
+                "severity": _sev_for.get(etype, "MEDIUM"),
+                "recommended_action": (item.get("recommended_action")
+                                       or "Review and resolve manually."),
+            }
+            if buckets[key] is None:
+                buckets[key] = esc_obj
+        d["escalations"] = {k: v for k, v in buckets.items() if v is not None}
+        d["_raw_escalations"] = raw
+    elif not isinstance(esc, dict):
+        d["escalations"] = {}
 
     # session_id is required by the schema; the synthesizer doesn't know
     # it, so fill it in here.

@@ -328,7 +328,7 @@ def _fetch_purchase_orders(client: bigquery.Client) -> list[dict]:
           AND so.requested_delivery_date <= DATE_ADD(anchor.max_dt, INTERVAL 7 DAY)
           AND so.requested_delivery_date >= DATE_SUB(anchor.max_dt, INTERVAL 30 DAY)
         ORDER BY so.requested_delivery_date ASC
-        LIMIT 20
+        LIMIT 100
     """)
 
     pos: list[dict] = []
