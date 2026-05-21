@@ -63,7 +63,7 @@ DECISIONS_DS = f"{PROJECT_ID}.tiger_decisions"
 DEMO_SOLD_TO = os.environ.get("DEMO_SOLD_TO")        # e.g. "0001000245"
 DEMO_MATERIAL = os.environ.get("DEMO_MATERIAL")      # e.g. "MAT-..."
 
-_bq = bigquery.Client(project=PROJECT_ID)
+_bq = bigquery.Client(project=PROJECT_ID, location="us-central1")
 
 
 # Tool results are kept in the ADK session memory for the duration of the
@@ -1460,39 +1460,46 @@ def get_allocation_history(
         where_dec.append("sold_to = @sold_to")
         params.append(_p("sold_to", "STRING", sold_to))
 
-    sql = f"""
-      WITH historical AS (
-        SELECT decision_date, sold_to, priority_tier_at_decision,
-               ordered_quantity_cases, allocated_quantity_cases,
-               delivered_quantity_cases, fill_rate_pct,
-               decision_status, decision_reason,
-               'historical' AS source
-        FROM `{SEMANTIC_DS}.fct_allocation_decisions`
-        WHERE {' AND '.join(where_sem)}
-      ),
-      agentic AS (
-        SELECT decision_date, sold_to, priority_tier_at_decision,
-               ordered_quantity_cases, allocated_quantity_cases,
-               delivered_quantity_cases, fill_rate_pct,
-               decision_status, decision_reason,
-               'agentic' AS source
-        FROM `{DECISIONS_DS}.fct_allocation_decisions`
-        WHERE {' AND '.join(where_dec)}
-      )
-      SELECT * FROM historical
-      UNION ALL
-      SELECT * FROM agentic
+    # Historical decisions live in tiger_semantic (us-central1);
+    # agentic decisions live in tiger_decisions (US multi-region).
+    # Can't UNION across regions in one query, so we run two and merge.
+    sql_hist = f"""
+      SELECT decision_date, sold_to, priority_tier_at_decision,
+             ordered_quantity_cases, allocated_quantity_cases,
+             delivered_quantity_cases, fill_rate_pct,
+             decision_status, decision_reason,
+             'historical' AS source
+      FROM `{SEMANTIC_DS}.fct_allocation_decisions`
+      WHERE {' AND '.join(where_sem)}
       ORDER BY decision_date DESC
-      LIMIT 100
+      LIMIT 50
     """
+    sql_agent = f"""
+      SELECT decision_date, sold_to, priority_tier_at_decision,
+             ordered_quantity_cases, allocated_quantity_cases,
+             delivered_quantity_cases, fill_rate_pct,
+             decision_status, decision_reason,
+             'agentic' AS source
+      FROM `{DECISIONS_DS}.fct_allocation_decisions`
+      WHERE {' AND '.join(where_dec)}
+      ORDER BY decision_date DESC
+      LIMIT 50
+    """
+    rows: list[dict] = []
     try:
-        rows = _run_query(sql, params)
-    except Exception as exc:
-        # tiger_decisions table may not exist on a fresh deploy.
-        return {"rows": [], "row_count": 0,
-                "rationale": f"Allocation history unavailable: {exc}",
-                "view_queried": ("tiger_semantic.fct_allocation_decisions + "
-                                 "tiger_decisions.fct_allocation_decisions")}
+        rows.extend(_run_query(sql_hist, params))
+    except Exception:
+        pass  # historical view may not exist
+    try:
+        # tiger_decisions is in the US region — use a US-located client.
+        _bq_us = bigquery.Client(project=PROJECT_ID, location="US")
+        cfg = bigquery.QueryJobConfig(query_parameters=params or [])
+        agent_rows = [dict(r) for r in _bq_us.query(sql_agent, job_config=cfg).result()]
+        rows.extend(agent_rows[:_ROW_CAP])
+    except Exception:
+        pass  # tiger_decisions table may not exist on a fresh deploy
+    rows.sort(key=lambda r: str(r.get("decision_date", "")), reverse=True)
+    rows = rows[:100]
     return {"rows": rows,
             "view_queried": ("tiger_semantic.fct_allocation_decisions + "
                              "tiger_decisions.fct_allocation_decisions"),
@@ -1548,6 +1555,9 @@ def dce_write(
                  and isinstance(allocated, (int, float)) else None)
 
     # Agent-specific payload packed into decision_reason as JSON (Option A).
+    # `trigger` packs the original order context — fct_allocation_decisions
+    # has only `sold_to`, so downstream consumers (Fulfillment Simulator)
+    # JSON_VALUE the material_number / customer_name / mabd from here.
     decision_reason_obj = {
         "_dce_schema": "agent_v2_01",
         "rationale": rec.get("expected_outcome"),
@@ -1568,6 +1578,14 @@ def dce_write(
             name: {"disposition": s.get("disposition"),
                    "confidence": s.get("confidence")}
             for name, s in signals.items()
+        },
+        "trigger": {
+            "material_number": order.get("material_number"),
+            "material_description": order.get("material_description"),
+            "customer_name": order.get("customer_name"),
+            "requested_delivery_date": order.get("requested_delivery_date"),
+            "sales_order_number": order.get("sales_order_number"),
+            "trigger_source": order.get("trigger_source"),
         },
         "trigger_source": order.get("trigger_source"),
         "session_id": session_id,
@@ -1608,6 +1626,167 @@ def dce_write(
             "table": table_ref,
             "inserted_at": datetime.now(timezone.utc).isoformat(),
             "dce_schema": "agent_v2_01"}
+
+
+# ===========================================================================
+# FULFILLMENT SIMULATOR  →  per-plant ATP across the network + per-customer
+# penalty rate. Used by the LP optimizer in fulfillment_optimizer.py.
+# ===========================================================================
+def get_network_inventory(material_number: str, sold_to: Optional[str] = None) -> dict:
+    """Per-plant available finished-goods position across the network.
+
+    For each plant carrying this FERT, returns the most recent forward
+    projection week's ending_inventory_cases (tiger_semantic.fct_inventory_
+    projection) as `available`.
+
+    Phase 1 limitation: this does NOT subtract open commitments from
+    tiger_decisions.fct_allocation_decisions yet. The decision log lives
+    in a separate dataset and the cross-dataset join needs a location
+    fix (BQ picks the wrong region when both are referenced). Until the
+    location handling is in, `committed` is reported as 0 and `available`
+    equals `ending`. This is safe for the demo (decision log is empty)
+    and gives the LP correctly-bounded plant capacities; once Phase 2
+    wires real commitments, only the `committed` and `available` columns
+    change — the caller surface is stable.
+
+    Args:
+        material_number: FERT material number.
+        sold_to: accepted but unused in Phase 1 (commits are not subtracted).
+
+    Returns:
+        {
+          "rows": [{plant_code, ending, committed, available}, ...],
+          "view_queried": "tiger_semantic.fct_inventory_projection",
+          "row_count": int,
+          "note": "commitments not subtracted in Phase 1"
+        }
+    """
+    params = [_p("matnr", "STRING", material_number)]
+    # The projection table in this demo dataset covers a future window
+    # (~2026-07 → 2027-07), not necessarily anchored to today. Rather than
+    # gate by a wall-clock window, take the EARLIEST available projection
+    # row per plant — that's the freshest forward ATP regardless of when
+    # "today" is on the container clock.
+    sql = f"""
+      WITH per_plant AS (
+        SELECT plant_code,
+               ARRAY_AGG(STRUCT(projection_week_start_date,
+                                ending_inventory_cases)
+                         ORDER BY projection_week_start_date ASC LIMIT 1)[OFFSET(0)] AS first_proj
+        FROM `{SEMANTIC_DS}.fct_inventory_projection`
+        WHERE material_fert_number = @matnr
+        GROUP BY plant_code
+      )
+      SELECT plant_code,
+             COALESCE(first_proj.ending_inventory_cases, 0) AS ending,
+             CAST(0 AS FLOAT64) AS committed,
+             COALESCE(first_proj.ending_inventory_cases, 0) AS available
+      FROM per_plant
+      WHERE COALESCE(first_proj.ending_inventory_cases, 0) > 0
+      ORDER BY plant_code
+    """
+    rows = _run_query(sql, params)
+    return {
+        "rows": rows,
+        "view_queried": "tiger_semantic.fct_inventory_projection",
+        "row_count": len(rows),
+        "note": "commitments not subtracted in Phase 1",
+        "sold_to_filter_applied": False,
+    }
+
+
+def get_customer_penalty_profile(sold_to: str) -> dict:
+    """Per-customer fine rate ($/case) for OTIF failures.
+
+    Combines:
+      - dim_customer.otif_target_pct (SLA threshold; informational)
+      - fct_chargebacks (last 180 days): avg posted chargeback amount per
+        late case → usable as penalty_per_case in the LP.
+
+    Falls back to a conservative default ($25/case) if no chargeback
+    history exists for this customer.
+
+    Args:
+        sold_to: SAP sold-to customer number.
+
+    Returns:
+        {
+          "sold_to": ...,
+          "otif_target_pct": ...,
+          "avg_chargeback_per_late_case_usd": ...,
+          "sample_size_chargebacks": ...,
+          "penalty_per_case_usd": ...,   # the value the LP uses
+          "is_fallback": bool,
+          "view_queried": "tiger_semantic.dim_customer + fct_chargebacks"
+        }
+    """
+    params = [_p("sold_to", "STRING", sold_to)]
+    sql = f"""
+      WITH cust AS (
+        SELECT customer_number, otif_target_pct, priority_tier_name
+        FROM `{SEMANTIC_DS}.dim_customer`
+        WHERE customer_number = @sold_to
+        LIMIT 1
+      ),
+      cb AS (
+        SELECT AVG(NULLIF(c.chargeback_amount_usd, 0))
+                 AS avg_amount_usd,
+               COUNT(*) AS n
+        FROM `{SEMANTIC_DS}.fct_chargebacks` c
+        WHERE c.sold_to = @sold_to
+          AND c.chargeback_assessed_date >=
+              DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)
+          AND COALESCE(c.chargeback_status, '') <> 'WRITTEN_OFF'
+      ),
+      late_units AS (
+        SELECT SUM(GREATEST(o.ordered_quantity_cases
+                            - COALESCE(o.delivered_quantity_cases, 0), 0))
+                 AS late_qty
+        FROM `{SEMANTIC_DS}.fct_otif` o
+        WHERE o.sold_to = @sold_to
+          AND o.otif_flag = 'N'
+          AND o.delivery_date_promised >=
+              DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)
+      )
+      SELECT cust.customer_number, cust.otif_target_pct, cust.priority_tier_name,
+             cb.avg_amount_usd, cb.n AS sample_size_chargebacks,
+             late_units.late_qty
+      FROM cust, cb, late_units
+    """
+    rows = _run_query(sql, params)
+    if not rows:
+        return {
+            "sold_to": sold_to,
+            "otif_target_pct": None,
+            "avg_chargeback_per_late_case_usd": None,
+            "sample_size_chargebacks": 0,
+            "penalty_per_case_usd": 25.0,
+            "is_fallback": True,
+            "view_queried": "tiger_semantic.dim_customer + fct_chargebacks",
+        }
+    r = rows[0]
+    avg_amt = r.get("avg_amount_usd")
+    n_cb = int(r.get("sample_size_chargebacks") or 0)
+    late_qty = float(r.get("late_qty") or 0)
+    per_case = None
+    if avg_amt and late_qty > 0 and n_cb > 0:
+        # Total posted chargebacks ÷ total late case-volume in the same window.
+        per_case = float(avg_amt) * n_cb / late_qty
+    if not per_case or per_case <= 0:
+        per_case = 25.0
+        is_fallback = True
+    else:
+        is_fallback = False
+    return {
+        "sold_to": sold_to,
+        "otif_target_pct": r.get("otif_target_pct"),
+        "priority_tier_name": r.get("priority_tier_name"),
+        "avg_chargeback_per_late_case_usd": round(float(avg_amt), 2) if avg_amt else None,
+        "sample_size_chargebacks": n_cb,
+        "penalty_per_case_usd": round(per_case, 2),
+        "is_fallback": is_fallback,
+        "view_queried": "tiger_semantic.dim_customer + fct_chargebacks",
+    }
 
 
 # ===========================================================================
@@ -1714,4 +1893,8 @@ ALL_TOOLS = {
     "get_promotional_context":      get_promotional_context,
     "get_forecast_accuracy":        get_forecast_accuracy,
     "get_allocation_history":       get_allocation_history,
+    # Fulfillment Simulator (Phase 1) — used by fulfillment_optimizer.py.
+    # Not bound to any agent yet; future agents can register them via _T().
+    "get_network_inventory":        get_network_inventory,
+    "get_customer_penalty_profile": get_customer_penalty_profile,
 }

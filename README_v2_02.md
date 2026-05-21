@@ -102,3 +102,61 @@ The five tabs now run on the real contract. Deeper features — richer agent
 visibility, new visualizations, per-specialist drill-downs — are the next
 phase. `API_CONTRACT_v2_02.md` is the spec to build them against; nothing
 should reintroduce the old `customer_kunnr` / `material_matnr` field names.
+
+
+
+
+
+
+
+Here's the step-by-step for deploying **tiger-frontend** from the UI using continuous deployment:
+
+**On the "Create service" screen you're on:**
+
+1. Select **"Continuously deploy from a repository"** (the GitHub/GitLab/Bitbucket option)
+
+2. Click **"Set up with Cloud Build"** → it opens a side panel
+
+3. **Repository Provider** — pick **GitHub** (or wherever your repo is hosted)
+
+4. **Authenticate** — sign into GitHub and grant access to the repo
+
+5. **Select repository** — choose your `cfr_agentic_ai_framework_v2_02` repo
+
+6. **Branch** — select `main` (or whichever branch you deploy from)
+
+7. **Build Type** — select **Dockerfile**
+
+8. **Source location** — set to `/frontend/Dockerfile` (path within the repo)
+
+9. Click **Save**
+
+**Back on the main Create service screen:**
+
+10. **Service name** — `tiger-frontend`
+
+11. **Region** — `us-central1`
+
+12. Scroll down to **"Authentication"** — select **"Allow unauthenticated invocations"**
+
+13. Expand **"Container, Networking, Security"** tab:
+    - **Container port**: `8080`
+    - **Memory**: `512Mi`
+    - **CPU**: `1`
+    - Under **"Variables & Secrets"** tab, add environment variable:
+      - `BACKEND_URL` = `https://tiger-orchestrator-182983932769.us-central1.run.app`
+
+14. Click **Create**
+
+---
+
+**Repeat the same for tiger-orchestrator**, but with these differences:
+- **Source location**: `/backend/Dockerfile`
+- **Service name**: `tiger-orchestrator`
+- **Authentication**: **"Require authentication"**
+- **Memory**: `4Gi`, **CPU**: `2`
+- **Environment variables**: all the backend vars (PROJECT_ID, AI_PROVIDER, etc.)
+
+---
+
+After setup, every push to `main` will auto-trigger a new build and deployment for each service.

@@ -42,7 +42,12 @@ COPY code/orchestrator_service/orchestrator.py     /app/orchestrator.py
 COPY code/orchestrator_service/firestore_client.py /app/firestore_client.py
 COPY code/orchestrator_service/bigquery_client.py  /app/bigquery_client.py
 COPY code/orchestrator_service/data_pipeline.py    /app/data_pipeline.py
+COPY code/orchestrator_service/fulfillment_optimizer.py /app/fulfillment_optimizer.py
 COPY code/orchestrator_service/main.py             /app/main.py
+
+# Static config (freight-cost lookup table for the fulfillment LP)
+COPY code/orchestrator_service/config/ /app/config/
+ENV FREIGHT_COSTS_PATH=/app/config/freight_costs.json
 
 # Agent system prompts (loaded by name at agent init)
 COPY agents/ /app/agents/

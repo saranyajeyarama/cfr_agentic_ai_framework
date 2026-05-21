@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, Check, CheckCircle2, ChevronRight, CornerDownRight, X, Info, ShieldAlert, Bot, Loader2 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { buildStartSessionRequest } from '../../lib/api';
-import type { AgentEvalState, AgentEvalMap } from '../../lib/agentEvals';
+import type { AgentEvalState, AgentEvalMap, DecisionEntry, UserDecision } from '../../lib/agentEvals';
 import type { DashboardData } from '../../types/dashboard';
 
 type Severity = 'critical' | 'warning' | 'neutral';
@@ -34,16 +34,6 @@ type PO = {
   mabd?: string;
 };
 
-type DecisionEntry = {
-  id: string;
-  timestamp: string;
-  poNumber: string;
-  customer: string;
-  agentRecommendation: string;
-  userDecision: string;
-  overrideReason: string | null;
-  outcome: string;
-};
 
 
 
@@ -68,17 +58,24 @@ export function OrderTriage({
   data,
   agentEvals,
   setAgentEvals,
+  decisionLog,
+  setDecisionLog,
+  onDecisionSaved,
 }: {
   data: DashboardData;
   agentEvals: AgentEvalMap;
   setAgentEvals: React.Dispatch<React.SetStateAction<AgentEvalMap>>;
+  decisionLog: DecisionEntry[];
+  setDecisionLog: React.Dispatch<React.SetStateAction<DecisionEntry[]>>;
+  /** Called after a decision is persisted to the backend so the Fulfillment
+   *  Simulator can re-fetch its incident list and pick up newly approved orders. */
+  onDecisionSaved?: () => void;
 }) {
   const PURCHASE_ORDERS: PO[] = data.purchaseOrders as PO[];
   const [activePoId, setActivePoId] = useState<string>(PURCHASE_ORDERS[0]?.id || '');
   const [decision, setDecision] = useState<'accept' | 'modify' | 'reject' | null>(null);
   const [overrideReason, setOverrideReason] = useState('');
   const [showRationale, setShowRationale] = useState(false);
-  const [decisionLog, setDecisionLog] = useState<DecisionEntry[]>(data.decisionCaptureLog);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
 
@@ -172,40 +169,85 @@ export function OrderTriage({
   };
 
   const handleExecuteDecision = async () => {
+    if (!decision) return;
     setIsSubmitting(true);
     const evalSessionId = activeEval?.sessionId ?? null;
+    let outcomeNote = '';
+    let decisionIdFromBackend: string | undefined;
 
-    // If agent already created a session, log against it; otherwise log locally
-    let outcomeNote = evalSessionId
-      ? `session ${evalSessionId} evaluated`
-      : 'logged locally';
-
-    if (!evalSessionId) {
-      try {
-        const res = await fetch('/api/sessions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(buildStartSessionRequest(poToOrder(activePo))),
-        });
-        if (res.ok) {
-          const d = await res.json();
-          outcomeNote = `session ${d.session_id} started`;
+    try {
+      // ── 1. Persist the decision to BigQuery via the backend ──────────
+      if (evalSessionId) {
+        if (decision === 'accept' || decision === 'modify') {
+          const res = await fetch(`/api/sessions/${evalSessionId}/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              user_id: 'planner',
+              approval_notes: decision === 'modify' ? overrideReason : null,
+            }),
+          });
+          if (res.ok) {
+            const d = await res.json();
+            decisionIdFromBackend = d.decision_id;
+            outcomeNote = `Saved → BigQuery (${d.decision_id?.slice(0, 8)})`;
+          } else {
+            outcomeNote = `Backend ${res.status} — logged locally`;
+          }
+        } else {
+          // reject
+          const res = await fetch(`/api/sessions/${evalSessionId}/reject`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              user_id: 'planner',
+              rejection_reason: overrideReason || 'User rejected the order',
+            }),
+          });
+          if (res.ok) {
+            const d = await res.json();
+            decisionIdFromBackend = d.decision_id;
+            outcomeNote = `Rejected → BigQuery (${d.decision_id?.slice(0, 8)})`;
+          } else {
+            outcomeNote = `Backend ${res.status} — logged locally`;
+          }
         }
-      } catch { /* backend unreachable */ }
+      } else {
+        outcomeNote = 'No agent session — logged locally only';
+      }
+    } catch {
+      outcomeNote = 'Backend unreachable — logged locally';
     }
 
+    // ── 2. Update the agentEvals map so the queue card shows the decision ─
+    setAgentEvals(prev => ({
+      ...prev,
+      [activePo.id]: {
+        ...prev[activePo.id],
+        userDecision: decision as UserDecision,
+        decisionId: decisionIdFromBackend,
+      },
+    }));
+
+    // ── 3. Log in the telemetry table ────────────────────────────────────
     const newDecision: DecisionEntry = {
       id: `dc-${Date.now()}`,
       timestamp: new Date().toISOString(),
       poNumber: activePo.orderNumber,
       customer: activePo.customer,
       agentRecommendation: recommendedAction,
-      userDecision: decision || 'reject',
+      userDecision: decision,
       overrideReason: (decision === 'modify' || decision === 'reject') ? overrideReason : null,
       outcome: outcomeNote,
     };
+    setDecisionLog(prev => [newDecision, ...prev].slice(0, 20));
 
-    setDecisionLog([newDecision, ...decisionLog].slice(0, 5));
+    // ── 4. If accepted/modified, invalidate the Fulfillment incidents cache
+    //       so the Simulator picks up the newly approved order on next visit.
+    if ((decision === 'accept' || decision === 'modify') && onDecisionSaved) {
+      onDecisionSaved();
+    }
+
     setDecision(null);
     setOverrideReason('');
     setIsSubmitting(false);
@@ -247,6 +289,7 @@ export function OrderTriage({
                 po={item}
                 active={activePoId === item.id}
                 evalStatus={agentEvals[item.id]?.status ?? 'idle'}
+                userDecision={agentEvals[item.id]?.userDecision}
                 onClick={() => handlePoClick(item.id)}
               />
             ))}
@@ -380,27 +423,58 @@ export function OrderTriage({
           <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
             <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-4">Decision Capture Engine</h4>
 
+            {/* ── Already-decided banner ────────────────────────────── */}
+            {activeEval?.userDecision && (
+              <div className={cn(
+                "flex items-center gap-3 p-4 rounded-lg border mb-6",
+                activeEval.userDecision === 'accept' && "bg-emerald-50 border-emerald-200 text-emerald-800",
+                activeEval.userDecision === 'modify' && "bg-amber-50 border-amber-200 text-amber-800",
+                activeEval.userDecision === 'reject' && "bg-red-50 border-red-200 text-[#DB033B]",
+              )}>
+                {activeEval.userDecision === 'accept' && <CheckCircle2 className="w-5 h-5 text-emerald-600" />}
+                {activeEval.userDecision === 'modify' && <CornerDownRight className="w-5 h-5 text-amber-600" />}
+                {activeEval.userDecision === 'reject' && <X className="w-5 h-5 text-[#DB033B]" />}
+                <div>
+                  <span className="font-bold text-sm capitalize">{activeEval.userDecision === 'accept' ? 'Accepted' : activeEval.userDecision === 'modify' ? 'Modified' : 'Rejected'}</span>
+                  <span className="text-xs ml-2 opacity-75">
+                    {activeEval.decisionId
+                      ? `— saved to BigQuery (${activeEval.decisionId.slice(0, 8)}…)`
+                      : '— logged locally'}
+                  </span>
+                  {(activeEval.userDecision === 'accept' || activeEval.userDecision === 'modify') && (
+                    <span className="text-xs ml-2 font-medium">→ Queued for Fulfillment Simulator</span>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-3 mb-6">
               <button
+                disabled={!!activeEval?.userDecision}
                 onClick={() => { setDecision('accept'); setOverrideReason(''); }}
                 className={cn(
                   "flex-1 py-3 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all border shadow-sm",
+                  activeEval?.userDecision && "opacity-40 cursor-not-allowed",
                   decision === 'accept' ? "bg-emerald-50 text-emerald-700 border-emerald-300 ring-2 ring-emerald-500/20" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:border-slate-300"
                 )}>
                 <Check className="w-4 h-4" /> Accept Agent Proposal
               </button>
               <button
+                disabled={!!activeEval?.userDecision}
                 onClick={() => { setDecision('modify'); setOverrideReason(''); }}
                 className={cn(
                   "flex-1 py-3 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all border shadow-sm",
+                  activeEval?.userDecision && "opacity-40 cursor-not-allowed",
                   decision === 'modify' ? "bg-amber-50 text-amber-700 border-amber-300 ring-2 ring-amber-500/20" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:border-slate-300"
                 )}>
                 <CornerDownRight className="w-4 h-4" /> Modify / Override
               </button>
               <button
+                disabled={!!activeEval?.userDecision}
                 onClick={() => { setDecision('reject'); setOverrideReason(''); }}
                 className={cn(
                   "flex-1 py-3 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all border shadow-sm",
+                  activeEval?.userDecision && "opacity-40 cursor-not-allowed",
                   decision === 'reject' ? "bg-[#DB033B]/10 text-[#DB033B] border-[#DB033B]/30 ring-2 ring-[#DB033B]/20" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:border-slate-300"
                 )}>
                 <X className="w-4 h-4" /> Reject Entire Order
@@ -492,15 +566,19 @@ export function OrderTriage({
   );
 }
 
-function QueueItem({ po, active, evalStatus, onClick }: {
+type AgentEvalStatus = AgentEvalState['status'];
+
+function QueueItem({ po, active, evalStatus, userDecision, onClick }: {
   po: PO;
   active: boolean;
   evalStatus: AgentEvalStatus;
+  userDecision?: UserDecision;
   onClick: () => void;
   key?: string | number;
 }) {
   const isCritical = po.severity === 'critical';
   const isWarning = po.severity === 'warning';
+  const decided = !!userDecision;
 
   return (
     <button
@@ -510,25 +588,46 @@ function QueueItem({ po, active, evalStatus, onClick }: {
         active
           ? "bg-white border-[#DB033B] shadow-md ring-1 ring-[#DB033B]/20"
           : "bg-white border-slate-200 hover:border-slate-300 hover:shadow-sm opacity-90 hover:opacity-100",
-        isCritical && !active && "border-l-4 border-l-[#DB033B]",
-        isWarning && !active && "border-l-4 border-l-amber-500",
+        // Decision highlight overrides severity border
+        decided && userDecision === 'accept' && !active && "border-l-4 border-l-emerald-500 bg-emerald-50/40",
+        decided && userDecision === 'modify' && !active && "border-l-4 border-l-amber-500 bg-amber-50/40",
+        decided && userDecision === 'reject' && !active && "border-l-4 border-l-[#DB033B] bg-red-50/30 opacity-60",
+        !decided && isCritical && !active && "border-l-4 border-l-[#DB033B]",
+        !decided && isWarning && !active && "border-l-4 border-l-amber-500",
         isCritical && active && "border-l-4 border-l-[#DB033B]"
       )}
     >
       <div className="flex justify-between items-start mb-2">
         <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">{po.customer}</span>
         <div className="flex items-center gap-1.5">
-          {evalStatus === 'evaluating' && (
+          {/* User decision badge — takes precedence over eval status */}
+          {userDecision === 'accept' && (
+            <span className="flex items-center gap-0.5 text-[9px] font-bold text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">
+              <Check className="w-2.5 h-2.5" /> Accepted
+            </span>
+          )}
+          {userDecision === 'modify' && (
+            <span className="flex items-center gap-0.5 text-[9px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">
+              <CornerDownRight className="w-2.5 h-2.5" /> Modified
+            </span>
+          )}
+          {userDecision === 'reject' && (
+            <span className="flex items-center gap-0.5 text-[9px] font-bold text-[#DB033B] bg-[#DB033B]/10 px-1.5 py-0.5 rounded">
+              <X className="w-2.5 h-2.5" /> Rejected
+            </span>
+          )}
+          {/* Eval status icons — shown only when no decision yet */}
+          {!decided && evalStatus === 'evaluating' && (
             <Loader2 className="w-3 h-3 text-amber-500 animate-spin" />
           )}
-          {evalStatus === 'done' && (
+          {!decided && evalStatus === 'done' && (
             <CheckCircle2 className="w-3 h-3 text-emerald-500" />
           )}
-          {evalStatus === 'error' && (
+          {!decided && evalStatus === 'error' && (
             <AlertTriangle className="w-3 h-3 text-slate-400" />
           )}
-          {isCritical && <div className="w-2 h-2 rounded-full bg-[#DB033B] animate-pulse" />}
-          {isWarning && !isCritical && <div className="w-2 h-2 rounded-full bg-amber-500" />}
+          {!decided && isCritical && <div className="w-2 h-2 rounded-full bg-[#DB033B] animate-pulse" />}
+          {!decided && isWarning && !isCritical && <div className="w-2 h-2 rounded-full bg-amber-500" />}
         </div>
       </div>
       <div className="flex items-center gap-2 mb-2">

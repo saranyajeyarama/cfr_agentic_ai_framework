@@ -31,3 +31,7 @@ deprecated==1.2.18
 
 # Utilities
 python-dateutil==2.9.0.post0
+
+# Linear programming solver for the Fulfillment Simulator (Phase 1).
+# Ships with the bundled CBC solver — no system packages required.
+pulp>=2.7,<3.0
