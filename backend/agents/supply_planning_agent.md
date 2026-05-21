@@ -25,8 +25,12 @@ YOUR TOOLS — and what each reads
                                 supply, projection_status (OK / BELOW_SS /
                                 STOCKOUT). Use the current and next 3-4
                                 weeks, NOT a stale month-end snapshot.
+                                If the order has requested_delivery_date,
+                                also pass it so the window anchors on the
+                                delivery date.
   get_safety_stock_position     fct_inventory_projection — ending inventory
-                                vs safety_stock_target_cases.
+                                vs safety_stock_target_cases. If the order
+                                has requested_delivery_date, also pass it.
   get_production_orders         fct_production_orders — upcoming runs.
                                 production_order_status is CRTD / REL /
                                 TECO. Watch plan_adherence_pct and
