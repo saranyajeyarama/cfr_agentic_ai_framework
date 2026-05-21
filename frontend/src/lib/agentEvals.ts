@@ -20,15 +20,22 @@ export type AgentRec = {
   what_would_change: string;
 };
 
+export type UserDecision = 'accept' | 'modify' | 'reject';
+
 export type AgentEvalState = {
   status: AgentEvalStatus;
   sessionId?: string;
   rec?: AgentRec;
+  /** Set after the user confirms Accept / Modify / Reject. */
+  userDecision?: UserDecision;
+  /** BigQuery decision_id returned by dce_write (only for accept/modify). */
+  decisionId?: string;
 };
 
 export type AgentEvalMap = Record<string, AgentEvalState>;
 
 const STORAGE_KEY = 'tiger:agentEvals:v1';
+const DECISION_LOG_KEY = 'tiger:decisionLog:v1';
 
 function loadFromSession(): AgentEvalMap {
   try {
@@ -89,4 +96,52 @@ export function useUpdateAgentEval(
     },
     [setEvals],
   );
+}
+
+
+// ─── Decision Capture Log (Order Triage) ────────────────────────────────────
+// Each entry is one human override/acceptance recorded against an agent
+// recommendation. Survives tab switches and reloads.
+
+export type DecisionEntry = {
+  id: string;
+  timestamp: string;
+  poNumber: string;
+  customer: string;
+  agentRecommendation: string;
+  userDecision: string;
+  overrideReason: string | null;
+  outcome: string;
+};
+
+/**
+ * Persisted decision log. Seeded from `seed` (typically the live
+ * /dashboard-data.decisionCaptureLog) the first time the user lands on
+ * the page; user additions are merged in and persisted to sessionStorage.
+ */
+export function useDecisionLogStore(
+  seed: DecisionEntry[],
+): [DecisionEntry[], React.Dispatch<React.SetStateAction<DecisionEntry[]>>] {
+  const [log, setLog] = useState<DecisionEntry[]>(() => {
+    try {
+      const raw = sessionStorage.getItem(DECISION_LOG_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as DecisionEntry[];
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {
+      /* fall through */
+    }
+    return seed;
+  });
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(DECISION_LOG_KEY, JSON.stringify(log));
+    } catch {
+      /* ignore */
+    }
+  }, [log]);
+
+  return [log, setLog];
 }

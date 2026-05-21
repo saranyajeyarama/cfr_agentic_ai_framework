@@ -16,7 +16,7 @@ import os
 from google.cloud import bigquery
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "resilience-riskradar")
-_bq = bigquery.Client(project=PROJECT_ID)
+_bq = bigquery.Client(project=PROJECT_ID, location="us-central1")
 
 
 def get_client() -> bigquery.Client:

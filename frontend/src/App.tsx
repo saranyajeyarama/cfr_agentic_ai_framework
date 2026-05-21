@@ -15,7 +15,11 @@ import { RootCauseHub } from './components/tabs/RootCauseHub';
 import { SafetyStockOptimizer } from './components/tabs/SafetyStockOptimizer';
 import mockData from './data/mockData.json';
 import type { DashboardData } from './types/dashboard';
-import { useAgentEvalsStore } from './lib/agentEvals';
+import { useAgentEvalsStore, useDecisionLogStore } from './lib/agentEvals';
+import {
+  useFulfillmentIncidentsStore,
+  useFulfillmentScenariosStore,
+} from './lib/fulfillment';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('watchtower');
@@ -24,6 +28,15 @@ export default function App() {
   // Lifted so tab switches don't unmount OrderTriage and lose its
   // evaluation results. Backed by sessionStorage so reloads keep them.
   const [agentEvals, setAgentEvals] = useAgentEvalsStore();
+  // Same pattern for the Fulfillment Simulator — incident list + per-incident
+  // LP scenarios survive tab switches and reloads.
+  const incidentsStore = useFulfillmentIncidentsStore();
+  const [scenariosMap, setScenariosMap] = useFulfillmentScenariosStore();
+  // Recent Agent Override Telemetry — persisted so tab switches don't drop
+  // the local additions a user made during the session.
+  const [decisionLog, setDecisionLog] = useDecisionLogStore(
+    dashboardData.decisionCaptureLog ?? [],
+  );
 
   useEffect(() => {
     fetch('/api/dashboard-data')
@@ -60,9 +73,18 @@ export default function App() {
                   data={dashboardData}
                   agentEvals={agentEvals}
                   setAgentEvals={setAgentEvals}
+                  decisionLog={decisionLog}
+                  setDecisionLog={setDecisionLog}
+                  onDecisionSaved={incidentsStore.invalidate}
                 />
               )}
-              {activeTab === 'simulator' && <FulfillmentSimulator data={dashboardData} />}
+              {activeTab === 'simulator' && (
+                <FulfillmentSimulator
+                  incidentsStore={incidentsStore}
+                  scenariosMap={scenariosMap}
+                  setScenariosMap={setScenariosMap}
+                />
+              )}
               {activeTab === 'rootcause' && <RootCauseHub data={dashboardData} />}
               {activeTab === 'optimizer' && <SafetyStockOptimizer data={dashboardData} />}
             </motion.div>
