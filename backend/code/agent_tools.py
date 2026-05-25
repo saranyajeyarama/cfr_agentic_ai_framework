@@ -1898,3 +1898,301 @@ ALL_TOOLS = {
     "get_network_inventory":        get_network_inventory,
     "get_customer_penalty_profile": get_customer_penalty_profile,
 }
+
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Data Health — freshness of every tiger_semantic view the agents read.
+#
+# Queries the views themselves (not INFORMATION_SCHEMA) so that:
+#   1. We measure actual business-data freshness (MAX(business_date_col)),
+#      not BigQuery metadata. This catches the class of bug Dinesh fixed
+#      in v2.1 — where fct_inventory_projection was last_modified=recent
+#      but its data only projected forward from 2026-07-20.
+#   2. We confirm views are not empty (row_count > 0). An empty view is
+#      a different failure mode than a stale one.
+#
+# All 18 view probes are consolidated into a single UNION ALL query so
+# the call costs one BigQuery job, not 18. Sub-second total.
+# ───────────────────────────────────────────────────────────────────────────
+_DATA_HEALTH_VIEW_CONFIG = [
+    # (view_name, agent_owner, freshness_anchor, expected_lag_days,
+    #  max_forward_lag_days, source_system)
+    #
+    # freshness_anchor = None  → dim/master data; only row_count matters
+    # expected_lag_days        → how far behind today MAX(anchor) can be
+    #                            before WARNING / STALE (none = future-only data)
+    # max_forward_lag_days     → how far AHEAD of today MIN(anchor) can be
+    #                            before MISALIGNED. None = no upper limit
+    #                            (legitimately forward-looking, e.g. forecast).
+    #
+    # max_forward_lag_days catches the v2.1 bug class — fct_inventory_projection
+    # was loaded with data starting 2026-07-20 while the agents queried
+    # today ± 4 weeks, returning 0 rows. MIN(anchor) check surfaces this.
+    ("dim_carrier",                  "Transportation",        None,                                 None,  None,  "SAP"),
+    ("dim_customer",                 "Customer Supply",       None,                                 None,  None,  "SAP"),
+    ("dim_material",                 "Supply Planning",       "material_creation_date",             365,   None,  "SAP"),
+    ("fct_allocation_decisions",     "Customer Supply",       "decision_date",                       7,    7,     "Decision Log"),
+    ("fct_bills_of_materials",       "Supply Planning",       "bom_valid_from_date",                 90,   None,  "SAP"),
+    ("fct_chargebacks",              "Transportation",        "chargeback_assessed_date",            14,   7,     "Customer Portal"),
+    ("fct_demand_drivers",           "Retail Intelligence",   "driver_week_start_date",              14,   14,    "POS / IRI"),
+    ("fct_edi_purchase_orders",      "Trigger Adapter",       "transaction_date",                     2,   2,     "EDI 850 stream"),
+    ("fct_forecast",                 "Demand Planning",       "forecast_week_start_date",            14,   None,  "OMP"),
+    ("fct_forecast_accuracy",        "Demand Planning",       None,                                 None,  None,  "OMP / derived"),
+    ("fct_inventory_batch_snapshot", "Supply Planning",       "snapshot_date",                        2,   2,     "SAP"),
+    ("fct_inventory_projection",     "Supply Planning",       "projection_week_start_date",          14,   7,     "OMP"),
+    ("fct_otif",                     "Transportation",        "delivery_date_actual_at_customer",    7,    7,     "Customer Portal"),
+    ("fct_production_orders",        "Supply Planning",       "actual_end_date",                     7,    14,    "SAP"),
+    ("fct_promo_plan",               "Demand Planning",       "promo_start_date",                    30,   None,  "TPM"),
+    ("fct_purchase_orders",          "Supply Planning",       "po_document_date",                    7,    7,     "SAP"),
+    ("fct_sales_orders",             "Customer Supply",       "order_creation_date",                  2,   2,     "SAP"),
+    ("fct_shipments",                "Transportation",        "actual_departure_date",                3,   3,     "SAP"),
+]
+
+
+def get_data_health() -> dict:
+    """Live freshness snapshot of every tiger_semantic view the agents
+    depend on. Queries each view directly (no INFORMATION_SCHEMA lookup)
+    so the answer reflects business-data freshness, not metadata.
+
+    For each view in _DATA_HEALTH_VIEW_CONFIG, runs ONE consolidated
+    UNION ALL query returning MAX(anchor), MIN(anchor), COUNT(*) per view.
+    Individual view-not-found errors are caught and reported as MISSING
+    status without aborting the entire route.
+
+    Status values:
+      FRESH       latest data within expected lag, no forward misalignment
+      WARNING     latest data 1-2× expected lag old
+      STALE       latest data >2× expected lag old
+      EMPTY       view exists but contains no rows (or all NULLs)
+      MISALIGNED  data exists but starts too far in the future for the
+                  agent's query window (catches the v2.1 Dinesh bug class)
+      MISSING     view does not exist or query failed unrecoverably
+      LOADED      dim/master view has rows (no freshness anchor expected)
+
+    Cost: one BigQuery job, ~18 partition-pruned aggregations. Sub-second.
+    Service-account permission required: bigquery.dataViewer on
+    tiger_semantic (same permission the existing agent tools already use —
+    no new role required).
+    """
+    # Build ONE consolidated UNION query probing every configured view.
+    # We do NOT query INFORMATION_SCHEMA — we already know which views
+    # exist (they're in _DATA_HEALTH_VIEW_CONFIG). If a configured view
+    # is genuinely missing from the dataset, the UNION query will fail
+    # on that branch; we handle that via a fallback per-view loop below.
+    parts = []
+    for view, _agent, anchor, _lag, _max_fwd, _src in _DATA_HEALTH_VIEW_CONFIG:
+        if anchor:
+            parts.append(
+                f"SELECT '{view}' AS view_name, "
+                f"CAST(MAX({anchor}) AS STRING) AS max_date_iso, "
+                f"CAST(MIN({anchor}) AS STRING) AS min_date_iso, "
+                f"COUNT(*) AS total_rows "
+                f"FROM `{SEMANTIC_DS}.{view}`")
+        else:
+            parts.append(
+                f"SELECT '{view}' AS view_name, "
+                f"CAST(NULL AS STRING) AS max_date_iso, "
+                f"CAST(NULL AS STRING) AS min_date_iso, "
+                f"COUNT(*) AS total_rows "
+                f"FROM `{SEMANTIC_DS}.{view}`")
+    union_sql = "\nUNION ALL\n".join(parts)
+
+    by_name: dict[str, dict] = {}
+    union_failed_reason: str | None = None
+
+    try:
+        probe_rows = _run_query(union_sql, params=[])
+        by_name = {r.get("view_name"): r for r in probe_rows}
+    except Exception as exc:
+        # UNION failed — fall back to per-view probing so one missing
+        # table doesn't blank out the entire health check.
+        union_failed_reason = str(exc)
+        for view, _agent, anchor, _lag, _max_fwd, _src in _DATA_HEALTH_VIEW_CONFIG:
+            try:
+                if anchor:
+                    sql = (
+                        f"SELECT "
+                        f"CAST(MAX({anchor}) AS STRING) AS max_date_iso, "
+                        f"CAST(MIN({anchor}) AS STRING) AS min_date_iso, "
+                        f"COUNT(*) AS total_rows "
+                        f"FROM `{SEMANTIC_DS}.{view}`")
+                else:
+                    sql = (
+                        f"SELECT "
+                        f"CAST(NULL AS STRING) AS max_date_iso, "
+                        f"CAST(NULL AS STRING) AS min_date_iso, "
+                        f"COUNT(*) AS total_rows "
+                        f"FROM `{SEMANTIC_DS}.{view}`")
+                rows = _run_query(sql, params=[])
+                if rows:
+                    rows[0]["view_name"] = view
+                    by_name[view] = rows[0]
+                # If empty result, leave absent → MISSING below
+            except Exception:
+                # This specific view doesn't exist or isn't readable.
+                # Leave absent → MISSING in the scoring step.
+                pass
+
+    today = date.today()
+    sources = []
+    for view, agent, anchor, expected_lag, max_fwd, source_sys in _DATA_HEALTH_VIEW_CONFIG:
+        probe = by_name.get(view)
+        if not probe:
+            sources.append({
+                "name": view, "agent": agent, "source_system": source_sys,
+                "freshness_anchor": anchor,
+                "earliest_data_date": None,
+                "latest_data_date": None,
+                "age_days": None, "total_rows": 0,
+                "expected_lag_days": expected_lag,
+                "max_forward_lag_days": max_fwd,
+                "status": "MISSING",
+                "status_reason": (
+                    f"View not found in {SEMANTIC_DS} or query failed"),
+            })
+            continue
+
+        total_rows = int(probe.get("total_rows") or 0)
+
+        if total_rows == 0:
+            sources.append({
+                "name": view, "agent": agent, "source_system": source_sys,
+                "freshness_anchor": anchor,
+                "earliest_data_date": None,
+                "latest_data_date": None,
+                "age_days": None, "total_rows": 0,
+                "expected_lag_days": expected_lag,
+                "max_forward_lag_days": max_fwd,
+                "status": "EMPTY",
+                "status_reason": "View exists but contains no rows",
+            })
+            continue
+
+        if not anchor:
+            # Dim/master table — having rows is sufficient
+            sources.append({
+                "name": view, "agent": agent, "source_system": source_sys,
+                "freshness_anchor": None,
+                "earliest_data_date": None,
+                "latest_data_date": None,
+                "age_days": None, "total_rows": total_rows,
+                "expected_lag_days": None,
+                "max_forward_lag_days": None,
+                "status": "LOADED",
+                "status_reason": "Reference/master data — no freshness anchor",
+            })
+            continue
+
+        # Date-anchored view — score by age vs expected_lag, and check
+        # for forward misalignment via MIN.
+        max_date_raw = probe.get("max_date_iso")
+        min_date_raw = probe.get("min_date_iso")
+        if not max_date_raw:
+            sources.append({
+                "name": view, "agent": agent, "source_system": source_sys,
+                "freshness_anchor": anchor,
+                "earliest_data_date": None,
+                "latest_data_date": None,
+                "age_days": None, "total_rows": total_rows,
+                "expected_lag_days": expected_lag,
+                "max_forward_lag_days": max_fwd,
+                "status": "EMPTY",
+                "status_reason": f"All {anchor} values are NULL",
+            })
+            continue
+
+        try:
+            max_dt = date.fromisoformat(str(max_date_raw)[:10])
+            min_dt = (date.fromisoformat(str(min_date_raw)[:10])
+                      if min_date_raw else None)
+        except Exception:
+            sources.append({
+                "name": view, "agent": agent, "source_system": source_sys,
+                "freshness_anchor": anchor,
+                "earliest_data_date": str(min_date_raw) if min_date_raw else None,
+                "latest_data_date": str(max_date_raw),
+                "age_days": None, "total_rows": total_rows,
+                "expected_lag_days": expected_lag,
+                "max_forward_lag_days": max_fwd,
+                "status": "MISSING",
+                "status_reason": f"Unparseable date: {max_date_raw}",
+            })
+            continue
+
+        age_days = (today - max_dt).days
+
+        # MIN-aware forward-alignment check (catches Dinesh bug class)
+        if min_dt and max_fwd is not None:
+            min_forward_days = (min_dt - today).days
+            if min_forward_days > max_fwd:
+                sources.append({
+                    "name": view, "agent": agent, "source_system": source_sys,
+                    "freshness_anchor": anchor,
+                    "earliest_data_date": min_dt.isoformat(),
+                    "latest_data_date": max_dt.isoformat(),
+                    "age_days": age_days,
+                    "total_rows": total_rows,
+                    "expected_lag_days": expected_lag,
+                    "max_forward_lag_days": max_fwd,
+                    "status": "MISALIGNED",
+                    "status_reason": (
+                        f"Data starts {min_forward_days}d in the future — "
+                        f"agents querying [today ± window] will return 0 rows. "
+                        f"Earliest data should be within {max_fwd}d of today."),
+                })
+                continue
+
+        if age_days < 0:
+            status, reason = "FRESH", (
+                f"Latest {anchor} is {-age_days}d in the future "
+                f"(forward-looking data — healthy)")
+        elif age_days <= expected_lag:
+            status, reason = "FRESH", (
+                f"Latest {anchor} is {age_days}d old "
+                f"(within {expected_lag}d expected lag)")
+        elif age_days <= expected_lag * 2:
+            status, reason = "WARNING", (
+                f"Latest {anchor} is {age_days}d old "
+                f"(past {expected_lag}d expected lag)")
+        else:
+            status, reason = "STALE", (
+                f"Latest {anchor} is {age_days}d old — "
+                f"more than 2× the {expected_lag}d expected lag")
+
+        sources.append({
+            "name": view, "agent": agent, "source_system": source_sys,
+            "freshness_anchor": anchor,
+            "earliest_data_date": min_dt.isoformat() if min_dt else None,
+            "latest_data_date": max_dt.isoformat(),
+            "age_days": age_days,
+            "total_rows": total_rows,
+            "expected_lag_days": expected_lag,
+            "max_forward_lag_days": max_fwd,
+            "status": status,
+            "status_reason": reason,
+        })
+
+    by_status: dict[str, int] = {}
+    for s in sources:
+        by_status[s["status"]] = by_status.get(s["status"], 0) + 1
+
+    return {
+        "data_available": True,
+        "sources": sources,
+        "summary": {
+            "total": len(sources),
+            "fresh": by_status.get("FRESH", 0),
+            "warning": by_status.get("WARNING", 0),
+            "stale": by_status.get("STALE", 0),
+            "empty": by_status.get("EMPTY", 0),
+            "misaligned": by_status.get("MISALIGNED", 0),
+            "missing": by_status.get("MISSING", 0),
+            "loaded": by_status.get("LOADED", 0),
+        },
+        "reference_date": today.isoformat(),
+        "view_queried": f"{SEMANTIC_DS}.* (direct view probes, no metadata lookup)",
+        "union_query_fallback_reason": union_failed_reason,
+    }

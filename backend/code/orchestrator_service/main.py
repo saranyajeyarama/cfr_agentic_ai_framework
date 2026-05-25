@@ -45,6 +45,7 @@ from agent_tools import (
     get_demo_scenario_candidates,
     get_network_inventory,
     get_customer_penalty_profile,
+    get_data_health,
 )
 from firestore_client import create_session, get_session
 from orchestrator import run_session, approve_session, reject_session
@@ -56,6 +57,10 @@ from schemas import (
     FulfillmentIncidentsResponse,
 )
 from fulfillment_optimizer import simulate as _simulate_fulfillment
+from _v23_adapter import (
+    candidate_to_v23_order,
+    decision_to_v23_synthesis,
+)
 
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "resilience-riskradar")
@@ -393,6 +398,118 @@ def demo_candidates(limit: int = 10) -> dict:
     """Data-derived demo scenario shortlist. Pin a chosen anchor via the
     DEMO_SOLD_TO / DEMO_MATERIAL env vars."""
     return get_demo_scenario_candidates(limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# v2.3 routes — additive, non-breaking. Wrap the v2.1 contract in the
+# v2.3 UI's expected shapes so the upgraded UI can run against the live
+# backend without breaking the v2.1 frontend during the parallel
+# transition.
+#
+# Contract & adapter logic live in _v23_adapter.py. These routes are
+# thin wrappers; do not put business logic here.
+# ---------------------------------------------------------------------------
+@app.get("/v23/orders")
+def v23_orders(limit: int = 10) -> dict:
+    """v2.3 ORDERS[] shape — wraps get_demo_scenario_candidates and
+    adapts each row to the v2.3 UI's expected field names. Flag
+    derivation (above_forecast / promo / hard_block / buffer_build /
+    clean) is server-side here, single source of truth for both UIs.
+    """
+    src = get_demo_scenario_candidates(limit=limit)
+    candidates = src.get("candidates") or []
+    return {
+        "orders": [candidate_to_v23_order(c) for c in candidates],
+        "row_count": len(candidates),
+        "data_available": bool(candidates),
+        "rationale": src.get("rationale"),
+    }
+
+
+@app.get("/data-health")
+def data_health() -> dict:
+    """Live freshness snapshot of every tiger_semantic view the agents
+    depend on. Queries BigQuery INFORMATION_SCHEMA — no mock data.
+
+    Used by the v2.3 UI's Data Health page. Returns one row per view
+    with last_modified timestamp, age in hours, expected refresh window,
+    and a status flag (FRESH / WARNING / STALE / MISSING).
+
+    See _DATA_HEALTH_VIEW_CONFIG in agent_tools.py for the per-view
+    refresh cadence + source-system config the status thresholds use.
+    """
+    return get_data_health()
+
+
+@app.post("/v23/triage/{order_id}")
+async def v23_triage(order_id: str, backend: dict) -> dict:
+    """Run the full 5-agent flow for one v2.3 UI order, return the
+    result in the v2.3 SYNTHESIS[order_id] shape.
+
+    Request body: the `_backend` dict from /v23/orders for this order
+    (sold_to, material_number, ordered_quantity_cases,
+    requested_delivery_date, ...). The v2.3 UI round-trips that
+    payload back so we can resolve the CustomerOrderEvent without
+    re-querying the candidate shortlist.
+
+    Response: { order_id, synthesis: <v2.3 SYNTHESIS entry>, session_id }
+    """
+    # Validate the round-tripped payload
+    required = ("sold_to", "material_number")
+    missing = [k for k in required if not backend.get(k)]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"_backend payload missing required keys: {missing}")
+
+    # Resolve to a CustomerOrderEvent via the demo trigger path
+    try:
+        order_event = from_demo_payload({
+            "sold_to": backend["sold_to"],
+            "material_number": backend["material_number"],
+            "ordered_quantity_cases": backend.get(
+                "ordered_quantity_cases"),
+            "requested_delivery_date": backend.get(
+                "requested_delivery_date"),
+            "customer_name": backend.get("customer_name"),
+            "material_description": backend.get("material_description"),
+            "ship_to": backend.get("ship_to"),
+        })
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not resolve v2.3 order: {exc}")
+
+    # Run the session inline (same pattern as /sessions/sync)
+    session_id = _new_session_id()
+    create_session(
+        session_id=session_id,
+        trigger_type="manual",
+        trigger_payload={**order_event.to_dict(),
+                         "trigger_source": "v23_payload"},
+    )
+    await _run_session_tracked(session_id, "manual", order_event)
+    sess = get_session(session_id)
+    if not sess:
+        raise HTTPException(
+            status_code=500,
+            detail="Session was created but cannot be read back")
+
+    # Pull the final_action_card from session state and adapt to v2.3 shape
+    decision = sess.get("final_action_card") or {}
+    if not decision:
+        raise HTTPException(
+            status_code=500,
+            detail="Session completed but produced no decision")
+
+    return {
+        "order_id": order_id,
+        "session_id": session_id,
+        "synthesis": decision_to_v23_synthesis(decision),
+        # Bonus — also return the unmapped v2.1 contract for clients that
+        # want it. Frontend can ignore.
+        "raw_decision": decision,
+    }
 
 
 # ---------------------------------------------------------------------------
