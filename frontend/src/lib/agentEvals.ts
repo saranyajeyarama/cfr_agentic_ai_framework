@@ -35,7 +35,9 @@ export type AgentEvalState = {
 export type AgentEvalMap = Record<string, AgentEvalState>;
 
 const STORAGE_KEY = 'tiger:agentEvals:v1';
-const DECISION_LOG_KEY = 'tiger:decisionLog:v1';
+// v3 key clears accumulated local optimistic entries from the v2 cache.
+// Ground truth is always BigQuery; this ensures a fresh start on reload.
+const DECISION_LOG_KEY = 'tiger:decisionLog:v3';
 
 function loadFromSession(): AgentEvalMap {
   try {
@@ -115,12 +117,28 @@ export type DecisionEntry = {
 };
 
 /**
- * Persisted decision log. Seeded from `seed` (typically the live
- * /dashboard-data.decisionCaptureLog) the first time the user lands on
- * the page; user additions are merged in and persisted to sessionStorage.
+ * Fetch recent telemetry entries from GET /api/telemetry/execution.
+ * Called from App on mount; result is passed to setDecisionLog so the
+ * Recent Agent Override Telemetry table shows real BigQuery data.
+ */
+export async function fetchTelemetryLog(limit = 20): Promise<DecisionEntry[]> {
+  try {
+    const res = await fetch(`/api/telemetry/execution?limit=${limit}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.entries ?? []) as DecisionEntry[];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persisted decision log. Seeded from `seed` on first load if sessionStorage
+ * is empty. Real data is loaded from BigQuery (GET /telemetry/execution) by
+ * the App component on mount and replaces the seed via setDecisionLog.
  */
 export function useDecisionLogStore(
-  seed: DecisionEntry[],
+  seed: DecisionEntry[] = [],
 ): [DecisionEntry[], React.Dispatch<React.SetStateAction<DecisionEntry[]>>] {
   const [log, setLog] = useState<DecisionEntry[]>(() => {
     try {

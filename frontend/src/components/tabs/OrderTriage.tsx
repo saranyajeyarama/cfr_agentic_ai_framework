@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { AlertTriangle, Check, CheckCircle2, ChevronRight, CornerDownRight, X, Info, ShieldAlert, Bot, Loader2 } from 'lucide-react';
+import { AlertTriangle, Check, CheckCircle2, ChevronRight, CornerDownRight, X, Info, ShieldAlert, Bot, Loader2, RefreshCw } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { buildStartSessionRequest } from '../../lib/api';
 import type { AgentEvalState, AgentEvalMap, DecisionEntry, UserDecision } from '../../lib/agentEvals';
+import { fetchTelemetryLog } from '../../lib/agentEvals';
 import type { DashboardData } from '../../types/dashboard';
 
 type Severity = 'critical' | 'warning' | 'neutral';
@@ -77,6 +78,18 @@ export function OrderTriage({
   const [overrideReason, setOverrideReason] = useState('');
   const [showRationale, setShowRationale] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRefreshingTelemetry, setIsRefreshingTelemetry] = useState(false);
+
+  const handleRefreshTelemetry = async () => {
+    setIsRefreshingTelemetry(true);
+    try {
+      const entries = await fetchTelemetryLog(20);
+      // Always replace with exact BigQuery state — never merge with local cache.
+      setDecisionLog(entries);
+    } finally {
+      setIsRefreshingTelemetry(false);
+    }
+  };
 
 
 
@@ -229,9 +242,9 @@ export function OrderTriage({
       },
     }));
 
-    // ── 3. Log in the telemetry table ────────────────────────────────────
+    // ── 3. Optimistically log in local telemetry table (instant UI update) ──
     const newDecision: DecisionEntry = {
-      id: `dc-${Date.now()}`,
+      id: `tel-${Date.now()}`,   // temporary local id; BQ will assign a real one
       timestamp: new Date().toISOString(),
       poNumber: activePo.orderNumber,
       customer: activePo.customer,
@@ -241,6 +254,34 @@ export function OrderTriage({
       outcome: outcomeNote,
     };
     setDecisionLog(prev => [newDecision, ...prev].slice(0, 20));
+
+    // ── 3b. Persist to tiger_decisions.fct_user_execution_telemetry (async) ─
+    //        Only write when there is a real agent session AND the
+    //        approve/reject API call returned a decision_id — this prevents
+    //        test/demo decisions (no live backend session) from polluting the
+    //        audit table. Local UI is already updated above regardless.
+    if (evalSessionId && decisionIdFromBackend) {
+      void fetch('/api/telemetry/execution', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          po_number:            activePo.orderNumber,
+          sold_to:              activePo.soldTo ?? null,
+          customer_name:        activePo.customer,
+          material_number:      activePo.materialNumber ?? null,
+          ordered_qty:          activePo.requestedQty ?? null,
+          agent_recommendation: recommendedAction,
+          user_decision:        decision,
+          override_reason:      (decision === 'modify' || decision === 'reject') ? overrideReason : null,
+          override_reason_code: (decision === 'modify' || decision === 'reject') ? overrideReason : null,
+          session_id:           evalSessionId,
+          decision_id:          decisionIdFromBackend,
+          outcome_note:         outcomeNote,
+          user_id:              'planner',
+          source_tab:           'order_triage',
+        }),
+      }).catch(() => { /* silent — local state is already updated */ });
+    }
 
     // ── 4. If accepted/modified, invalidate the Fulfillment incidents cache
     //       so the Simulator picks up the newly approved order on next visit.
@@ -523,7 +564,21 @@ export function OrderTriage({
 
           {/* Component 4: Decisions Log */}
           <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-            <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-4">Recent Agent Override Telemetry</h4>
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Recent Agent Override Telemetry</h4>
+                <p className="text-[10px] text-slate-400 mt-0.5">Sourced from tiger_decisions.fct_user_execution_telemetry · BigQuery</p>
+              </div>
+              <button
+                onClick={handleRefreshTelemetry}
+                disabled={isRefreshingTelemetry}
+                className="flex items-center gap-1.5 text-[11px] font-medium text-slate-500 hover:text-slate-700 px-2.5 py-1.5 rounded-lg border border-slate-200 hover:border-slate-300 bg-white transition-colors disabled:opacity-50"
+                title="Refresh from BigQuery"
+              >
+                <RefreshCw className={cn("w-3 h-3", isRefreshingTelemetry && "animate-spin")} />
+                {isRefreshingTelemetry ? 'Refreshing…' : 'Refresh'}
+              </button>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm whitespace-nowrap">
                 <thead>
@@ -537,11 +592,17 @@ export function OrderTriage({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {decisionLog.map((log) => (
+                  {decisionLog.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 px-4 text-center text-slate-400 text-sm">
+                        No telemetry recorded yet. Make a decision above — it will appear here and persist to BigQuery.
+                      </td>
+                    </tr>
+                  ) : decisionLog.map((log) => (
                     <tr key={log.id} className="hover:bg-slate-50 transition-colors">
                       <td className="py-3 px-4 font-mono text-xs text-slate-500">{new Date(log.timestamp).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
-                      <td className="py-3 px-4 font-medium text-slate-800">{log.poNumber}</td>
-                      <td className="py-3 px-4 text-slate-600">{log.customer}</td>
+                      <td className="py-3 px-4 font-medium text-slate-800">{log.poNumber || '—'}</td>
+                      <td className="py-3 px-4 text-slate-600">{log.customer || '—'}</td>
                       <td className="py-3 px-4 text-slate-800 font-bold capitalize">
                         <span className={cn(
                           "px-2 py-1 rounded text-xs",
@@ -552,8 +613,8 @@ export function OrderTriage({
                           {log.userDecision}
                         </span>
                       </td>
-                      <td className="py-3 px-4 text-slate-500 italic max-wxs truncate" title={log.overrideReason || ''}>{log.overrideReason || '—'}</td>
-                      <td className="py-3 px-4 text-slate-600 text-xs">{log.outcome}</td>
+                      <td className="py-3 px-4 text-slate-500 italic max-w-xs truncate" title={log.overrideReason || ''}>{log.overrideReason || '—'}</td>
+                      <td className="py-3 px-4 text-slate-600 text-xs">{log.outcome || '—'}</td>
                     </tr>
                   ))}
                 </tbody>

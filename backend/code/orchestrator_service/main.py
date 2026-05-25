@@ -54,6 +54,8 @@ from schemas import (
     ChatRequest, ChatResponse,
     FulfillmentSimulateRequest, FulfillmentSimulateResponse,
     FulfillmentIncidentsResponse,
+    ExecutionTelemetryRequest, ExecutionTelemetryWriteResponse,
+    ExecutionTelemetryListResponse,
 )
 from fulfillment_optimizer import simulate as _simulate_fulfillment
 
@@ -85,6 +87,65 @@ app.add_middleware(
 def _new_session_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"session_{ts}_{uuid.uuid4().hex[:6]}"
+
+
+# ---------------------------------------------------------------------------
+# User Execution Telemetry — fct_user_execution_telemetry
+# Dedicated BigQuery audit table in tiger_decisions (US multi-region).
+# Created once on first write/read via _ensure_telemetry_table().
+# ---------------------------------------------------------------------------
+
+_TELEMETRY_TABLE = f"{PROJECT_ID}.tiger_decisions.fct_user_execution_telemetry"
+_telemetry_table_ready: bool = False
+
+
+def _bq_telemetry() -> bigquery.Client:
+    """BigQuery client for tiger_decisions (US multi-region)."""
+    from data_pipeline import _bq_decisions
+    return _bq_decisions()
+
+
+def _ensure_telemetry_table() -> None:
+    """Create fct_user_execution_telemetry if it doesn't exist (idempotent)."""
+    global _telemetry_table_ready
+    if _telemetry_table_ready:
+        return
+    try:
+        client = _bq_telemetry()
+        schema = [
+            bigquery.SchemaField("telemetry_id",          "STRING",    mode="REQUIRED"),
+            bigquery.SchemaField("event_timestamp",        "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("po_number",              "STRING"),
+            bigquery.SchemaField("sold_to",                "STRING"),
+            bigquery.SchemaField("customer_name",          "STRING"),
+            bigquery.SchemaField("material_number",        "STRING"),
+            bigquery.SchemaField("ordered_qty",            "FLOAT64"),
+            bigquery.SchemaField("agent_recommendation",   "STRING"),
+            bigquery.SchemaField("user_decision",          "STRING",    mode="REQUIRED"),
+            bigquery.SchemaField("override_reason",        "STRING"),
+            bigquery.SchemaField("override_reason_code",   "STRING"),
+            bigquery.SchemaField("session_id",             "STRING"),
+            bigquery.SchemaField("decision_id",            "STRING"),
+            bigquery.SchemaField("outcome_note",           "STRING"),
+            bigquery.SchemaField("user_id",                "STRING"),
+            bigquery.SchemaField("source_tab",             "STRING"),
+            bigquery.SchemaField("created_at",             "TIMESTAMP", mode="REQUIRED"),
+        ]
+        table = bigquery.Table(_TELEMETRY_TABLE, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field="created_at",
+        )
+        table.description = (
+            "User execution telemetry — human override audit trail for "
+            "Order Triage and Fulfillment Simulator. Written by the frontend "
+            "via POST /telemetry/execution on every Accept / Modify / Reject."
+        )
+        client.create_table(table, exists_ok=True)
+        _telemetry_table_ready = True
+        print(f"[telemetry] {_TELEMETRY_TABLE} ready", flush=True)
+    except Exception as exc:
+        print(f"[telemetry] table ensure failed: {exc}", flush=True)
 
 
 @app.exception_handler(RequestValidationError)
@@ -555,6 +616,99 @@ def reject(session_id: str, req: RejectionRequest) -> DecisionResponse:
         rejection_reason=req.rejection_reason,
     )
     return DecisionResponse(decision_id=decision_id, status="rejected")
+
+
+# ---------------------------------------------------------------------------
+# User Execution Telemetry endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/telemetry/execution", response_model=ExecutionTelemetryWriteResponse)
+def write_telemetry(req: ExecutionTelemetryRequest) -> ExecutionTelemetryWriteResponse:
+    """Write one human-decision event to fct_user_execution_telemetry.
+
+    Called by the frontend (background, non-blocking) immediately after a
+    user clicks Accept / Modify / Reject in Order Triage. The local UI state
+    is updated optimistically; this call persists the record to BigQuery for
+    cross-session and cross-user visibility.
+    """
+    _ensure_telemetry_table()
+    client = _bq_telemetry()
+    telemetry_id = f"tel-{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    row = {
+        "telemetry_id":        telemetry_id,
+        "event_timestamp":     now.isoformat(),
+        "po_number":           req.po_number or "",
+        "sold_to":             req.sold_to or "",
+        "customer_name":       req.customer_name or "",
+        "material_number":     req.material_number or "",
+        "ordered_qty":         req.ordered_qty,
+        "agent_recommendation": req.agent_recommendation or "",
+        "user_decision":       req.user_decision,
+        "override_reason":     req.override_reason,
+        "override_reason_code": req.override_reason_code,
+        "session_id":          req.session_id,
+        "decision_id":         req.decision_id,
+        "outcome_note":        req.outcome_note or "",
+        "user_id":             req.user_id or "planner",
+        "source_tab":          req.source_tab or "order_triage",
+        "created_at":          now.isoformat(),
+    }
+    errors = client.insert_rows_json(_TELEMETRY_TABLE, [row])
+    if errors:
+        print(f"[telemetry] insert errors: {errors}", flush=True)
+        raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
+    print(f"[telemetry] wrote {telemetry_id} decision={req.user_decision} po={req.po_number}", flush=True)
+    return ExecutionTelemetryWriteResponse(telemetry_id=telemetry_id, status="written")
+
+
+@app.get("/telemetry/execution", response_model=ExecutionTelemetryListResponse)
+def read_telemetry(limit: int = 20) -> ExecutionTelemetryListResponse:
+    """Return the most recent human-decision events from BigQuery.
+
+    Called on Order Triage tab mount to populate the Recent Agent Override
+    Telemetry table with real persisted data instead of mock seed values.
+    Degrades to empty list if the table doesn't exist yet or the query fails.
+    """
+    _ensure_telemetry_table()
+    client = _bq_telemetry()
+    safe_limit = min(max(limit, 1), 100)
+    try:
+        rows = list(client.query(f"""
+            SELECT
+                telemetry_id,
+                event_timestamp,
+                po_number,
+                customer_name,
+                sold_to,
+                agent_recommendation,
+                user_decision,
+                override_reason,
+                outcome_note
+            FROM `{_TELEMETRY_TABLE}`
+            ORDER BY event_timestamp DESC
+            LIMIT {safe_limit}
+        """).result())
+    except Exception as exc:
+        print(f"[telemetry] read failed: {exc}", flush=True)
+        return ExecutionTelemetryListResponse(entries=[], total=0)
+
+    entries = []
+    for r in rows:
+        r = dict(r)
+        et = r.get("event_timestamp")
+        ts = et.isoformat() if hasattr(et, "isoformat") else str(et or "")
+        entries.append({
+            "id":                  r.get("telemetry_id") or "",
+            "timestamp":           ts,
+            "poNumber":            r.get("po_number") or "",
+            "customer":            r.get("customer_name") or r.get("sold_to") or "",
+            "agentRecommendation": r.get("agent_recommendation") or "",
+            "userDecision":        (r.get("user_decision") or "").lower(),
+            "overrideReason":      r.get("override_reason"),
+            "outcome":             r.get("outcome_note") or "",
+        })
+    return ExecutionTelemetryListResponse(entries=entries, total=len(entries))
 
 
 if __name__ == "__main__":

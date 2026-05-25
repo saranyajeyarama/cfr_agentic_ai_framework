@@ -15,7 +15,7 @@ import { RootCauseHub } from './components/tabs/RootCauseHub';
 import { SafetyStockOptimizer } from './components/tabs/SafetyStockOptimizer';
 import mockData from './data/mockData.json';
 import type { DashboardData } from './types/dashboard';
-import { useAgentEvalsStore, useDecisionLogStore } from './lib/agentEvals';
+import { useAgentEvalsStore, useDecisionLogStore, fetchTelemetryLog } from './lib/agentEvals';
 import {
   useFulfillmentIncidentsStore,
   useFulfillmentScenariosStore,
@@ -32,11 +32,11 @@ export default function App() {
   // LP scenarios survive tab switches and reloads.
   const incidentsStore = useFulfillmentIncidentsStore();
   const [scenariosMap, setScenariosMap] = useFulfillmentScenariosStore();
-  // Recent Agent Override Telemetry — persisted so tab switches don't drop
-  // the local additions a user made during the session.
-  const [decisionLog, setDecisionLog] = useDecisionLogStore(
-    dashboardData.decisionCaptureLog ?? [],
-  );
+  // Recent Agent Override Telemetry — no longer seeded from mockData.
+  // Real data is loaded from tiger_decisions.fct_user_execution_telemetry
+  // via GET /api/telemetry/execution on app mount (see useEffect below).
+  // Optimistic local entries are prepended immediately on each decision.
+  const [decisionLog, setDecisionLog] = useDecisionLogStore([]);
 
   useEffect(() => {
     fetch('/api/dashboard-data')
@@ -48,6 +48,20 @@ export default function App() {
       .catch(() => {
         setIsLiveData(false);
       });
+  }, []);
+
+  // Replace the decision log with exactly what BigQuery has on every mount.
+  // Local optimistic entries (from handleExecuteDecision) intentionally
+  // survive until this effect runs so the user sees their action immediately,
+  // but the ground truth is always BigQuery — not the local cache.
+  useEffect(() => {
+    fetchTelemetryLog(20).then(entries => {
+      // Always replace — never merge. Local IDs (tel-<timestamp>) and BQ IDs
+      // (tel-<uuid>) are different formats and would never deduplicate in a
+      // merge, causing duplicates for every session decision.
+      setDecisionLog(entries);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
