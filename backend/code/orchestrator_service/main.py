@@ -23,7 +23,12 @@ from __future__ import annotations
 # generators create OTEL span tokens in one asyncio context; FastAPI
 # BackgroundTasks closes them in a copied context, so ContextVar.reset()
 # raises ValueError. OTEL catches it and logs it at ERROR — harmless noise.
+from logging_config import configure_logging
+configure_logging()
+
+import logging
 import logging as _logging
+log = logging.getLogger(__name__)
 _logging.getLogger("opentelemetry").setLevel(_logging.CRITICAL)
 
 import asyncio
@@ -148,19 +153,18 @@ def _ensure_telemetry_table() -> None:
         )
         client.create_table(table, exists_ok=True)
         _telemetry_table_ready = True
-        print(f"[telemetry] {_TELEMETRY_TABLE} ready", flush=True)
+        log.info("Telemetry table ready: %s", _TELEMETRY_TABLE)
     except Exception as exc:
-        print(f"[telemetry] table ensure failed: {exc}", flush=True)
+        log.warning("Telemetry table ensure failed: %s", exc)
 
 
 @app.exception_handler(RequestValidationError)
 async def _log_validation_error(request: Request, exc: RequestValidationError):
     body = await request.body()
-    print(
-        f"[422-DEBUG] {request.method} {request.url.path}\n"
-        f"  errors={exc.errors()}\n"
-        f"  body={body[:2000].decode('utf-8', 'replace')}",
-        flush=True,
+    log.warning(
+        "422 validation error %s %s errors=%s body=%.500s",
+        request.method, request.url.path,
+        exc.errors(), body[:500].decode("utf-8", "replace"),
     )
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
@@ -387,9 +391,7 @@ def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulate
                     pm["carrier_otp_target"] = ci.get("on_time_performance_target_pct")
     except Exception as exc:
         # Delivery context is best-effort — optimizer still works without it.
-        import traceback
-        print(f"[fulfillment-simulate] delivery context error (non-fatal): "
-              f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}", flush=True)
+        log.warning("Fulfillment delivery context error: %s", exc)
 
     # 5) Solve.
     result = _simulate_fulfillment(
@@ -446,9 +448,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     except HTTPException:
         raise
     except Exception as exc:
-        import traceback
-        print(f"[chat] {type(exc).__name__}: {exc}\n"
-              f"{traceback.format_exc()}", flush=True)
+        log.error("Chat route error: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Gemini error: {type(exc).__name__}: {exc}")
@@ -581,6 +581,7 @@ async def start_session(
     req: StartSessionRequest,
     background_tasks: BackgroundTasks,
 ) -> StartSessionResponse:
+    log.info("POST /sessions trigger_source=%s sold_to=%s material=%s", req.trigger_source, getattr(req, 'sold_to', '?'), getattr(req, 'material_number', '?'))
     try:
         if req.trigger_source == "edi_850":
             if not req.isa_control_id:
@@ -713,6 +714,7 @@ def _require_awaiting(session_id: str) -> dict:
 
 @app.post("/sessions/{session_id}/approve", response_model=DecisionResponse)
 def approve(session_id: str, req: ApprovalRequest) -> DecisionResponse:
+    log.info("POST /sessions/%s/approve user_id=%s", session_id, req.user_id)
     sess = _require_awaiting(session_id)
     decision_id = approve_session(
         session_id=session_id,
@@ -725,6 +727,7 @@ def approve(session_id: str, req: ApprovalRequest) -> DecisionResponse:
 
 @app.post("/sessions/{session_id}/reject", response_model=DecisionResponse)
 def reject(session_id: str, req: RejectionRequest) -> DecisionResponse:
+    log.info("POST /sessions/%s/reject reason=%.100s", session_id, req.rejection_reason[:100] if req.rejection_reason else '')
     sess = _require_awaiting(session_id)
     decision_id = reject_session(
         session_id=session_id,
@@ -773,9 +776,9 @@ def write_telemetry(req: ExecutionTelemetryRequest) -> ExecutionTelemetryWriteRe
     }
     errors = client.insert_rows_json(_TELEMETRY_TABLE, [row])
     if errors:
-        print(f"[telemetry] insert errors: {errors}", flush=True)
+        log.error("Telemetry BQ insert errors: %s", errors)
         raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
-    print(f"[telemetry] wrote {telemetry_id} decision={req.user_decision} po={req.po_number}", flush=True)
+    log.info("Telemetry written: id=%s decision=%s po=%s", telemetry_id, req.user_decision, req.po_number)
     return ExecutionTelemetryWriteResponse(telemetry_id=telemetry_id, status="written")
 
 
@@ -807,7 +810,7 @@ def read_telemetry(limit: int = 20) -> ExecutionTelemetryListResponse:
             LIMIT {safe_limit}
         """).result())
     except Exception as exc:
-        print(f"[telemetry] read failed: {exc}", flush=True)
+        log.error("Telemetry read failed: %s", exc, exc_info=True)
         return ExecutionTelemetryListResponse(entries=[], total=0)
 
     entries = []

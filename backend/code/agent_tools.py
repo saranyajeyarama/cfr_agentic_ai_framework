@@ -52,6 +52,10 @@ from typing import Any, Literal, Optional
 from google.adk.tools import FunctionTool
 from google.cloud import bigquery
 
+import logging as _logging
+import time as _time
+_tool_log = _logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Connection constants
 # ---------------------------------------------------------------------------
@@ -78,19 +82,28 @@ def _run_query(sql: str, params: list) -> list[dict]:
     """Single chokepoint to BigQuery. All read tools route through this so
     tool calls can be audited via the orchestrator's Firestore step writes.
     Returns up to _ROW_CAP rows as a list of plain dicts (dates ISO-stringified)."""
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
-    job = _bq.query(sql, job_config=job_config)
-    rows = job.result(max_results=_ROW_CAP)
-    out: list[dict] = []
-    for r in rows:
-        d = dict(r)
-        for k, v in d.items():
-            if isinstance(v, (date, datetime)):
-                d[k] = v.isoformat()
-        out.append(d)
-        if len(out) >= _ROW_CAP:
-            break
-    return out
+    _t0 = _time.monotonic()
+    try:
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        job = _bq.query(sql, job_config=job_config)
+        rows = job.result(max_results=_ROW_CAP)
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            for k, v in d.items():
+                if isinstance(v, (date, datetime)):
+                    d[k] = v.isoformat()
+            out.append(d)
+            if len(out) >= _ROW_CAP:
+                break
+        _ms = int((_time.monotonic() - _t0) * 1000)
+        _tool_log.debug("BQ query OK rows=%d latency_ms=%d sql=%.120s", len(out), _ms, sql.strip())
+        return out
+    except Exception as exc:
+        _ms = int((_time.monotonic() - _t0) * 1000)
+        _tool_log.error("BQ query FAILED latency_ms=%d error=%s sql=%.120s",
+                        _ms, exc, sql.strip(), exc_info=True)
+        raise
 
 
 def _p(name: str, type_: str, value) -> bigquery.ScalarQueryParameter:
@@ -648,9 +661,8 @@ def get_finished_goods_inventory(
             the tool falls back to the original CURRENT_DATE() window.
     """
     # ───────── DEBUG-RDD: tool entry log ─────────
-    print(f"[DEBUG-RDD][get_finished_goods_inventory] called with "
-          f"material_number={material_number!r}, plant_code={plant_code!r}, "
-          f"requested_delivery_date={requested_delivery_date!r}")
+    _tool_log.debug("get_fgi called material=%r plant=%r rdd=%r",
+                    material_number, plant_code, requested_delivery_date)
 
     # Original behavior preserved EXACTLY — runs as the default and is only
     # overridden inside the try block below if a valid delivery date arrives.
@@ -673,16 +685,11 @@ def get_finished_goods_inventory(
             params = [_p("matnr", "STRING", material_number),
                       _p("rdd", "STRING", requested_delivery_date)]
             _window_strategy = "rdd_anchored"
-            print(f"[DEBUG-RDD][get_finished_goods_inventory] using "
-                  f"rdd-anchored window: [{requested_delivery_date} - 4w, "
-                  f"{requested_delivery_date} + 1w]")
+            _tool_log.debug("get_fgi using rdd-anchored window rdd=%s", requested_delivery_date)
         except Exception as e:
-            print(f"[DEBUG-RDD][get_finished_goods_inventory] rdd "
-                  f"validation failed ({e!r}); falling back to "
-                  f"CURRENT_DATE() window")
+            _tool_log.warning("get_fgi rdd validation failed err=%r", e)
     else:
-        print(f"[DEBUG-RDD][get_finished_goods_inventory] no rdd "
-              f"provided; using CURRENT_DATE() window")
+        _tool_log.debug("get_fgi no rdd provided using CURRENT_DATE window")
 
     if plant_code:
         where.append("plant_code = @plant")
@@ -705,9 +712,7 @@ def get_finished_goods_inventory(
         rows = _run_query(sql, params)
     except Exception as e:
         # ───────── DEBUG-RDD: query failed; fall back to original ─────────
-        print(f"[DEBUG-RDD][get_finished_goods_inventory] query failed "
-              f"with strategy={_window_strategy}, error={e!r}; "
-              f"retrying with original CURRENT_DATE() window")
+        _tool_log.warning("get_fgi query failed strategy=%s err=%r retrying", _window_strategy, e)
         where = ["material_fert_number = @matnr",
                  "projection_week_start_date BETWEEN "
                  "DATE_SUB(CURRENT_DATE(), INTERVAL 1 WEEK) "
@@ -733,8 +738,7 @@ def get_finished_goods_inventory(
         _window_strategy = "fallback_after_error"
 
     # ───────── DEBUG-RDD: result log ─────────
-    print(f"[DEBUG-RDD][get_finished_goods_inventory] returned "
-          f"row_count={len(rows)}, strategy={_window_strategy}")
+    _tool_log.debug("get_fgi returned rows=%d strategy=%s", len(rows), _window_strategy)
 
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_inventory_projection",
@@ -761,9 +765,8 @@ def get_safety_stock_position(
             the tool falls back to projection_week_start_date >= CURRENT_DATE().
     """
     # ───────── DEBUG-RDD: tool entry log ─────────
-    print(f"[DEBUG-RDD][get_safety_stock_position] called with "
-          f"material_number={material_number!r}, plant_code={plant_code!r}, "
-          f"requested_delivery_date={requested_delivery_date!r}")
+    _tool_log.debug("get_ssp called material=%r plant=%r rdd=%r",
+                    material_number, plant_code, requested_delivery_date)
 
     # Original behavior preserved EXACTLY — runs as the default and is only
     # overridden inside the try block below if a valid delivery date arrives.
@@ -784,16 +787,11 @@ def get_safety_stock_position(
             params = [_p("matnr", "STRING", material_number),
                       _p("rdd", "STRING", requested_delivery_date)]
             _window_strategy = "rdd_anchored"
-            print(f"[DEBUG-RDD][get_safety_stock_position] using "
-                  f"rdd-anchored window: [{requested_delivery_date} - 4w, "
-                  f"{requested_delivery_date} + 1w]")
+            _tool_log.debug("get_ssp using rdd-anchored window rdd=%s", requested_delivery_date)
         except Exception as e:
-            print(f"[DEBUG-RDD][get_safety_stock_position] rdd "
-                  f"validation failed ({e!r}); falling back to "
-                  f"CURRENT_DATE() window")
+            _tool_log.warning("get_ssp rdd validation failed err=%r", e)
     else:
-        print(f"[DEBUG-RDD][get_safety_stock_position] no rdd "
-              f"provided; using CURRENT_DATE() window")
+        _tool_log.debug("get_ssp no rdd provided using CURRENT_DATE window")
 
     if plant_code:
         where.append("plant_code = @plant")
@@ -815,9 +813,7 @@ def get_safety_stock_position(
         rows = _run_query(sql, params)
     except Exception as e:
         # ───────── DEBUG-RDD: query failed; fall back to original ─────────
-        print(f"[DEBUG-RDD][get_safety_stock_position] query failed "
-              f"with strategy={_window_strategy}, error={e!r}; "
-              f"retrying with original CURRENT_DATE() window")
+        _tool_log.warning("get_ssp query failed strategy=%s err=%r retrying", _window_strategy, e)
         where = ["material_fert_number = @matnr",
                  "projection_week_start_date >= CURRENT_DATE()"]
         params = [_p("matnr", "STRING", material_number)]
@@ -840,8 +836,7 @@ def get_safety_stock_position(
         _window_strategy = "fallback_after_error"
 
     # ───────── DEBUG-RDD: result log ─────────
-    print(f"[DEBUG-RDD][get_safety_stock_position] returned "
-          f"row_count={len(rows)}, strategy={_window_strategy}")
+    _tool_log.debug("get_ssp returned rows=%d strategy=%s", len(rows), _window_strategy)
 
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_inventory_projection",

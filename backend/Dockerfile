@@ -43,7 +43,13 @@ COPY code/orchestrator_service/firestore_client.py /app/firestore_client.py
 COPY code/orchestrator_service/bigquery_client.py  /app/bigquery_client.py
 COPY code/orchestrator_service/data_pipeline.py    /app/data_pipeline.py
 COPY code/orchestrator_service/fulfillment_optimizer.py /app/fulfillment_optimizer.py
+COPY code/orchestrator_service/_v23_adapter.py     /app/_v23_adapter.py
 COPY code/orchestrator_service/main.py             /app/main.py
+COPY code/orchestrator_service/logging_config.py   /app/logging_config.py
+
+# Log directory — writable by the app user. The RotatingFileHandler writes
+# here if LOG_FILE_PATH is set; silently skipped if not mounted in Cloud Run.
+RUN mkdir -p /app/logs && chmod 777 /app/logs
 
 # Static config (freight-cost lookup table for the fulfillment LP)
 COPY code/orchestrator_service/config/ /app/config/

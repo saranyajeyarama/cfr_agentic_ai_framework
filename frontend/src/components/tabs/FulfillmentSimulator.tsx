@@ -1,3 +1,4 @@
+import type { Dispatch, SetStateAction } from 'react';
 import { Activity, AlertTriangle, ArrowRight, ShieldAlert, ChevronRight, CheckCircle2, Loader2, Truck, Clock, Building2 } from 'lucide-react';
 import { Pie, PieChart, ResponsiveContainer } from 'recharts';
 import { useEffect, useState } from 'react';
@@ -21,7 +22,7 @@ export function FulfillmentSimulator({
     load: (force?: boolean) => Promise<void>;
   };
   scenariosMap: ScenarioMap;
-  setScenariosMap: React.Dispatch<React.SetStateAction<ScenarioMap>>;
+  setScenariosMap: Dispatch<SetStateAction<ScenarioMap>>;
 }) {
   const { state: incidentsState, load: loadIncidents } = incidentsStore;
   const INCIDENTS = incidentsState.incidents;

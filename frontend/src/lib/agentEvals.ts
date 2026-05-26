@@ -7,7 +7,7 @@
  * sessionStorage so a page reload also keeps results around for the
  * lifetime of the browser tab.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } from 'react';
 
 export type AgentEvalStatus = 'idle' | 'evaluating' | 'done' | 'error';
 
@@ -71,7 +71,7 @@ function saveToSession(map: AgentEvalMap) {
  */
 export function useAgentEvalsStore(): [
   AgentEvalMap,
-  React.Dispatch<React.SetStateAction<AgentEvalMap>>,
+  Dispatch<SetStateAction<AgentEvalMap>>,
 ] {
   const [evals, setEvals] = useState<AgentEvalMap>(() => loadFromSession());
 
@@ -87,7 +87,7 @@ export function useAgentEvalsStore(): [
  * having to construct the spread at every call site.
  */
 export function useUpdateAgentEval(
-  setEvals: React.Dispatch<React.SetStateAction<AgentEvalMap>>,
+  setEvals: Dispatch<SetStateAction<AgentEvalMap>>,
 ) {
   return useCallback(
     (poId: string, patch: Partial<AgentEvalState> | AgentEvalState) => {
@@ -139,7 +139,7 @@ export async function fetchTelemetryLog(limit = 20): Promise<DecisionEntry[]> {
  */
 export function useDecisionLogStore(
   seed: DecisionEntry[] = [],
-): [DecisionEntry[], React.Dispatch<React.SetStateAction<DecisionEntry[]>>] {
+): [DecisionEntry[], Dispatch<SetStateAction<DecisionEntry[]>>] {
   const [log, setLog] = useState<DecisionEntry[]>(() => {
     try {
       const raw = sessionStorage.getItem(DECISION_LOG_KEY);
