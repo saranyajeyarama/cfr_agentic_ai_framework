@@ -49,7 +49,7 @@ def _run(client: bigquery.Client, sql: str, params: list | None = None) -> list[
         cfg = bigquery.QueryJobConfig(query_parameters=params or [])
         return [dict(r) for r in client.query(sql, job_config=cfg).result()]
     except Exception as exc:
-        print(f"BQ query failed: {exc}\n SQL: {sql[:300]}", flush=True)
+        log.error("BQ query failed: %s sql=%.300s", exc, sql)
         return []
 
 
@@ -637,8 +637,7 @@ def _fetch_fulfillment_incidents(client: bigquery.Client) -> list[dict]:
 def _fetch_demo_seed_incidents(client: bigquery.Client) -> list[dict]:
     """Fallback: no approved+at-risk orders → seed 1-2 illustrative
     incidents from raw OTIF history so the UI is never blank."""
-    print("[fulfillment-incidents] no approved+at-risk orders found; "
-          "falling back to demo seeds from fct_otif", flush=True)
+    log.info("No approved+at-risk orders found; falling back to demo seed from fct_otif")
     fallback = _run(client, f"""
         SELECT
             o.delivery_number, o.sold_to_name, o.sold_to,
@@ -816,12 +815,12 @@ def fetch_fulfillment_incidents() -> dict:
     try:
         client = _bq_client()
     except Exception as exc:  # noqa: BLE001
-        print(f"[fulfillment-incidents] BQ client init failed: {exc}", flush=True)
+        log.error("Fulfillment incidents BQ init failed: %s", exc, exc_info=True)
         return {"incidents": [], "meta": {"error": "bigquery_client_unavailable"}}
     try:
         incidents = _fetch_fulfillment_incidents(client)
     except Exception as exc:  # noqa: BLE001
-        print(f"[fulfillment-incidents] query failed: {exc}", flush=True)
+        log.error("Fulfillment incidents query failed: %s", exc, exc_info=True)
         return {"incidents": [], "meta": {"error": str(exc)[:200]}}
     demo = any(i.get("_demo_seed") for i in incidents)
     return {
@@ -1082,10 +1081,7 @@ def _safe_section(name: str, fn, client, default):
     try:
         return fn(client)
     except Exception as exc:
-        import traceback
-        print(f"[dashboard] section '{name}' failed: "
-              f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-              flush=True)
+        log.error("Dashboard section '%s' failed: %s", name, exc, exc_info=True)
         return default
 
 
@@ -1095,10 +1091,7 @@ def fetch_dashboard_data() -> dict:
     except Exception as exc:
         # BigQuery client itself could not be created. Return an all-empty
         # dashboard rather than 500 — the front-end falls back to mock data.
-        import traceback
-        print(f"[dashboard] BigQuery client init failed: "
-              f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-              flush=True)
+        log.error("Dashboard BQ client init failed: %s", exc, exc_info=True)
         client = None
 
     if client is None:

@@ -23,7 +23,12 @@ from __future__ import annotations
 # generators create OTEL span tokens in one asyncio context; FastAPI
 # BackgroundTasks closes them in a copied context, so ContextVar.reset()
 # raises ValueError. OTEL catches it and logs it at ERROR — harmless noise.
+from logging_config import configure_logging
+configure_logging()
+
+import logging
 import logging as _logging
+log = logging.getLogger(__name__)
 _logging.getLogger("opentelemetry").setLevel(_logging.CRITICAL)
 
 import asyncio
@@ -45,6 +50,7 @@ from agent_tools import (
     get_demo_scenario_candidates,
     get_network_inventory,
     get_customer_penalty_profile,
+    get_data_health,
 )
 from firestore_client import create_session, get_session
 from orchestrator import run_session, approve_session, reject_session
@@ -54,8 +60,14 @@ from schemas import (
     ChatRequest, ChatResponse,
     FulfillmentSimulateRequest, FulfillmentSimulateResponse,
     FulfillmentIncidentsResponse,
+    ExecutionTelemetryRequest, ExecutionTelemetryWriteResponse,
+    ExecutionTelemetryListResponse,
 )
 from fulfillment_optimizer import simulate as _simulate_fulfillment
+from _v23_adapter import (
+    candidate_to_v23_order,
+    decision_to_v23_synthesis,
+)
 
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "resilience-riskradar")
@@ -87,14 +99,72 @@ def _new_session_id() -> str:
     return f"session_{ts}_{uuid.uuid4().hex[:6]}"
 
 
+# ---------------------------------------------------------------------------
+# User Execution Telemetry — fct_user_execution_telemetry
+# Dedicated BigQuery audit table in tiger_decisions (US multi-region).
+# Created once on first write/read via _ensure_telemetry_table().
+# ---------------------------------------------------------------------------
+
+_TELEMETRY_TABLE = f"{PROJECT_ID}.tiger_decisions.fct_user_execution_telemetry"
+_telemetry_table_ready: bool = False
+
+
+def _bq_telemetry() -> bigquery.Client:
+    """BigQuery client for tiger_decisions (US multi-region)."""
+    from data_pipeline import _bq_decisions
+    return _bq_decisions()
+
+
+def _ensure_telemetry_table() -> None:
+    """Create fct_user_execution_telemetry if it doesn't exist (idempotent)."""
+    global _telemetry_table_ready
+    if _telemetry_table_ready:
+        return
+    try:
+        client = _bq_telemetry()
+        schema = [
+            bigquery.SchemaField("telemetry_id",          "STRING",    mode="REQUIRED"),
+            bigquery.SchemaField("event_timestamp",        "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("po_number",              "STRING"),
+            bigquery.SchemaField("sold_to",                "STRING"),
+            bigquery.SchemaField("customer_name",          "STRING"),
+            bigquery.SchemaField("material_number",        "STRING"),
+            bigquery.SchemaField("ordered_qty",            "FLOAT64"),
+            bigquery.SchemaField("agent_recommendation",   "STRING"),
+            bigquery.SchemaField("user_decision",          "STRING",    mode="REQUIRED"),
+            bigquery.SchemaField("override_reason",        "STRING"),
+            bigquery.SchemaField("override_reason_code",   "STRING"),
+            bigquery.SchemaField("session_id",             "STRING"),
+            bigquery.SchemaField("decision_id",            "STRING"),
+            bigquery.SchemaField("outcome_note",           "STRING"),
+            bigquery.SchemaField("user_id",                "STRING"),
+            bigquery.SchemaField("source_tab",             "STRING"),
+            bigquery.SchemaField("created_at",             "TIMESTAMP", mode="REQUIRED"),
+        ]
+        table = bigquery.Table(_TELEMETRY_TABLE, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field="created_at",
+        )
+        table.description = (
+            "User execution telemetry — human override audit trail for "
+            "Order Triage and Fulfillment Simulator. Written by the frontend "
+            "via POST /telemetry/execution on every Accept / Modify / Reject."
+        )
+        client.create_table(table, exists_ok=True)
+        _telemetry_table_ready = True
+        log.info("Telemetry table ready: %s", _TELEMETRY_TABLE)
+    except Exception as exc:
+        log.warning("Telemetry table ensure failed: %s", exc)
+
+
 @app.exception_handler(RequestValidationError)
 async def _log_validation_error(request: Request, exc: RequestValidationError):
     body = await request.body()
-    print(
-        f"[422-DEBUG] {request.method} {request.url.path}\n"
-        f"  errors={exc.errors()}\n"
-        f"  body={body[:2000].decode('utf-8', 'replace')}",
-        flush=True,
+    log.warning(
+        "422 validation error %s %s errors=%s body=%.500s",
+        request.method, request.url.path,
+        exc.errors(), body[:500].decode("utf-8", "replace"),
     )
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
@@ -321,9 +391,7 @@ def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulate
                     pm["carrier_otp_target"] = ci.get("on_time_performance_target_pct")
     except Exception as exc:
         # Delivery context is best-effort — optimizer still works without it.
-        import traceback
-        print(f"[fulfillment-simulate] delivery context error (non-fatal): "
-              f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}", flush=True)
+        log.warning("Fulfillment delivery context error: %s", exc)
 
     # 5) Solve.
     result = _simulate_fulfillment(
@@ -380,9 +448,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     except HTTPException:
         raise
     except Exception as exc:
-        import traceback
-        print(f"[chat] {type(exc).__name__}: {exc}\n"
-              f"{traceback.format_exc()}", flush=True)
+        log.error("Chat route error: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Gemini error: {type(exc).__name__}: {exc}")
@@ -396,6 +462,118 @@ def demo_candidates(limit: int = 10) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# v2.3 routes — additive, non-breaking. Wrap the v2.1 contract in the
+# v2.3 UI's expected shapes so the upgraded UI can run against the live
+# backend without breaking the v2.1 frontend during the parallel
+# transition.
+#
+# Contract & adapter logic live in _v23_adapter.py. These routes are
+# thin wrappers; do not put business logic here.
+# ---------------------------------------------------------------------------
+@app.get("/v23/orders")
+def v23_orders(limit: int = 10) -> dict:
+    """v2.3 ORDERS[] shape — wraps get_demo_scenario_candidates and
+    adapts each row to the v2.3 UI's expected field names. Flag
+    derivation (above_forecast / promo / hard_block / buffer_build /
+    clean) is server-side here, single source of truth for both UIs.
+    """
+    src = get_demo_scenario_candidates(limit=limit)
+    candidates = src.get("candidates") or []
+    return {
+        "orders": [candidate_to_v23_order(c) for c in candidates],
+        "row_count": len(candidates),
+        "data_available": bool(candidates),
+        "rationale": src.get("rationale"),
+    }
+
+
+@app.get("/data-health")
+def data_health() -> dict:
+    """Live freshness snapshot of every tiger_semantic view the agents
+    depend on. Queries BigQuery INFORMATION_SCHEMA — no mock data.
+
+    Used by the v2.3 UI's Data Health page. Returns one row per view
+    with last_modified timestamp, age in hours, expected refresh window,
+    and a status flag (FRESH / WARNING / STALE / MISSING).
+
+    See _DATA_HEALTH_VIEW_CONFIG in agent_tools.py for the per-view
+    refresh cadence + source-system config the status thresholds use.
+    """
+    return get_data_health()
+
+
+@app.post("/v23/triage/{order_id}")
+async def v23_triage(order_id: str, backend: dict) -> dict:
+    """Run the full 5-agent flow for one v2.3 UI order, return the
+    result in the v2.3 SYNTHESIS[order_id] shape.
+
+    Request body: the `_backend` dict from /v23/orders for this order
+    (sold_to, material_number, ordered_quantity_cases,
+    requested_delivery_date, ...). The v2.3 UI round-trips that
+    payload back so we can resolve the CustomerOrderEvent without
+    re-querying the candidate shortlist.
+
+    Response: { order_id, synthesis: <v2.3 SYNTHESIS entry>, session_id }
+    """
+    # Validate the round-tripped payload
+    required = ("sold_to", "material_number")
+    missing = [k for k in required if not backend.get(k)]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"_backend payload missing required keys: {missing}")
+
+    # Resolve to a CustomerOrderEvent via the demo trigger path
+    try:
+        order_event = from_demo_payload({
+            "sold_to": backend["sold_to"],
+            "material_number": backend["material_number"],
+            "ordered_quantity_cases": backend.get(
+                "ordered_quantity_cases"),
+            "requested_delivery_date": backend.get(
+                "requested_delivery_date"),
+            "customer_name": backend.get("customer_name"),
+            "material_description": backend.get("material_description"),
+            "ship_to": backend.get("ship_to"),
+        })
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not resolve v2.3 order: {exc}")
+
+    # Run the session inline (same pattern as /sessions/sync)
+    session_id = _new_session_id()
+    create_session(
+        session_id=session_id,
+        trigger_type="manual",
+        trigger_payload={**order_event.to_dict(),
+                         "trigger_source": "v23_payload"},
+    )
+    await _run_session_tracked(session_id, "manual", order_event)
+    sess = get_session(session_id)
+    if not sess:
+        raise HTTPException(
+            status_code=500,
+            detail="Session was created but cannot be read back")
+
+    # Pull the final_action_card from session state and adapt to v2.3 shape
+    decision = sess.get("final_action_card") or {}
+    if not decision:
+        raise HTTPException(
+            status_code=500,
+            detail="Session completed but produced no decision")
+
+    return {
+        "order_id": order_id,
+        "session_id": session_id,
+        "synthesis": decision_to_v23_synthesis(decision),
+        # Bonus — also return the unmapped v2.1 contract for clients that
+        # want it. Frontend can ignore.
+        "raw_decision": decision,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Start a session — trigger adapter resolves the order event
 # ---------------------------------------------------------------------------
 @app.post("/sessions", response_model=StartSessionResponse)
@@ -403,6 +581,7 @@ async def start_session(
     req: StartSessionRequest,
     background_tasks: BackgroundTasks,
 ) -> StartSessionResponse:
+    log.info("POST /sessions trigger_source=%s sold_to=%s material=%s", req.trigger_source, getattr(req, 'sold_to', '?'), getattr(req, 'material_number', '?'))
     try:
         if req.trigger_source == "edi_850":
             if not req.isa_control_id:
@@ -535,6 +714,7 @@ def _require_awaiting(session_id: str) -> dict:
 
 @app.post("/sessions/{session_id}/approve", response_model=DecisionResponse)
 def approve(session_id: str, req: ApprovalRequest) -> DecisionResponse:
+    log.info("POST /sessions/%s/approve user_id=%s", session_id, req.user_id)
     sess = _require_awaiting(session_id)
     decision_id = approve_session(
         session_id=session_id,
@@ -547,6 +727,7 @@ def approve(session_id: str, req: ApprovalRequest) -> DecisionResponse:
 
 @app.post("/sessions/{session_id}/reject", response_model=DecisionResponse)
 def reject(session_id: str, req: RejectionRequest) -> DecisionResponse:
+    log.info("POST /sessions/%s/reject reason=%.100s", session_id, req.rejection_reason[:100] if req.rejection_reason else '')
     sess = _require_awaiting(session_id)
     decision_id = reject_session(
         session_id=session_id,
@@ -555,6 +736,99 @@ def reject(session_id: str, req: RejectionRequest) -> DecisionResponse:
         rejection_reason=req.rejection_reason,
     )
     return DecisionResponse(decision_id=decision_id, status="rejected")
+
+
+# ---------------------------------------------------------------------------
+# User Execution Telemetry endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/telemetry/execution", response_model=ExecutionTelemetryWriteResponse)
+def write_telemetry(req: ExecutionTelemetryRequest) -> ExecutionTelemetryWriteResponse:
+    """Write one human-decision event to fct_user_execution_telemetry.
+
+    Called by the frontend (background, non-blocking) immediately after a
+    user clicks Accept / Modify / Reject in Order Triage. The local UI state
+    is updated optimistically; this call persists the record to BigQuery for
+    cross-session and cross-user visibility.
+    """
+    _ensure_telemetry_table()
+    client = _bq_telemetry()
+    telemetry_id = f"tel-{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    row = {
+        "telemetry_id":        telemetry_id,
+        "event_timestamp":     now.isoformat(),
+        "po_number":           req.po_number or "",
+        "sold_to":             req.sold_to or "",
+        "customer_name":       req.customer_name or "",
+        "material_number":     req.material_number or "",
+        "ordered_qty":         req.ordered_qty,
+        "agent_recommendation": req.agent_recommendation or "",
+        "user_decision":       req.user_decision,
+        "override_reason":     req.override_reason,
+        "override_reason_code": req.override_reason_code,
+        "session_id":          req.session_id,
+        "decision_id":         req.decision_id,
+        "outcome_note":        req.outcome_note or "",
+        "user_id":             req.user_id or "planner",
+        "source_tab":          req.source_tab or "order_triage",
+        "created_at":          now.isoformat(),
+    }
+    errors = client.insert_rows_json(_TELEMETRY_TABLE, [row])
+    if errors:
+        log.error("Telemetry BQ insert errors: %s", errors)
+        raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
+    log.info("Telemetry written: id=%s decision=%s po=%s", telemetry_id, req.user_decision, req.po_number)
+    return ExecutionTelemetryWriteResponse(telemetry_id=telemetry_id, status="written")
+
+
+@app.get("/telemetry/execution", response_model=ExecutionTelemetryListResponse)
+def read_telemetry(limit: int = 20) -> ExecutionTelemetryListResponse:
+    """Return the most recent human-decision events from BigQuery.
+
+    Called on Order Triage tab mount to populate the Recent Agent Override
+    Telemetry table with real persisted data instead of mock seed values.
+    Degrades to empty list if the table doesn't exist yet or the query fails.
+    """
+    _ensure_telemetry_table()
+    client = _bq_telemetry()
+    safe_limit = min(max(limit, 1), 100)
+    try:
+        rows = list(client.query(f"""
+            SELECT
+                telemetry_id,
+                event_timestamp,
+                po_number,
+                customer_name,
+                sold_to,
+                agent_recommendation,
+                user_decision,
+                override_reason,
+                outcome_note
+            FROM `{_TELEMETRY_TABLE}`
+            ORDER BY event_timestamp DESC
+            LIMIT {safe_limit}
+        """).result())
+    except Exception as exc:
+        log.error("Telemetry read failed: %s", exc, exc_info=True)
+        return ExecutionTelemetryListResponse(entries=[], total=0)
+
+    entries = []
+    for r in rows:
+        r = dict(r)
+        et = r.get("event_timestamp")
+        ts = et.isoformat() if hasattr(et, "isoformat") else str(et or "")
+        entries.append({
+            "id":                  r.get("telemetry_id") or "",
+            "timestamp":           ts,
+            "poNumber":            r.get("po_number") or "",
+            "customer":            r.get("customer_name") or r.get("sold_to") or "",
+            "agentRecommendation": r.get("agent_recommendation") or "",
+            "userDecision":        (r.get("user_decision") or "").lower(),
+            "overrideReason":      r.get("override_reason"),
+            "outcome":             r.get("outcome_note") or "",
+        })
+    return ExecutionTelemetryListResponse(entries=entries, total=len(entries))
 
 
 if __name__ == "__main__":

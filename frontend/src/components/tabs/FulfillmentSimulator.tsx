@@ -1,3 +1,4 @@
+import type { Dispatch, SetStateAction } from 'react';
 import { Activity, AlertTriangle, ArrowRight, ShieldAlert, ChevronRight, CheckCircle2, Loader2, Truck, Clock, Building2 } from 'lucide-react';
 import { Pie, PieChart, ResponsiveContainer } from 'recharts';
 import { useEffect, useState } from 'react';
@@ -21,7 +22,7 @@ export function FulfillmentSimulator({
     load: (force?: boolean) => Promise<void>;
   };
   scenariosMap: ScenarioMap;
-  setScenariosMap: React.Dispatch<React.SetStateAction<ScenarioMap>>;
+  setScenariosMap: Dispatch<SetStateAction<ScenarioMap>>;
 }) {
   const { state: incidentsState, load: loadIncidents } = incidentsStore;
   const INCIDENTS = incidentsState.incidents;
@@ -236,9 +237,9 @@ export function FulfillmentSimulator({
                  <div className="w-10 h-10 rounded-full bg-[#DB033B]/10 flex items-center justify-center text-[#DB033B] flex-shrink-0 border border-[#DB033B]/20">
                     <AlertTriangle className="w-5 h-5" />
                  </div>
-                 <div>
+                 <div className="min-w-0 flex-1">
                    <div className="font-bold text-slate-800">{incident.customer} — {incident.skuName}</div>
-                   <div className="text-sm text-slate-600 mt-1 leading-relaxed">
+                   <div className="text-sm text-slate-600 mt-1 leading-relaxed break-words">
                      {incident.description}
                    </div>
                    {/* Origin plant & transit context from dim_plant + fct_shipments */}
@@ -287,13 +288,27 @@ export function FulfillmentSimulator({
                        <div className="text-lg font-black font-mono text-slate-800">{incident.maxDaysLate ?? 0}d</div>
                        <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Max Late</div>
                      </div>
-                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100">
-                       <div className="text-lg font-black font-mono text-slate-800">{incident.lastRootCause ?? 'N/A'}</div>
-                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Root Cause</div>
+                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100 overflow-hidden">
+                       <div
+                         className="text-sm font-bold text-slate-800 truncate leading-snug"
+                         title={incident.lastRootCause ?? 'N/A'}
+                       >
+                         {incident.lastRootCause
+                           ? incident.lastRootCause.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())
+                           : 'N/A'}
+                       </div>
+                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mt-0.5">Root Cause</div>
                      </div>
-                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100">
-                       <div className="text-lg font-black font-mono text-slate-800">{incident.mabdEnforcement ?? 'N/A'}</div>
-                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Enforcement</div>
+                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100 overflow-hidden">
+                       <div
+                         className="text-sm font-bold text-slate-800 truncate leading-snug"
+                         title={incident.mabdEnforcement ?? 'N/A'}
+                       >
+                         {incident.mabdEnforcement
+                           ? incident.mabdEnforcement.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())
+                           : 'N/A'}
+                       </div>
+                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mt-0.5">Enforcement</div>
                      </div>
                    </div>
                  </div>

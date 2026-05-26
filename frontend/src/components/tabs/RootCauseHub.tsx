@@ -3,6 +3,8 @@ import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis
 import { useState, useCallback } from 'react';
 
 import type { DashboardData } from '../../types/dashboard';
+import { useDashboardData } from '../../lib/hooks';
+import { DashboardSkeleton, ErrorState } from '../primitives';
 
 type ViewLevel = 'L1' | 'L2_DEMAND' | 'L2_SUPPLY';
 
@@ -64,60 +66,14 @@ const CustomTooltip = ({ active, payload, label }: any) => {
   return null;
 };
 
-export function RootCauseHub({ data }: { data: DashboardData }) {
-  const { rootCauseSummary } = data;
-  const DRIVERS = buildDrivers(rootCauseSummary.drivers);
-
-  const L1_DATA: ChartDataPoint[] = [
-    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', isTotal: true },
-    { name: 'Demand Gaps', transparentVal: BASELINE - rootCauseSummary.demandDrivenCases, visibleVal: rootCauseSummary.demandDrivenCases, displayVal: `-${rootCauseSummary.demandDrivenCases.toLocaleString()}`, fill: '#3b82f6', type: 'gap-demand' },
-    { name: 'Supply Gaps', transparentVal: BASELINE - rootCauseSummary.demandDrivenCases - rootCauseSummary.supplyDrivenCases, visibleVal: rootCauseSummary.supplyDrivenCases, displayVal: `-${rootCauseSummary.supplyDrivenCases.toLocaleString()}`, fill: '#eab308', type: 'gap-supply' },
-    { name: 'Actual Cases', transparentVal: 0, visibleVal: BASELINE - rootCauseSummary.totalCasesMissed, displayVal: (BASELINE - rootCauseSummary.totalCasesMissed).toLocaleString(), fill: '#475569', type: 'actual', isTotal: true },
-  ];
-
-  const L2_DEMAND_DATA: ChartDataPoint[] = [
-    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
-    ...rootCauseSummary.drivers.filter(d => d.category === 'Demand').map((d, index, arr) => {
-      const prevMissed = arr.slice(0, index).reduce((sum, item) => sum + item.casesMissed, 0);
-      return {
-        name: d.name.length > 15 ? d.name.substring(0, 15) + '...' : d.name,
-        transparentVal: BASELINE - prevMissed - d.casesMissed,
-        visibleVal: d.casesMissed,
-        displayVal: `-${d.casesMissed.toLocaleString()}`,
-        fill: index % 2 === 0 ? '#1d4ed8' : '#3b82f6',
-        type: 'driver',
-        id: d.id,
-      };
-    }),
-  ];
-
-  const L2_SUPPLY_DATA: ChartDataPoint[] = [
-    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
-    ...rootCauseSummary.drivers.filter(d => d.category === 'Supply').map((d, index, arr) => {
-      const prevMissed = arr.slice(0, index).reduce((sum, item) => sum + item.casesMissed, 0);
-      return {
-        name: d.name.length > 15 ? d.name.substring(0, 15) + '...' : d.name,
-        transparentVal: BASELINE - prevMissed - d.casesMissed,
-        visibleVal: d.casesMissed,
-        displayVal: `-${d.casesMissed.toLocaleString()}`,
-        fill: index % 2 === 0 ? '#b45309' : '#d97706',
-        type: 'driver',
-        id: d.id,
-      };
-    }),
-  ];
-
-  const firstDriverId = rootCauseSummary.drivers[0]?.id || '';
+export function RootCauseHub() {
+  const { data, loading, err, reload } = useDashboardData();
   const [viewLevel, setViewLevel] = useState<ViewLevel>('L1');
-  const [selectedDriverId, setSelectedDriverId] = useState<string>(firstDriverId);
+  const [selectedDriverId, setSelectedDriverId] = useState<string>('');
   const [draftText, setDraftText] = useState<string>('');
   const [isGeneratingEmail, setIsGeneratingEmail] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [showTeamsToast, setShowTeamsToast] = useState(false);
-
-  const selectedDriver = DRIVERS[selectedDriverId];
-
-  const chartData = viewLevel === 'L1' ? L1_DATA : viewLevel === 'L2_DEMAND' ? L2_DEMAND_DATA : L2_SUPPLY_DATA;
 
   const generateEmail = useCallback(async (driver: any) => {
     if (!driver) return;
@@ -155,6 +111,63 @@ Keep it under 200 words. Sign off as "Customer Supply Operations Team, Mars Pet 
       setIsGeneratingEmail(false);
     }
   }, []);
+
+  if (loading) return <DashboardSkeleton title="Loading Root Cause Hub…" />;
+  if (err || !data) return (
+    <ErrorState
+      title="Could not load Root Cause Hub"
+      message={err || 'Dashboard data unavailable.'}
+      onRetry={reload}
+    />
+  );
+
+  const { rootCauseSummary } = data;
+  const DRIVERS = buildDrivers(rootCauseSummary.drivers);
+
+  const L1_DATA: ChartDataPoint[] = [
+    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', isTotal: true },
+    { name: 'Demand Gaps', transparentVal: BASELINE - rootCauseSummary.demandDrivenCases, visibleVal: rootCauseSummary.demandDrivenCases, displayVal: `-${rootCauseSummary.demandDrivenCases.toLocaleString()}`, fill: '#3b82f6', type: 'gap-demand' },
+    { name: 'Supply Gaps', transparentVal: BASELINE - rootCauseSummary.demandDrivenCases - rootCauseSummary.supplyDrivenCases, visibleVal: rootCauseSummary.supplyDrivenCases, displayVal: `-${rootCauseSummary.supplyDrivenCases.toLocaleString()}`, fill: '#eab308', type: 'gap-supply' },
+    { name: 'Actual Cases', transparentVal: 0, visibleVal: BASELINE - rootCauseSummary.totalCasesMissed, displayVal: (BASELINE - rootCauseSummary.totalCasesMissed).toLocaleString(), fill: '#475569', type: 'actual', isTotal: true },
+  ];
+
+  const L2_DEMAND_DATA: ChartDataPoint[] = [
+    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
+    ...rootCauseSummary.drivers.filter((d: any) => d.category === 'Demand').map((d: any, index: number, arr: any[]) => {
+      const prevMissed = arr.slice(0, index).reduce((sum: number, item: any) => sum + item.casesMissed, 0);
+      return {
+        name: d.name.length > 15 ? d.name.substring(0, 15) + '...' : d.name,
+        transparentVal: BASELINE - prevMissed - d.casesMissed,
+        visibleVal: d.casesMissed,
+        displayVal: `-${d.casesMissed.toLocaleString()}`,
+        fill: index % 2 === 0 ? '#1d4ed8' : '#3b82f6',
+        type: 'driver',
+        id: d.id,
+      };
+    }),
+  ];
+
+  const L2_SUPPLY_DATA: ChartDataPoint[] = [
+    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
+    ...rootCauseSummary.drivers.filter((d: any) => d.category === 'Supply').map((d: any, index: number, arr: any[]) => {
+      const prevMissed = arr.slice(0, index).reduce((sum: number, item: any) => sum + item.casesMissed, 0);
+      return {
+        name: d.name.length > 15 ? d.name.substring(0, 15) + '...' : d.name,
+        transparentVal: BASELINE - prevMissed - d.casesMissed,
+        visibleVal: d.casesMissed,
+        displayVal: `-${d.casesMissed.toLocaleString()}`,
+        fill: index % 2 === 0 ? '#b45309' : '#d97706',
+        type: 'driver',
+        id: d.id,
+      };
+    }),
+  ];
+
+  const firstDriverId = rootCauseSummary.drivers[0]?.id || '';
+  const effectiveDriverId = selectedDriverId || firstDriverId;
+  const selectedDriver = DRIVERS[effectiveDriverId];
+
+  const chartData = viewLevel === 'L1' ? L1_DATA : viewLevel === 'L2_DEMAND' ? L2_DEMAND_DATA : L2_SUPPLY_DATA;
 
   const handleBarClick = (data: any) => {
     if (viewLevel === 'L1') {

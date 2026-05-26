@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { Area, AreaChart, CartesianGrid, ComposedChart, Legend, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Package, ShieldCheck, AlertCircle, TrendingUp, TrendingDown, CheckCircle2, ChevronRight, Activity } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import type { DashboardData } from '../../types/dashboard';
+import { useDashboardData } from '../../lib/hooks';
+import { DashboardSkeleton, ErrorState } from '../primitives';
 
 type Severity = 'critical' | 'warning' | 'neutral';
 
@@ -29,13 +30,23 @@ type SkuOptimization = {
   weeklyChartData: ChartDataPoint[];
 };
 
-export function SafetyStockOptimizer({ data }: { data: DashboardData }) {
-  const SKU_DATA: SkuOptimization[] = data.safetyStockRecommendations as SkuOptimization[];
-  const [selectedSkuId, setSelectedSkuId] = useState<string>(SKU_DATA[0]?.id || '');
+export function SafetyStockOptimizer() {
+  const { data, loading, err, reload } = useDashboardData();
+  const [selectedSkuId, setSelectedSkuId] = useState<string>('');
   const [showReasonCode, setShowReasonCode] = useState(false);
   const [reasonCode, setReasonCode] = useState("");
   const [showRationale, setShowRationale] = useState(false);
 
+  if (loading) return <DashboardSkeleton title="Loading Safety Stock Optimizer…" />;
+  if (err || !data) return (
+    <ErrorState
+      title="Could not load Safety Stock Optimizer"
+      message={err || 'Dashboard data unavailable.'}
+      onRetry={reload}
+    />
+  );
+
+  const SKU_DATA: SkuOptimization[] = data.safetyStockRecommendations as SkuOptimization[];
   const activeSku = SKU_DATA.find(s => s.id === selectedSkuId) || SKU_DATA[0];
 
   const getSeverityIcon = (severity: Severity) => {

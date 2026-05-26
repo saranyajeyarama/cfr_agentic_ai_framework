@@ -2,9 +2,21 @@ import React from 'react';
 import { AlertCircle, ArrowRight, ShieldAlert, TrendingUp } from 'lucide-react';
 import { Area, AreaChart, ResponsiveContainer } from 'recharts';
 import { ComposableMap, Geographies, Geography, Marker, Line } from "react-simple-maps";
-import type { DashboardData } from '../../types/dashboard';
+import { useDashboardData } from '../../lib/hooks';
+import { DashboardSkeleton, ErrorState } from '../primitives';
 
-export function Watchtower({ data }: { data: DashboardData }) {
+export function Watchtower() {
+  const { data, loading, err, reload } = useDashboardData();
+
+  if (loading) return <DashboardSkeleton title="Loading Watchtower…" />;
+  if (err || !data) return (
+    <ErrorState
+      title="Could not load Watchtower"
+      message={err || 'Dashboard data unavailable.'}
+      onRetry={reload}
+    />
+  );
+
   const { alerts, networkNodes, globalKPIs } = data;
 
   const getNodeCoords = (id: string) => {

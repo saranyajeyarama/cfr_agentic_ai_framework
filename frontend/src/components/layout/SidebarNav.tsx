@@ -1,72 +1,120 @@
-import { LayoutDashboard, Inbox, GitMerge, FileSearch, PanelLeftClose, PanelLeftOpen, ShieldCheck } from "lucide-react";
-import { cn } from "../../lib/utils";
 import { useState } from "react";
+import {
+  LayoutDashboard, Inbox, GitMerge, FileSearch,
+  PanelLeftClose, PanelLeftOpen, ShieldCheck,
+  Clock, Home, Activity, type LucideIcon,
+} from "lucide-react";
+import { cn } from "../../lib/utils";
+import type { ScreenId } from "../../lib/types";
 
-export type TabId = 'watchtower' | 'triage' | 'simulator' | 'rootcause' | 'optimizer';
+/** @deprecated Use ScreenId from lib/types. Kept as an alias so existing
+ *  imports compile during the transition. */
+export type TabId = ScreenId;
 
 interface SidebarNavProps {
   activeTab: TabId;
   setActiveTab: (tab: TabId) => void;
 }
 
+// ─── Tab definitions ──────────────────────────────────────────────────────────
+type TabDef = { id: TabId; label: string; icon: LucideIcon };
+
+const MAIN_TABS: TabDef[] = [
+  { id: 'watchtower', label: 'Agent Watchtower',       icon: LayoutDashboard },
+  { id: 'triage',     label: 'Order Triage',           icon: Inbox           },
+  { id: 'simulator',  label: 'Fulfillment Simulator',  icon: GitMerge        },
+  { id: 'rootcause',  label: 'Root Cause Hub',         icon: FileSearch      },
+  { id: 'safetystock', label: 'Safety Stock Optimizer', icon: ShieldCheck     },
+];
+
+const ANALYTICS_TABS: TabDef[] = [
+  { id: 'manager',    label: 'My Dashboard',   icon: Home     },
+  { id: 'decisions',  label: 'Decision Log',   icon: Clock    },
+  { id: 'datahealth', label: 'Data Health',    icon: Activity },
+];
+
+// ─── Main component ───────────────────────────────────────────────────────────
 export function SidebarNav({ activeTab, setActiveTab }: SidebarNavProps) {
   const [isCollapsed, setIsCollapsed] = useState(false);
 
-  const tabs = [
-    { id: 'watchtower', label: 'Agent Watchtower', icon: LayoutDashboard },
-    { id: 'triage', label: 'Order Triage', icon: Inbox },
-    { id: 'simulator', label: 'Fulfillment Simulator', icon: GitMerge },
-    { id: 'rootcause', label: 'Root Cause Hub', icon: FileSearch },
-    { id: 'optimizer', label: 'Safety Stock Optimizer', icon: ShieldCheck },
-  ] as const;
+  const renderTabs = (tabs: TabDef[]) =>
+    tabs.map(tab => {
+      const isActive = activeTab === tab.id;
+      const Icon = tab.icon;
+      return (
+        <button
+          key={tab.id}
+          onClick={() => setActiveTab(tab.id)}
+          className={cn(
+            "flex items-center gap-3 py-3 w-full transition-colors relative group",
+            isCollapsed ? "justify-center px-0" : "px-6 text-left",
+            isActive
+              ? "bg-[#fef2f2] text-slate-900 font-semibold border-r-2 border-[#DB033B]"
+              : "text-slate-500 font-medium hover:text-slate-700 hover:bg-slate-50"
+          )}
+        >
+          <Icon className={cn("w-5 h-5 shrink-0", isActive ? "text-[#DB033B]" : "text-slate-400")} />
+          {!isCollapsed && <span className="truncate">{tab.label}</span>}
+          {isCollapsed && (
+            <div className="absolute left-full ml-2 px-2 py-1 bg-slate-800 text-white text-xs rounded opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap z-50">
+              {tab.label}
+            </div>
+          )}
+        </button>
+      );
+    });
 
   return (
-    <nav className={cn(
-      "border-r border-slate-200 bg-white flex flex-col py-6 shrink-0 z-10 transition-all duration-300 relative",
-      isCollapsed ? "w-20" : "w-64"
-    )}>
-      <div className={cn(
-        "px-4 mb-4 flex items-center",
-        isCollapsed ? "justify-center" : "justify-between"
-      )}>
-        {!isCollapsed && <div className="text-xs font-semibold text-slate-400 tracking-wider uppercase">Workspace</div>}
-        <button 
-          onClick={() => setIsCollapsed(!isCollapsed)}
+    <nav
+      className={cn(
+        "border-r border-slate-200 bg-white flex flex-col py-6 shrink-0 z-10 transition-all duration-300 relative",
+        isCollapsed ? "w-20" : "w-64"
+      )}
+    >
+      {/* Collapse toggle */}
+      <div className={cn("px-4 mb-4 flex items-center", isCollapsed ? "justify-center" : "justify-between")}>
+        {!isCollapsed && (
+          <div className="text-xs font-semibold text-slate-400 tracking-wider uppercase">Workspace</div>
+        )}
+        <button
+          onClick={() => setIsCollapsed(c => !c)}
           className="text-slate-400 hover:text-slate-600 transition-colors p-1 rounded-md hover:bg-slate-100"
         >
           {isCollapsed ? <PanelLeftOpen className="w-4 h-4" /> : <PanelLeftClose className="w-4 h-4" />}
         </button>
       </div>
-      
-      <div className="flex flex-col gap-1 w-full mt-2">
-        {tabs.map((tab) => {
-          const isActive = activeTab === tab.id;
-          return (
-            <button 
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={cn(
-                "flex items-center gap-3 py-3 w-full transition-colors relative group",
-                isCollapsed ? "justify-center px-0" : "px-6 text-left",
-                isActive 
-                  ? "bg-[#fef2f2] text-slate-900 font-semibold border-r-2 border-[#DB033B]" 
-                  : "text-slate-500 font-medium hover:text-slate-700 hover:bg-slate-50"
-              )}
-            >
-              <tab.icon className={cn("w-5 h-5 shrink-0", isActive ? "text-[#DB033B]" : "text-slate-400")} />
-              
-              {!isCollapsed && <span className="truncate">{tab.label}</span>}
 
-              {isCollapsed && (
-                <div className="absolute left-full ml-2 px-2 py-1 bg-slate-800 text-white text-xs rounded opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap z-50">
-                  {tab.label}
-                </div>
-              )}
-            </button>
-          )
-        })}
+      {/* Core operations tabs */}
+      <div className="flex flex-col gap-1 w-full mt-2">
+        {renderTabs(MAIN_TABS)}
       </div>
+
+      {/* Analytics section divider */}
+      <div className="mt-4 mb-1">
+        {!isCollapsed ? (
+          <div className="px-6 py-2 text-[10px] font-bold text-slate-400 tracking-widest uppercase">
+            Analytics
+          </div>
+        ) : (
+          <div className="border-t border-slate-100 mx-4 my-2" />
+        )}
+      </div>
+
+      {/* Analytics tabs */}
+      <div className="flex flex-col gap-1 w-full">
+        {renderTabs(ANALYTICS_TABS)}
+      </div>
+
+      {/* Spacer */}
+      <div className="flex-1" />
+
+      {/* Brand footer */}
+      {!isCollapsed && (
+        <div className="px-6 py-3 border-t border-slate-100">
+          <div className="text-[10px] text-slate-400 font-mono">Tiger Foods OpEx Tower</div>
+          <div className="text-[9px] text-slate-300 mt-0.5">v2.02b · Agentic AI</div>
+        </div>
+      )}
     </nav>
   );
 }
-

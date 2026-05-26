@@ -11,7 +11,7 @@
  *  2. Scenarios per incident id — cached so re-clicking an incident or
  *     switching tabs doesn't re-run the LP.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } from 'react';
 
 // ─── Types (mirror backend FulfillmentIncident / FulfillmentScenario) ────────
 
@@ -172,7 +172,7 @@ export function useFulfillmentIncidentsStore() {
 
 export function useFulfillmentScenariosStore(): [
   ScenarioMap,
-  React.Dispatch<React.SetStateAction<ScenarioMap>>,
+  Dispatch<SetStateAction<ScenarioMap>>,
 ] {
   const [map, setMap] = useState<ScenarioMap>(() => {
     const loaded = readJSON<ScenarioMap>(SCENARIOS_KEY, {});
@@ -196,7 +196,7 @@ export function useFulfillmentScenariosStore(): [
  */
 export async function runFulfillmentSimulate(
   incident: FulfillmentIncident,
-  setMap: React.Dispatch<React.SetStateAction<ScenarioMap>>,
+  setMap: Dispatch<SetStateAction<ScenarioMap>>,
 ): Promise<void> {
   if (!incident.soldTo || !incident.materialNumber || !incident.orderedQty) {
     setMap(prev => ({

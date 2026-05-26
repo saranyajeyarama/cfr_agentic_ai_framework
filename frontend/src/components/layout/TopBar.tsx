@@ -1,55 +1,106 @@
-import { Dog, Cat } from 'lucide-react';
+/**
+ * TopBar — v2.3 visual identity.
+ * Extracted from mars-supply-ai-v2_02-restyled.jsx (function TopBar).
+ *
+ * Inline-style aesthetic preserved verbatim from the reference. Live KPIs
+ * come from /api/dashboard-data via App.tsx and degrade to '—' when the
+ * field is absent.
+ */
+
+import { C, MONO } from '../../lib/constants';
 import type { DashboardData } from '../../types/dashboard';
 
+type KpiTile = { label: string; value: string; color: string };
+
+function fmtPct(v: unknown): string {
+  if (typeof v !== 'number' || !isFinite(v)) return '—';
+  return `${v.toFixed(1)}%`;
+}
+
+function fmtUsdK(v: unknown): string {
+  if (typeof v !== 'number' || !isFinite(v)) return '—';
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000)     return `$${Math.round(v / 1_000)}K`;
+  return `$${v.toFixed(0)}`;
+}
+
 export function TopBar({ data, isLive }: { data: DashboardData; isLive: boolean }) {
-  const { globalKPIs } = data;
+  const gk = (data?.globalKPIs ?? {}) as Record<string, unknown>;
+
+  const tiles: KpiTile[] = [
+    { label: 'Network CFR',         value: fmtPct(gk.networkCFR),                          color: C.green    },
+    { label: 'Fines at Risk 7D',    value: fmtUsdK(gk.otifFinesAtRisk7Day),                color: C.red      },
+    { label: 'Rev Preserved MTD',   value: fmtUsdK(gk.revenuePreservedMTD),                color: C.charcoal },
+    { label: 'Agent Accept Rate',   value: fmtPct(gk.agentRecommendationAcceptanceRate),   color: C.blue     },
+  ];
 
   return (
-    <header className="h-14 border-b-2 border-[#DB033B] bg-white flex items-center justify-between px-6 shrink-0 z-50">
-      <div className="flex items-center gap-6">
-        <div className="flex flex-col">
-          <span className="font-[700] text-[#DB033B] text-[14px] leading-tight">Mars Pet Nutrition</span>
-          <span className="text-[#94a3b8] text-[10px] leading-tight">OpEx Tower — Customer Supply</span>
-        </div>
-        <div className="w-px h-8 bg-[#e2e8f0]"></div>
-      </div>
-      
-      <div className="flex items-center gap-8 flex-1 pl-6">
-        <div className="flex flex-col">
-          <span className="text-[0.65rem] uppercase tracking-widest text-slate-500 font-semibold">Network CFR</span>
-          <span className="text-lg font-mono font-bold text-emerald-600">{globalKPIs.networkCFR}%</span>
-        </div>
-        <div className="w-px h-8 bg-slate-200"></div>
-        <div className="flex flex-col">
-          <span className="text-[0.65rem] uppercase tracking-widest text-slate-500 font-semibold">Fines at Risk (7D)</span>
-          <span className="text-lg font-mono font-bold text-[#DB033B]">${globalKPIs.otifFinesAtRisk7Day.toLocaleString()}</span>
-        </div>
-        <div className="w-px h-8 bg-slate-200"></div>
-        <div className="flex flex-col">
-          <span className="text-[0.65rem] uppercase tracking-widest text-slate-500 font-semibold">Rev. Preserved</span>
-          <span className="text-lg font-mono font-bold text-slate-900">${globalKPIs.revenuePreservedMTD.toLocaleString()}</span>
-        </div>
+    <header style={{
+      height: 56, borderBottom: `2px solid ${C.red}`, background: '#fff',
+      display: 'flex', alignItems: 'center', padding: '0 20px 0 16px', flexShrink: 0,
+      boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
+    }}>
+      {/* Brand block */}
+      <div style={{
+        display: 'flex', flexDirection: 'column', marginRight: 20, flexShrink: 0,
+      }}>
+        <span style={{ fontWeight: 700, color: C.red, fontSize: 14, lineHeight: 1.2 }}>
+          Mars Pet Nutrition
+        </span>
+        <span style={{ color: C.muted, fontSize: 10, letterSpacing: '0.04em' }}>
+          OpEx Tower — Customer Supply
+        </span>
       </div>
 
-      <div className="flex items-center gap-4">
-        <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] font-bold uppercase tracking-widest ${
-          isLive
-            ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-            : 'bg-amber-50 border-amber-200 text-amber-700'
-        }`}>
-          <div className={`w-1.5 h-1.5 rounded-full ${isLive ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse'}`} />
+      {/* Brand divider */}
+      <div style={{ width: 1, height: 32, background: C.border, marginRight: 20, flexShrink: 0 }} />
+
+      {/* KPI tiles */}
+      <div style={{ display: 'flex', alignItems: 'center', flex: 1, gap: 0 }}>
+        {tiles.map((k, i, a) => (
+          <div key={k.label} style={{
+            display: 'flex', flexDirection: 'column',
+            paddingRight: 18, marginRight: 18, flexShrink: 0,
+            borderRight: i < a.length - 1 ? `1px solid ${C.border}` : 'none',
+          }}>
+            <span style={{
+              fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.08em',
+              color: C.muted, fontWeight: 600, marginBottom: 1,
+            }}>{k.label}</span>
+            <span style={{
+              fontSize: 17, fontWeight: 700, color: k.color,
+              fontFamily: MONO, lineHeight: 1,
+            }}>{k.value}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Live / mock indicator + user avatar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 5, padding: '3px 10px',
+          borderRadius: 20,
+          border: isLive ? '1px solid #6ee7b7' : '1px solid #fcd34d',
+          fontSize: 9, fontWeight: 700,
+          color: isLive ? '#065f46' : '#92400e',
+          background: isLive ? '#ecfdf5' : '#fffbeb',
+          textTransform: 'uppercase', letterSpacing: '0.07em',
+        }}>
+          <span style={{
+            width: 6, height: 6, borderRadius: '50%',
+            background: isLive ? '#10b981' : '#f59e0b',
+            display: 'inline-block',
+          }} />
           {isLive ? 'Live Data' : 'Mock Data'}
         </div>
-        <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center border border-slate-200 text-slate-700">
-          <span className="text-xs font-bold">JD</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'flex-end', height: '58px', overflow: 'hidden', gap: '8px', flexShrink: 0, paddingRight: 0 }}>
-          <Dog size={24} color="#eab308" className="mb-2" />
-          <Dog size={28} color="#f97316" className="mb-2" />
-          <Cat size={32} color="#ec4899" className="mb-2" />
+        <div style={{
+          width: 32, height: 32, borderRadius: '50%', background: C.off,
+          border: `1px solid ${C.border}`, display: 'flex', alignItems: 'center',
+          justifyContent: 'center', fontSize: 11, fontWeight: 700, color: C.charcoal,
+        }}>
+          SO
         </div>
       </div>
     </header>
   );
 }
-

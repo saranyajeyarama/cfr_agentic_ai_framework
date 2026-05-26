@@ -1,650 +1,891 @@
-import { useState, useEffect, useCallback } from 'react';
-import { AlertTriangle, Check, CheckCircle2, ChevronRight, CornerDownRight, X, Info, ShieldAlert, Bot, Loader2 } from 'lucide-react';
-import { cn } from '../../lib/utils';
-import { buildStartSessionRequest } from '../../lib/api';
-import type { AgentEvalState, AgentEvalMap, DecisionEntry, UserDecision } from '../../lib/agentEvals';
-import type { DashboardData } from '../../types/dashboard';
-
-type Severity = 'critical' | 'warning' | 'neutral';
-
-type PO = {
-  id: string;
-  orderNumber: string;
-  customer: string;
-  tier: string;
-  skuCode: string;
-  skuName: string;
-  requestedQty: number;
-  requestedQtyUnit: string;
-  forecastQty: number;
-  severity: Severity;
-  issue: string;
-  issueDetail: string;
-  agents: string[];
-  recommendedAction: string;
-  proposedAllocation: string;
-  proposedHold: string;
-  financialImpact: string;
-  confidenceScore: number;
-  // Real tiger_semantic identifiers — supplied by /dashboard-data.
-  // soldTo is the SAP sold-to customer number (NOT the display name).
-  // materialNumber is the SAP material number.
-  soldTo?: string;
-  materialNumber?: string;
-  mabd?: string;
-};
-
-
-
-
 /**
- * Adapt a PO row to the shared startSession contract. The real SAP
- * identifiers (soldTo / materialNumber) come from /dashboard-data; on
- * mock data they are empty and the backend falls back to a demo scenario.
+ * Order Triage — v2.3 (Phase 2.1).
+ *
+ * Hero screen. Wired to the live v2.3 backend:
+ *   • Queue            → GET  /v23/orders             (fetchOrders)
+ *   • Agent evaluation → POST /v23/triage/{id}        (triageOrder, 30-180s blocking)
+ *   • Approve / Reject → POST /sessions/{sid}/approve | /reject  (approveSession / rejectSession)
+ *
+ * UX states (in order):
+ *   1. idle        — empty right panel, "select an order to begin"
+ *   2. selected    — order header visible, "Evaluate Agents" CTA
+ *   3. evaluating  — 4 agent cards with streaming dots + wall-clock + cancel
+ *   4. result      — agent signals + conflict + recommendation card + approve/reject
+ *   5. decided     — read-only result + approved/rejected banner
+ *   6. error       — validation / backend / network / timeout error with retry CTA
+ *
+ * Errors per the spec:
+ *   • 422   → show response.detail with a "try another order" CTA
+ *   • 5xx   → "agent flow failed" + session_id if available
+ *   • >180s → "agents still running" + session_id if available
+ *
+ * On approve / reject the queue is refetched so the just-decided order
+ * is removed (the backend filters out approved orders from /v23/orders).
  */
-function poToOrder(po: PO) {
-  return {
-    soldTo: po.soldTo,
-    materialNumber: po.materialNumber,
-    requestedQty: po.requestedQty,
-    mabd: po.mabd,
-    customerName: po.customer,
-    materialDescription: po.skuName,
-    referenceNumber: po.orderNumber,
-  };
+
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { AlertTriangle, Bot, CheckCircle2, Loader2, RefreshCw, X, Zap } from 'lucide-react';
+import {
+  C, MONO, AGENT_KEYS, AGENT_LABELS,
+  dispColor, actColor, sevColor, flagColor,
+} from '../../lib/constants';
+import { Pill, Blinker } from '../primitives';
+import {
+  fetchOrders, triageOrder, approveSession, rejectSession,
+  invalidateDashboard,
+  AbortError, ValidationError, BackendError, NetworkError,
+} from '../../lib/api';
+import type { Order, TriageResponse, AgentKey } from '../../lib/types';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+type TriageError =
+  | { kind: 'validation'; message: string; detail: unknown }
+  | { kind: 'backend';    message: string; status: number; sessionId?: string }
+  | { kind: 'network';    message: string }
+  | { kind: 'timeout';    message: string; sessionId?: string };
+
+type Phase = 'idle' | 'evaluating' | 'result' | 'decided' | 'error';
+
+type DecisionKind = 'approved' | 'rejected';
+
+// Hardcoded planner identity — replace with auth context when available.
+const USER_ID = 'planner.ops@mars.com';
+
+// Triage timeout per the spec.
+const TIMEOUT_MS = 180_000;
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+function fmtElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, '0')}`;
 }
 
-export function OrderTriage({
-  data,
-  agentEvals,
-  setAgentEvals,
-  decisionLog,
-  setDecisionLog,
-  onDecisionSaved,
-}: {
-  data: DashboardData;
-  agentEvals: AgentEvalMap;
-  setAgentEvals: React.Dispatch<React.SetStateAction<AgentEvalMap>>;
-  decisionLog: DecisionEntry[];
-  setDecisionLog: React.Dispatch<React.SetStateAction<DecisionEntry[]>>;
-  /** Called after a decision is persisted to the backend so the Fulfillment
-   *  Simulator can re-fetch its incident list and pick up newly approved orders. */
-  onDecisionSaved?: () => void;
-}) {
-  const PURCHASE_ORDERS: PO[] = data.purchaseOrders as PO[];
-  const [activePoId, setActivePoId] = useState<string>(PURCHASE_ORDERS[0]?.id || '');
-  const [decision, setDecision] = useState<'accept' | 'modify' | 'reject' | null>(null);
-  const [overrideReason, setOverrideReason] = useState('');
-  const [showRationale, setShowRationale] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+function classifyError(e: unknown, sessionId?: string): TriageError {
+  if (e instanceof ValidationError) {
+    return { kind: 'validation', message: e.message, detail: e.detail };
+  }
+  if (e instanceof BackendError) {
+    return { kind: 'backend', message: e.message, status: e.status, sessionId };
+  }
+  if (e instanceof NetworkError) {
+    return { kind: 'network', message: e.message };
+  }
+  return { kind: 'backend', message: String((e as Error)?.message ?? e), status: 0 };
+}
 
+// =============================================================================
+// Sub-components — kept inline to keep the file self-contained
+// =============================================================================
 
-
-  const startAgentEval = useCallback(async (po: PO) => {
-    setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'evaluating' } }));
-    try {
-      // Synchronous flow: backend runs the 4 specialists + synthesizer
-      // inline and returns the completed session document in one response.
-      // No polling, no orphaned sessions. Request blocks ~60-180s.
-      // setAgentEvals is App-level state — it's safe to call even after
-      // this tab unmounts, so the in-flight eval still lands.
-      const res = await fetch('/api/sessions/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildStartSessionRequest(poToOrder(po))),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const sess = await res.json();
-      const card = sess.final_action_card;
-      if (!card) {
-        setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'error', sessionId: sess.session_id } }));
-        return;
-      }
-      const r = card.recommendation ?? {};
-      const chain = card.reasoning_chain ?? {};
-      console.log('[DEBUG][frontend #5] full recommendation from API:', r);
-      console.log('[DEBUG][frontend #6] fulfill_qty_cs from API:', r.fulfill_qty_cs);
-      setAgentEvals(prev => ({
-        ...prev,
-        [po.id]: {
-          status: 'done',
-          sessionId: sess.session_id,
-          rec: {
-            action: r.action ?? 'ACCEPT',
-            fulfill_qty_cs: r.fulfill_qty_cs ?? 0,
-            confidence: r.confidence ?? 0,
-            expected_outcome: r.expected_outcome ?? '',
-            key_trade_offs: chain.key_trade_offs ?? [],
-            what_would_change: chain.what_would_change_the_decision ?? '',
-          },
-        },
-      }));
-    } catch {
-      setAgentEvals(prev => ({ ...prev, [po.id]: { status: 'error' } }));
-    }
-  }, [setAgentEvals]);
-
-  // Auto-evaluate only the currently selected PO. Firing one session per
-  // row on mount blasted the backend with ~20 simultaneous POST /sessions
-  // and OOM'd the container under sequential agent execution. Other POs
-  // can be evaluated on demand when the user opens them.
-  useEffect(() => {
-    if (!activePoId) return;
-    if (agentEvals[activePoId]) return;  // already started/done for this row
-    const po = PURCHASE_ORDERS.find(p => p.id === activePoId);
-    if (po) startAgentEval(po);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePoId]);
-
-  const activePo = PURCHASE_ORDERS.find(po => po.id === activePoId) || PURCHASE_ORDERS[0];
-  const activeEval = agentEvals[activePoId];
-  const evalList: AgentEvalState[] = Object.values(agentEvals);
-  const evaluatingCount = evalList.filter(e => e.status === 'evaluating').length;
-  const doneCount = evalList.filter(e => e.status === 'done').length;
-
-  // Merge agent recommendation over static BQ data when available
-  const displayRec = activeEval?.rec;
-  const recommendedAction = displayRec?.expected_outcome || activePo.recommendedAction;
-  const proposedAllocation = displayRec
-    ? `${displayRec.fulfill_qty_cs.toLocaleString()} cs`
-    : activePo.proposedAllocation;
-  console.log('[DEBUG][frontend #7] proposedAllocation display value:', proposedAllocation, '| displayRec:', displayRec ? { fulfill_qty_cs: displayRec.fulfill_qty_cs, action: displayRec.action } : 'none (using static)');
-  const proposedHold = displayRec
-    ? `${Math.max(0, activePo.requestedQty - displayRec.fulfill_qty_cs).toLocaleString()} cs`
-    : activePo.proposedHold;
-  const confidencePct = displayRec
-    ? Math.round(displayRec.confidence * 100)
-    : activePo.confidenceScore;
-  const rationale = displayRec
-    ? (displayRec.key_trade_offs.length
-        ? displayRec.key_trade_offs.join(' · ')
-        : displayRec.what_would_change)
-    : (activePo as any).rationale || activePo.issueDetail;
-
-  const handlePoClick = (id: string) => {
-    setActivePoId(id);
-    setDecision(null);
-    setOverrideReason('');
-    setShowRationale(false);
-  };
-
-  const handleExecuteDecision = async () => {
-    if (!decision) return;
-    setIsSubmitting(true);
-    const evalSessionId = activeEval?.sessionId ?? null;
-    let outcomeNote = '';
-    let decisionIdFromBackend: string | undefined;
-
-    try {
-      // ── 1. Persist the decision to BigQuery via the backend ──────────
-      if (evalSessionId) {
-        if (decision === 'accept' || decision === 'modify') {
-          const res = await fetch(`/api/sessions/${evalSessionId}/approve`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              user_id: 'planner',
-              approval_notes: decision === 'modify' ? overrideReason : null,
-            }),
-          });
-          if (res.ok) {
-            const d = await res.json();
-            decisionIdFromBackend = d.decision_id;
-            outcomeNote = `Saved → BigQuery (${d.decision_id?.slice(0, 8)})`;
-          } else {
-            outcomeNote = `Backend ${res.status} — logged locally`;
-          }
-        } else {
-          // reject
-          const res = await fetch(`/api/sessions/${evalSessionId}/reject`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              user_id: 'planner',
-              rejection_reason: overrideReason || 'User rejected the order',
-            }),
-          });
-          if (res.ok) {
-            const d = await res.json();
-            decisionIdFromBackend = d.decision_id;
-            outcomeNote = `Rejected → BigQuery (${d.decision_id?.slice(0, 8)})`;
-          } else {
-            outcomeNote = `Backend ${res.status} — logged locally`;
-          }
-        }
-      } else {
-        outcomeNote = 'No agent session — logged locally only';
-      }
-    } catch {
-      outcomeNote = 'Backend unreachable — logged locally';
-    }
-
-    // ── 2. Update the agentEvals map so the queue card shows the decision ─
-    setAgentEvals(prev => ({
-      ...prev,
-      [activePo.id]: {
-        ...prev[activePo.id],
-        userDecision: decision as UserDecision,
-        decisionId: decisionIdFromBackend,
-      },
-    }));
-
-    // ── 3. Log in the telemetry table ────────────────────────────────────
-    const newDecision: DecisionEntry = {
-      id: `dc-${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      poNumber: activePo.orderNumber,
-      customer: activePo.customer,
-      agentRecommendation: recommendedAction,
-      userDecision: decision,
-      overrideReason: (decision === 'modify' || decision === 'reject') ? overrideReason : null,
-      outcome: outcomeNote,
-    };
-    setDecisionLog(prev => [newDecision, ...prev].slice(0, 20));
-
-    // ── 4. If accepted/modified, invalidate the Fulfillment incidents cache
-    //       so the Simulator picks up the newly approved order on next visit.
-    if ((decision === 'accept' || decision === 'modify') && onDecisionSaved) {
-      onDecisionSaved();
-    }
-
-    setDecision(null);
-    setOverrideReason('');
-    setIsSubmitting(false);
-  };
-
+/** Render fn (NOT a component) to sidestep the React 19 / TS 5.8
+ *  key-in-props strict check when used inside `.map()`. */
+function renderOrderRow(
+  order: Order,
+  selected: boolean,
+  decided: DecisionKind | null,
+  onClick: () => void,
+) {
+  const fc = flagColor(order.flag_type);
   return (
-    <div className="flex flex-col h-full overflow-hidden bg-slate-50">
-      <div className="h-16 px-8 flex items-center border-b border-slate-200 bg-white justify-between shrink-0">
-        <div>
-          <h2 className="text-lg font-bold text-slate-800">Order Triage &amp; Allocation</h2>
-          <p className="text-xs text-slate-500">Exception management and allocation guardrails</p>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-slate-500">
-          {evaluatingCount > 0 && (
-            <span className="flex items-center gap-1.5 text-amber-600 font-medium">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              {evaluatingCount} agent evaluation{evaluatingCount > 1 ? 's' : ''} running
-            </span>
-          )}
-          {doneCount > 0 && (
-            <span className="flex items-center gap-1.5 text-emerald-600 font-medium">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              {doneCount} evaluated
-            </span>
-          )}
-        </div>
+    <div key={order.id} onClick={onClick} style={{
+      padding: '12px 14px', borderRadius: 8, marginBottom: 8, cursor: 'pointer',
+      border: selected ? `2px solid ${C.red}` : `1px solid ${C.border}`,
+      background: selected ? 'rgba(219,3,59,0.04)' : '#fff',
+      borderLeft: selected ? `4px solid ${C.red}` : `4px solid ${fc}`,
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4,
+      }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: C.charcoal }}>{order.customer}</span>
+        <Pill label={`P${order.priority}`}
+              color={order.priority === 1 ? C.red : order.priority === 2 ? C.orange : C.muted}
+              size={9} />
+      </div>
+      <div style={{ fontSize: 11, color: C.charcoal, marginBottom: 3, lineHeight: 1.35 }}>
+        {order.desc || order.sku}
+      </div>
+      <div style={{ fontSize: 11, color: C.muted, marginBottom: 7 }}>
+        {order.qty.toLocaleString()} cs · {order.id} · {order.mabd ?? '—'}
+      </div>
+      <div style={{
+        fontSize: 10, background: `${fc}16`, color: fc, borderRadius: 4,
+        padding: '2px 7px', display: 'inline-block', fontWeight: 600,
+      }}>{order.flag}</div>
+      {decided && (
+        <div style={{
+          marginTop: 6, fontSize: 11,
+          color: decided === 'approved' ? C.green : C.red, fontWeight: 700,
+        }}>{decided === 'approved' ? 'Approved' : 'Rejected'}</div>
+      )}
+    </div>
+  );
+}
+
+type SignalLike = { disposition: string; confidence: number; hard_block: boolean; summary: string } | null | undefined;
+
+/** Render fn (NOT a component) — see renderOrderRow note. */
+function renderAgentCard(
+  agentKey: AgentKey,
+  signal: SignalLike,
+  evaluating: boolean,
+) {
+  const meta = AGENT_LABELS[agentKey];
+  return (
+    <div key={agentKey} style={{
+      background: '#fff', border: `1px solid ${C.border}`, borderRadius: 8, padding: 14,
+      borderTop: `3px solid ${meta.color}`,
+      display: 'flex', flexDirection: 'column', gap: 10,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: meta.color }}>{meta.label}</div>
+        {signal
+          ? <Pill label={signal.disposition} color={dispColor(signal.disposition)} size={10} />
+          : evaluating
+            ? <span style={{ fontSize: 10, color: C.muted }}>Evaluating<Blinker /></span>
+            : <span style={{ fontSize: 10, color: C.muted }}>Waiting</span>}
       </div>
 
-      <div className="flex-1 flex overflow-hidden">
-        {/* Left Panel: Triage Queue */}
-        <div className="w-80 border-r border-slate-200 bg-white/50 flex flex-col flex-shrink-0 overflow-y-auto">
-          <div className="p-4 border-b border-slate-200 bg-slate-100/50">
-            <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Triage Queue</h3>
+      {/* Placeholder terminal while evaluating */}
+      {evaluating && !signal && (
+        <div style={{
+          height: 64, background: '#1a1a1a', borderRadius: 4,
+          padding: '5px 8px', fontFamily: MONO, fontSize: 10, color: '#666',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          flexDirection: 'column', gap: 4,
+        }}>
+          <span style={{ color: meta.color }}>▸ Running tools…</span>
+          <span style={{ color: '#444', fontSize: 9 }}>(streaming not exposed in /v23/triage yet)</span>
+        </div>
+      )}
+
+      {/* Filled signal */}
+      {signal && (
+        <>
+          <div style={{
+            fontSize: 11, color: C.charcoal, lineHeight: 1.45, fontStyle: 'italic',
+          }}>{signal.summary}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 10, color: C.muted, flexShrink: 0 }}>Confidence</span>
+            <div style={{ flex: 1, height: 4, background: C.border, borderRadius: 2 }}>
+              <div style={{
+                width: `${signal.confidence * 100}%`, height: '100%',
+                background: meta.color, borderRadius: 2,
+              }} />
+            </div>
+            <span style={{ color: meta.color, fontWeight: 700, fontSize: 11 }}>
+              {Math.round(signal.confidence * 100)}%
+            </span>
           </div>
-          <div className="flex flex-col p-2 gap-2">
-            {PURCHASE_ORDERS.map((item) => (
-              <QueueItem
-                key={item.id}
-                po={item}
-                active={activePoId === item.id}
-                evalStatus={agentEvals[item.id]?.status ?? 'idle'}
-                userDecision={agentEvals[item.id]?.userDecision}
-                onClick={() => handlePoClick(item.id)}
-              />
+          {signal.hard_block && (
+            <div style={{
+              display: 'inline-block', background: C.red, color: '#fff',
+              borderRadius: 4, padding: '3px 10px', fontSize: 11, fontWeight: 700,
+            }}>HARD BLOCK RAISED</div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ConflictBanner({ conflict }: { conflict: TriageResponse['synthesis']['conflicts'][number] }) {
+  return (
+    <div style={{
+      background: '#fff', border: `2px solid ${C.orange}`,
+      borderRadius: 8, padding: '14px 18px',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <Pill label="CONFLICT DETECTED" color={C.orange} />
+        <span style={{ fontSize: 13, fontWeight: 600, color: C.charcoal }}>
+          {conflict.type.replace(/_/g, ' ')}
+        </span>
+      </div>
+      <div style={{ fontSize: 12, color: C.charcoal, marginBottom: 5 }}>
+        <strong>Disputants: </strong>
+        {conflict.disputants
+          .map(d => AGENT_LABELS[d as AgentKey]?.label ?? d)
+          .join(' vs. ')}
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>{conflict.summary}</div>
+      <div style={{ fontSize: 11, color: C.muted }}>
+        {conflict.debate_rounds > 0 ? `Resolved after ${conflict.debate_rounds} debate round(s) — ${conflict.resolution}` : conflict.resolution}
+      </div>
+    </div>
+  );
+}
+
+function RecommendationCard({
+  syn, decided, onApprove, onReject,
+}: {
+  syn: TriageResponse['synthesis'];
+  decided: boolean;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const r = syn.rec;
+  const escKeys = Object.keys(syn.escalations || {});
+  return (
+    <div style={{
+      border: `2px solid ${actColor(r.action)}`, borderRadius: 10,
+      overflow: 'hidden', background: '#fff',
+    }}>
+      <div style={{
+        background: actColor(r.action), padding: '13px 20px',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <div style={{ color: '#fff' }}>
+          <div style={{
+            fontSize: 10, fontWeight: 700, letterSpacing: '0.12em', opacity: 0.8,
+          }}>CUSTOMER SUPPLY · RECOMMENDATION</div>
+          <div style={{
+            fontSize: 22, fontWeight: 900, letterSpacing: '0.04em', marginTop: 3,
+          }}>{r.action.replace(/_/g, ' ')}</div>
+        </div>
+        <div style={{ textAlign: 'right', color: '#fff' }}>
+          <div style={{ fontSize: 11, opacity: 0.8 }}>Confidence</div>
+          <div style={{ fontSize: 26, fontWeight: 900 }}>{Math.round(r.confidence * 100)}%</div>
+        </div>
+      </div>
+      <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        {r.qty > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
+            {([
+              ['Fulfill Qty',  `${r.qty.toLocaleString()} cs`],
+              ['Fill Rate',    `${r.fill_pct}%`],
+              ['Action',       r.action.replace(/_/g, ' ')],
+            ] as [string, string][]).map(([l, v]) => (
+              <div key={l} style={{
+                background: C.off, borderRadius: 6, padding: '10px 12px', textAlign: 'center',
+              }}>
+                <div style={{
+                  fontSize: 10, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em',
+                }}>{l}</div>
+                <div style={{
+                  fontSize: 15, fontWeight: 700, color: C.charcoal, marginTop: 4,
+                }}>{v}</div>
+              </div>
             ))}
           </div>
+        )}
+
+        <div style={{ background: C.off, borderRadius: 6, padding: '10px 14px' }}>
+          <div style={{
+            fontSize: 10, color: C.muted, fontWeight: 700,
+            textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6,
+          }}>Expected Outcome</div>
+          <div style={{
+            fontSize: 12, color: C.charcoal, lineHeight: 1.55,
+          }}>{r.outcome || '—'}</div>
         </div>
 
-        {/* Right Panel: Active Details */}
-        <div className="flex-1 overflow-y-auto p-8 space-y-6">
-          {/* Main Order Details */}
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-            <div className="flex justify-between items-start mb-6">
-              <div>
-                <h3 className="text-xl font-bold text-slate-800 mb-1">Order {activePo.orderNumber}</h3>
-                <div className="flex items-center gap-2 text-sm mt-2">
-                  <span className="text-slate-700 font-bold">{activePo.customer}</span>
-                  <span className="text-slate-500 px-2 rounded-full border border-slate-200 text-xs bg-slate-100">{activePo.tier} Customer</span>
-                </div>
+        {syn.chain.tradeoffs.length > 0 && (
+          <div>
+            <div style={{
+              fontSize: 10, color: C.muted, fontWeight: 700,
+              textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8,
+            }}>Key Trade-offs</div>
+            {syn.chain.tradeoffs.map((t, i) => (
+              <div key={i} style={{
+                display: 'flex', gap: 8, marginBottom: 5, fontSize: 12, color: C.charcoal,
+              }}>
+                <span style={{ color: C.red, fontWeight: 700, flexShrink: 0 }}>++</span>{t}
               </div>
-              <div className="text-right">
-                <div className="text-sm text-slate-500 mb-1">Requested Quantity</div>
-                <div className="text-2xl font-mono font-bold text-slate-800">{activePo.requestedQty.toLocaleString()} <span className="text-sm text-slate-400 font-sans">{activePo.requestedQtyUnit}</span></div>
-              </div>
-            </div>
-
-            <div className={cn(
-              "flex items-start gap-3 p-4 rounded-lg border text-sm shadow-sm",
-              activePo.severity === 'critical' ? "bg-[#DB033B]/10 border-[#DB033B]/20 text-[#DB033B]" :
-              activePo.severity === 'warning' ? "bg-amber-50 border-amber-100 text-amber-900" :
-              "bg-slate-50 border-slate-200 text-slate-700"
-            )}>
-              {activePo.severity === 'critical' && <ShieldAlert className="w-5 h-5 flex-shrink-0 mt-0.5 text-[#DB033B]" />}
-              {activePo.severity === 'warning' && <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5 text-amber-600" />}
-              {activePo.severity === 'neutral' && <Info className="w-5 h-5 flex-shrink-0 mt-0.5 text-slate-500" />}
-              <span className="leading-relaxed">{activePo.issueDetail}</span>
-            </div>
-          </div>
-
-          {/* Component 2: Co-Pilot Recommendation Card */}
-          <div className="bg-[#fef2f2] border border-[#DB033B] rounded-xl p-6 relative shadow-sm">
-            <div className="absolute top-0 left-0 w-1.5 h-full bg-[#DB033B] rounded-l-xl"></div>
-
-            <div className="flex justify-between items-center mb-4">
-              <div className="flex items-center gap-3">
-                <h4 className="text-sm font-bold tracking-wide text-[#DB033B] uppercase">Co-Pilot Recommendation</h4>
-                {activeEval?.status === 'evaluating' && (
-                  <span className="flex items-center gap-1 text-[10px] text-amber-600 font-bold bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">
-                    <Loader2 className="w-2.5 h-2.5 animate-spin" /> EVALUATING
-                  </span>
-                )}
-                {activeEval?.status === 'done' && (
-                  <span className="flex items-center gap-1 text-[10px] text-emerald-700 font-bold bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
-                    <CheckCircle2 className="w-2.5 h-2.5" /> LIVE AGENT
-                  </span>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                {activeEval?.status !== 'evaluating' && (
-                  <div className="text-[10px] font-bold text-slate-500 bg-white border border-slate-200 px-2 py-1 rounded shadow-sm">
-                    CONFIDENCE: <span className={cn(
-                      confidencePct >= 80 ? 'text-emerald-600' :
-                      confidencePct >= 60 ? 'text-amber-600' : 'text-[#DB033B]'
-                    )}>{confidencePct}%</span>
-                  </div>
-                )}
-                <div className="flex gap-2">
-                  {activePo.agents.map((agent, idx) => (
-                    <div key={idx} className="flex items-center gap-1.5 bg-white border border-[#DB033B] text-[#DB033B] px-2 py-1 rounded text-[10px] font-bold tracking-wide shadow-sm">
-                      <Bot className="w-3 h-3" /> {agent} Input
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            <div className="flex gap-4 items-start">
-              <div className="w-8 h-8 rounded-full bg-[#DB033B] text-white flex items-center justify-center flex-shrink-0 shadow-sm mt-1">
-                {activeEval?.status === 'evaluating'
-                  ? <Loader2 className="w-4 h-4 animate-spin" />
-                  : <CheckCircle2 className="w-5 h-5" />
-                }
-              </div>
-              <div className="flex-1">
-                {activeEval?.status === 'evaluating' ? (
-                  <div className="space-y-2 mb-5">
-                    <div className="h-4 bg-[#DB033B]/10 rounded animate-pulse w-3/4" />
-                    <div className="h-4 bg-[#DB033B]/10 rounded animate-pulse w-1/2" />
-                  </div>
-                ) : (
-                  <p className="font-medium leading-relaxed text-sm mb-5 text-[#DB033B]">
-                    {recommendedAction}
-                  </p>
-                )}
-
-                {/* Explainability toggle */}
-                <div className="mb-5">
-                  <button
-                    onClick={() => setShowRationale(!showRationale)}
-                    className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-700 transition-colors font-medium border-none bg-transparent p-0 cursor-pointer"
-                  >
-                    <ChevronRight className={cn("w-3.5 h-3.5 transition-transform", showRationale && "rotate-90")} />
-                    Why did the agent recommend this?
-                  </button>
-                  {showRationale && (
-                    <p className="mt-3 text-xs leading-relaxed text-slate-600 bg-white/60 p-3 rounded-lg border border-slate-200/60 shadow-sm">
-                      {rationale}
-                    </p>
-                  )}
-                </div>
-
-                <div className="flex gap-4">
-                  <div className="bg-white rounded-lg p-3 border border-[#DB033B] flex-1 shadow-sm">
-                    <div className="text-[10px] text-slate-500 mb-1 uppercase tracking-wider font-bold">Proposed Allocation</div>
-                    {activeEval?.status === 'evaluating'
-                      ? <div className="h-6 bg-slate-100 rounded animate-pulse mt-1" />
-                      : <div className="font-mono text-slate-800 font-bold text-lg">{proposedAllocation}</div>
-                    }
-                  </div>
-                  <div className="bg-white rounded-lg p-3 border border-[#DB033B] flex-1 shadow-sm">
-                    <div className="text-[10px] text-slate-500 mb-1 uppercase tracking-wider font-bold">Hold / Short</div>
-                    {activeEval?.status === 'evaluating'
-                      ? <div className="h-6 bg-slate-100 rounded animate-pulse mt-1" />
-                      : <div className="font-mono text-slate-600 font-bold text-lg">{proposedHold}</div>
-                    }
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Component 3: The Decision Capture Engine */}
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-            <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-4">Decision Capture Engine</h4>
-
-            {/* ── Already-decided banner ────────────────────────────── */}
-            {activeEval?.userDecision && (
-              <div className={cn(
-                "flex items-center gap-3 p-4 rounded-lg border mb-6",
-                activeEval.userDecision === 'accept' && "bg-emerald-50 border-emerald-200 text-emerald-800",
-                activeEval.userDecision === 'modify' && "bg-amber-50 border-amber-200 text-amber-800",
-                activeEval.userDecision === 'reject' && "bg-red-50 border-red-200 text-[#DB033B]",
-              )}>
-                {activeEval.userDecision === 'accept' && <CheckCircle2 className="w-5 h-5 text-emerald-600" />}
-                {activeEval.userDecision === 'modify' && <CornerDownRight className="w-5 h-5 text-amber-600" />}
-                {activeEval.userDecision === 'reject' && <X className="w-5 h-5 text-[#DB033B]" />}
-                <div>
-                  <span className="font-bold text-sm capitalize">{activeEval.userDecision === 'accept' ? 'Accepted' : activeEval.userDecision === 'modify' ? 'Modified' : 'Rejected'}</span>
-                  <span className="text-xs ml-2 opacity-75">
-                    {activeEval.decisionId
-                      ? `— saved to BigQuery (${activeEval.decisionId.slice(0, 8)}…)`
-                      : '— logged locally'}
-                  </span>
-                  {(activeEval.userDecision === 'accept' || activeEval.userDecision === 'modify') && (
-                    <span className="text-xs ml-2 font-medium">→ Queued for Fulfillment Simulator</span>
-                  )}
-                </div>
-              </div>
-            )}
-
-            <div className="flex gap-3 mb-6">
-              <button
-                disabled={!!activeEval?.userDecision}
-                onClick={() => { setDecision('accept'); setOverrideReason(''); }}
-                className={cn(
-                  "flex-1 py-3 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all border shadow-sm",
-                  activeEval?.userDecision && "opacity-40 cursor-not-allowed",
-                  decision === 'accept' ? "bg-emerald-50 text-emerald-700 border-emerald-300 ring-2 ring-emerald-500/20" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:border-slate-300"
-                )}>
-                <Check className="w-4 h-4" /> Accept Agent Proposal
-              </button>
-              <button
-                disabled={!!activeEval?.userDecision}
-                onClick={() => { setDecision('modify'); setOverrideReason(''); }}
-                className={cn(
-                  "flex-1 py-3 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all border shadow-sm",
-                  activeEval?.userDecision && "opacity-40 cursor-not-allowed",
-                  decision === 'modify' ? "bg-amber-50 text-amber-700 border-amber-300 ring-2 ring-amber-500/20" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:border-slate-300"
-                )}>
-                <CornerDownRight className="w-4 h-4" /> Modify / Override
-              </button>
-              <button
-                disabled={!!activeEval?.userDecision}
-                onClick={() => { setDecision('reject'); setOverrideReason(''); }}
-                className={cn(
-                  "flex-1 py-3 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all border shadow-sm",
-                  activeEval?.userDecision && "opacity-40 cursor-not-allowed",
-                  decision === 'reject' ? "bg-[#DB033B]/10 text-[#DB033B] border-[#DB033B]/30 ring-2 ring-[#DB033B]/20" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:border-slate-300"
-                )}>
-                <X className="w-4 h-4" /> Reject Entire Order
-              </button>
-            </div>
-
-            {(decision === 'modify' || decision === 'reject') && (
-              <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl animate-in slide-in-from-top-2 opacity-100 duration-300 shadow-inner">
-                <label className="block text-sm font-bold text-slate-700 mb-2">
-                  Override reason code required for Phase 2 Agent Training:
-                </label>
-                <select
-                  className="w-full bg-white border border-slate-300 rounded-lg px-3 py-3 text-sm text-slate-800 font-medium focus:outline-none focus:border-[#DB033B] focus:ring-2 focus:ring-[#DB033B]/20 shadow-sm"
-                  value={overrideReason}
-                  onChange={(e) => setOverrideReason(e.target.value)}
-                >
-                  <option value="" disabled>Select Reason Category...</option>
-                  <option value="vp_override">Sales VP Override (Recorded via Email)</option>
-                  <option value="data_lag">Data Lag / False Positive Alert</option>
-                  <option value="strategic">Strategic Account Growth Initiative (Loss Leader)</option>
-                  <option value="logistics_override">Local Logistics Override / Carrier Found</option>
-                  <option value="other">Other (Log Comment)</option>
-                </select>
-
-                <div className="mt-5 flex justify-end">
-                  <button
-                    disabled={!overrideReason || isSubmitting}
-                    onClick={handleExecuteDecision}
-                    className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold px-6 py-2.5 rounded-lg text-sm transition-colors shadow-md">
-                    {isSubmitting ? 'Submitting…' : 'Execute Override & Log Telemetry'}
-                  </button>
-                </div>
-              </div>
-            )}
-            {decision === 'accept' && (
-              <div className="flex justify-end animate-in fade-in duration-300">
-                <button
-                  disabled={isSubmitting}
-                  onClick={handleExecuteDecision}
-                  className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold px-8 py-2.5 rounded-lg text-sm transition-colors shadow-md focus:ring-4 focus:ring-emerald-500/20">
-                  {isSubmitting ? 'Submitting…' : 'Confirm Allocation'}
-                </button>
+            ))}
+            {syn.chain.flip && (
+              <div style={{ marginTop: 8, fontSize: 11, color: C.muted, fontStyle: 'italic' }}>
+                <strong style={{ color: C.charcoal, fontStyle: 'normal' }}>Would flip if: </strong>
+                {syn.chain.flip}
               </div>
             )}
           </div>
+        )}
 
-          {/* Component 4: Decisions Log */}
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-            <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-4">Recent Agent Override Telemetry</h4>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm whitespace-nowrap">
-                <thead>
-                  <tr className="border-b border-slate-200 text-slate-500 bg-slate-50">
-                    <th className="py-3 px-4 font-bold rounded-tl-lg">Timestamp</th>
-                    <th className="py-3 px-4 font-bold">PO Number</th>
-                    <th className="py-3 px-4 font-bold">Customer</th>
-                    <th className="py-3 px-4 font-bold">Decision</th>
-                    <th className="py-3 px-4 font-bold">Override Reason</th>
-                    <th className="py-3 px-4 font-bold rounded-tr-lg">Outcome</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {decisionLog.map((log) => (
-                    <tr key={log.id} className="hover:bg-slate-50 transition-colors">
-                      <td className="py-3 px-4 font-mono text-xs text-slate-500">{new Date(log.timestamp).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</td>
-                      <td className="py-3 px-4 font-medium text-slate-800">{log.poNumber}</td>
-                      <td className="py-3 px-4 text-slate-600">{log.customer}</td>
-                      <td className="py-3 px-4 text-slate-800 font-bold capitalize">
-                        <span className={cn(
-                          "px-2 py-1 rounded text-xs",
-                          log.userDecision === 'accept' ? "bg-emerald-100 text-emerald-800" :
-                          log.userDecision === 'modify' ? "bg-amber-100 text-amber-800" :
-                          "bg-[#DB033B]/10 text-[#DB033B]"
-                        )}>
-                          {log.userDecision}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-slate-500 italic max-wxs truncate" title={log.overrideReason || ''}>{log.overrideReason || '—'}</td>
-                      <td className="py-3 px-4 text-slate-600 text-xs">{log.outcome}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+        {r.alternatives.length > 0 && (
+          <div>
+            <div style={{
+              fontSize: 10, color: C.muted, fontWeight: 700,
+              textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8,
+            }}>Alternatives Considered</div>
+            {r.alternatives.map((a, i) => (
+              <div key={i} style={{
+                background: C.off, borderRadius: 6, padding: '8px 12px',
+                marginBottom: 5, fontSize: 12,
+              }}>
+                <strong>{a.label}</strong> — {a.outcome}
+                {a.qty > 0 && <span style={{ color: C.muted }}> · {a.qty.toLocaleString()} cs</span>}
+              </div>
+            ))}
           </div>
+        )}
+
+        {escKeys.length > 0 && (
+          <div>
+            <div style={{
+              fontSize: 10, color: C.muted, fontWeight: 700,
+              textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8,
+            }}>Escalations</div>
+            {escKeys.map(k => {
+              const e = syn.escalations[k];
+              return (
+                <div key={k} style={{
+                  border: `1px solid ${sevColor(e.severity)}`, borderRadius: 6,
+                  padding: '8px 12px', background: C.off, marginBottom: 6,
+                }}>
+                  <div style={{
+                    display: 'flex', gap: 6, alignItems: 'center', marginBottom: 4,
+                  }}>
+                    <Pill label={e.severity} color={sevColor(e.severity)} size={10} />
+                    <span style={{
+                      fontSize: 11, fontWeight: 600, color: C.charcoal,
+                    }}>{k.replace(/_/g, ' ')}</span>
+                  </div>
+                  <div style={{
+                    fontSize: 11, color: C.charcoal, marginBottom: 3,
+                  }}>{e.summary}</div>
+                  <div style={{ fontSize: 11, color: C.muted }}>Action: {e.action}</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {!decided && (
+          <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
+            <button onClick={onApprove} style={{
+              flex: 1, padding: '11px 0', background: C.green, color: '#fff',
+              border: 'none', borderRadius: 6, fontSize: 14, fontWeight: 700,
+              cursor: 'pointer', fontFamily: 'inherit',
+            }}>Approve</button>
+            <button onClick={onReject} style={{
+              flex: 1, padding: '11px 0', background: 'transparent', color: C.red,
+              border: `2px solid ${C.red}`, borderRadius: 6, fontSize: 14, fontWeight: 700,
+              cursor: 'pointer', fontFamily: 'inherit',
+            }}>Reject</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RejectModal({
+  onCancel, onSubmit,
+}: {
+  onCancel: () => void;
+  onSubmit: (reason: string) => void;
+}) {
+  const [reason, setReason] = useState('');
+  const trimmed = reason.trim();
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, background: 'rgba(15,23,42,0.5)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50,
+    }}>
+      <div style={{
+        background: '#fff', borderRadius: 10, padding: 22, width: 480, maxWidth: '92%',
+        boxShadow: '0 10px 30px rgba(0,0,0,0.2)',
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.charcoal }}>Reject AI recommendation</div>
+          <button onClick={onCancel} style={{
+            background: 'none', border: 'none', cursor: 'pointer', color: C.muted, padding: 2,
+          }}><X size={16} /></button>
+        </div>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
+          Explain why you are overriding the AI recommendation. This is logged in the
+          decision telemetry for audit and feeds back into future agent training.
+        </div>
+        <textarea value={reason} onChange={e => setReason(e.target.value)}
+          placeholder="e.g. customer has critical promo dependency we cannot defer…"
+          style={{
+            width: '100%', minHeight: 96, padding: 10, border: `1px solid ${C.border}`,
+            borderRadius: 6, fontFamily: 'inherit', fontSize: 12, resize: 'vertical',
+            boxSizing: 'border-box',
+          }} />
+        <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+          <button onClick={() => onSubmit(trimmed)} disabled={trimmed.length === 0} style={{
+            flex: 1, padding: 10, background: C.red, color: '#fff',
+            border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 700,
+            cursor: trimmed.length === 0 ? 'not-allowed' : 'pointer',
+            opacity: trimmed.length === 0 ? 0.4 : 1, fontFamily: 'inherit',
+          }}>Confirm reject</button>
+          <button onClick={onCancel} style={{
+            padding: '10px 16px', background: '#fff', border: `1px solid ${C.border}`,
+            borderRadius: 6, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit',
+          }}>Cancel</button>
         </div>
       </div>
     </div>
   );
 }
 
-type AgentEvalStatus = AgentEvalState['status'];
-
-function QueueItem({ po, active, evalStatus, userDecision, onClick }: {
-  po: PO;
-  active: boolean;
-  evalStatus: AgentEvalStatus;
-  userDecision?: UserDecision;
-  onClick: () => void;
-  key?: string | number;
+function ErrorPanel({
+  err, onTryAnother, onRetry,
+}: {
+  err: TriageError;
+  onTryAnother: () => void;
+  onRetry: () => void;
 }) {
-  const isCritical = po.severity === 'critical';
-  const isWarning = po.severity === 'warning';
-  const decided = !!userDecision;
+  const isTimeout = err.kind === 'timeout';
+  const isValidation = err.kind === 'validation';
+  const heading = {
+    validation: 'Backend rejected the order',
+    backend:    'Agent flow failed',
+    network:    'Could not reach the backend',
+    timeout:    'Agents still running',
+  }[err.kind];
+
+  const detailText = isValidation
+    ? typeof err.detail === 'string'
+      ? err.detail
+      : JSON.stringify(err.detail, null, 2)
+    : err.message;
+
+  const sessionId = 'sessionId' in err ? err.sessionId : undefined;
 
   return (
-    <button
-      onClick={onClick}
-      className={cn(
-        "p-4 rounded-xl border text-left transition-all duration-200 outline-none focus:ring-0",
-        active
-          ? "bg-white border-[#DB033B] shadow-md ring-1 ring-[#DB033B]/20"
-          : "bg-white border-slate-200 hover:border-slate-300 hover:shadow-sm opacity-90 hover:opacity-100",
-        // Decision highlight overrides severity border
-        decided && userDecision === 'accept' && !active && "border-l-4 border-l-emerald-500 bg-emerald-50/40",
-        decided && userDecision === 'modify' && !active && "border-l-4 border-l-amber-500 bg-amber-50/40",
-        decided && userDecision === 'reject' && !active && "border-l-4 border-l-[#DB033B] bg-red-50/30 opacity-60",
-        !decided && isCritical && !active && "border-l-4 border-l-[#DB033B]",
-        !decided && isWarning && !active && "border-l-4 border-l-amber-500",
-        isCritical && active && "border-l-4 border-l-[#DB033B]"
-      )}
-    >
-      <div className="flex justify-between items-start mb-2">
-        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">{po.customer}</span>
-        <div className="flex items-center gap-1.5">
-          {/* User decision badge — takes precedence over eval status */}
-          {userDecision === 'accept' && (
-            <span className="flex items-center gap-0.5 text-[9px] font-bold text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">
-              <Check className="w-2.5 h-2.5" /> Accepted
-            </span>
-          )}
-          {userDecision === 'modify' && (
-            <span className="flex items-center gap-0.5 text-[9px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">
-              <CornerDownRight className="w-2.5 h-2.5" /> Modified
-            </span>
-          )}
-          {userDecision === 'reject' && (
-            <span className="flex items-center gap-0.5 text-[9px] font-bold text-[#DB033B] bg-[#DB033B]/10 px-1.5 py-0.5 rounded">
-              <X className="w-2.5 h-2.5" /> Rejected
-            </span>
-          )}
-          {/* Eval status icons — shown only when no decision yet */}
-          {!decided && evalStatus === 'evaluating' && (
-            <Loader2 className="w-3 h-3 text-amber-500 animate-spin" />
-          )}
-          {!decided && evalStatus === 'done' && (
-            <CheckCircle2 className="w-3 h-3 text-emerald-500" />
-          )}
-          {!decided && evalStatus === 'error' && (
-            <AlertTriangle className="w-3 h-3 text-slate-400" />
-          )}
-          {!decided && isCritical && <div className="w-2 h-2 rounded-full bg-[#DB033B] animate-pulse" />}
-          {!decided && isWarning && !isCritical && <div className="w-2 h-2 rounded-full bg-amber-500" />}
+    <div style={{
+      background: '#fff', border: `2px solid ${isTimeout ? C.orange : C.red}`,
+      borderRadius: 10, padding: 22, display: 'flex', flexDirection: 'column', gap: 14,
+    }}>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        <AlertTriangle size={26} color={isTimeout ? C.orange : C.red} />
+        <div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.charcoal }}>{heading}</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+            {err.kind === 'backend' && `HTTP ${err.status}`}
+            {err.kind === 'timeout' && `Exceeded ${TIMEOUT_MS / 1000}s`}
+            {err.kind === 'network' && 'Network error'}
+            {err.kind === 'validation' && 'HTTP 422 — invalid payload'}
+          </div>
         </div>
       </div>
-      <div className="flex items-center gap-2 mb-2">
-        <h4 className="text-sm font-bold text-slate-800 leading-tight">{po.orderNumber}</h4>
-        <span className={cn(
-          "text-[9px] uppercase tracking-widest px-1.5 py-0.5 rounded font-bold",
-          isCritical ? "bg-[#DB033B]/10 text-[#DB033B]" :
-          isWarning ? "bg-amber-50 text-amber-700" :
-          "bg-slate-100 text-slate-600"
-        )}>
-          {po.issue}
-        </span>
+
+      <pre style={{
+        margin: 0, padding: '10px 14px', background: C.off, border: `1px solid ${C.border}`,
+        borderRadius: 6, fontSize: 11, fontFamily: MONO, color: C.charcoal,
+        whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 200, overflow: 'auto',
+      }}>{detailText}</pre>
+
+      {sessionId && (
+        <div style={{ fontSize: 11, color: C.muted }}>
+          For debugging — <strong style={{ color: C.charcoal, fontFamily: MONO }}>session_id = {sessionId}</strong>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 10 }}>
+        {(err.kind === 'backend' || err.kind === 'network' || err.kind === 'timeout') && (
+          <button onClick={onRetry} style={{
+            padding: '9px 16px', background: C.red, color: '#fff',
+            border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 700,
+            cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+            fontFamily: 'inherit',
+          }}>
+            <RefreshCw size={13} /> Try again
+          </button>
+        )}
+        <button onClick={onTryAnother} style={{
+          padding: '9px 16px', background: '#fff', color: C.charcoal,
+          border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 12, fontWeight: 600,
+          cursor: 'pointer', fontFamily: 'inherit',
+        }}>Try another order</button>
       </div>
-      <div className="flex justify-between items-center text-xs">
-        <span className="text-slate-500 font-medium">Vol: <span className="text-slate-800 font-bold">{po.requestedQty.toLocaleString()}</span></span>
-        <ChevronRight className={cn("w-4 h-4 transition-colors", active ? "text-[#DB033B]" : "text-slate-300")} />
+    </div>
+  );
+}
+
+// =============================================================================
+// Main component
+// =============================================================================
+
+export function OrderTriage({
+  onDecisionSaved,
+}: {
+  /** Optional callback fired after a successful approve or reject.
+   *  The Fulfillment Simulator listens on this to invalidate its
+   *  incidents cache so the newly-approved order shows up. */
+  onDecisionSaved?: () => void;
+} = {}) {
+  // Orders queue
+  const [orders, setOrders]           = useState<Order[]>([]);
+  const [ordersLoading, setOrdersLoading] = useState<boolean>(true);
+  const [ordersErr, setOrdersErr]     = useState<string | null>(null);
+
+  // Selection + triage
+  const [selectedId, setSelectedId]   = useState<string | null>(null);
+  const [phase, setPhase]             = useState<Phase>('idle');
+  const [result, setResult]           = useState<TriageResponse | null>(null);
+  const [error, setError]             = useState<TriageError | null>(null);
+  const [elapsedMs, setElapsedMs]     = useState<number>(0);
+
+  // Local per-order decisions (so the row shows "Approved" / "Rejected" while
+  // we wait for the queue to refetch).
+  const [decisionByOrder, setDecisionByOrder] = useState<Record<string, DecisionKind>>({});
+  const [rejectModalOpen, setRejectModalOpen] = useState<boolean>(false);
+
+  const abortRef    = useRef<AbortController | null>(null);
+  const timerRef    = useRef<number | null>(null);
+  const startTsRef  = useRef<number>(0);
+
+  // Load orders
+  const loadOrders = useCallback(() => {
+    setOrdersLoading(true);
+    setOrdersErr(null);
+    fetchOrders(20)
+      .then(o => { setOrders(o); setOrdersLoading(false); })
+      .catch(e => {
+        setOrdersErr(e?.message || 'Could not load orders');
+        setOrdersLoading(false);
+      });
+  }, []);
+
+  useEffect(() => { loadOrders(); }, [loadOrders]);
+
+  // Clean up timer on unmount
+  useEffect(() => () => {
+    if (timerRef.current != null) clearInterval(timerRef.current);
+    abortRef.current?.abort();
+  }, []);
+
+  const selectedOrder = orders.find(o => o.id === selectedId) ?? null;
+
+  function selectOrder(o: Order) {
+    // Hard reset triage state when picking a new order.
+    abortRef.current?.abort();
+    if (timerRef.current != null) clearInterval(timerRef.current);
+    setSelectedId(o.id);
+    setPhase('idle');
+    setResult(null);
+    setError(null);
+    setElapsedMs(0);
+    setRejectModalOpen(false);
+  }
+
+  async function runTriage(order: Order) {
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    startTsRef.current = Date.now();
+    setElapsedMs(0);
+    setError(null);
+    setResult(null);
+    setPhase('evaluating');
+
+    // Wall-clock tick
+    timerRef.current = window.setInterval(() => {
+      setElapsedMs(Date.now() - startTsRef.current);
+    }, 500);
+
+    // Timeout — 180s
+    const timeoutHandle = window.setTimeout(() => {
+      ctrl.abort();
+      if (timerRef.current != null) clearInterval(timerRef.current);
+      setError({ kind: 'timeout', message: `No response in ${TIMEOUT_MS / 1000}s` });
+      setPhase('error');
+    }, TIMEOUT_MS);
+
+    try {
+      const r = await triageOrder(order.id, order._backend, ctrl.signal);
+      window.clearTimeout(timeoutHandle);
+      if (timerRef.current != null) clearInterval(timerRef.current);
+      setResult(r);
+      setPhase('result');
+    } catch (e) {
+      window.clearTimeout(timeoutHandle);
+      if (timerRef.current != null) clearInterval(timerRef.current);
+      if (e instanceof AbortError) {
+        // Caused by either the user's Cancel button OR the timeout above.
+        // Timeout path already set the error/phase — only handle the
+        // user-cancel case here.
+        if (phase !== 'error') {
+          setPhase('idle');
+        }
+        return;
+      }
+      setError(classifyError(e));
+      setPhase('error');
+    }
+  }
+
+  function cancelTriage() {
+    abortRef.current?.abort();
+  }
+
+  async function handleApprove() {
+    if (!result || !selectedOrder) return;
+    setDecisionByOrder(prev => ({ ...prev, [selectedOrder.id]: 'approved' }));
+    setPhase('decided');
+    try {
+      await approveSession(result.session_id, USER_ID);
+    } catch (e) {
+      console.error('approveSession failed', e);
+      // We still leave the decision flagged locally so the user sees the
+      // intent — the next fetchOrders() refresh will reconcile.
+    } finally {
+      invalidateDashboard();
+      onDecisionSaved?.();
+      loadOrders();
+    }
+  }
+
+  async function handleRejectSubmit(reason: string) {
+    if (!result || !selectedOrder) return;
+    setRejectModalOpen(false);
+    setDecisionByOrder(prev => ({ ...prev, [selectedOrder.id]: 'rejected' }));
+    setPhase('decided');
+    try {
+      await rejectSession(result.session_id, USER_ID, reason);
+    } catch (e) {
+      console.error('rejectSession failed', e);
+    } finally {
+      invalidateDashboard();
+      onDecisionSaved?.();
+      loadOrders();
+    }
+  }
+
+  function backToQueue() {
+    abortRef.current?.abort();
+    if (timerRef.current != null) clearInterval(timerRef.current);
+    setSelectedId(null);
+    setPhase('idle');
+    setResult(null);
+    setError(null);
+    setElapsedMs(0);
+  }
+
+  // ── Render ──────────────────────────────────────────────────────────────
+  return (
+    <div style={{ display: 'flex', height: '100%', overflow: 'hidden', position: 'relative' }}>
+
+      {/* ─── Left rail: orders queue ───────────────────────────────────── */}
+      <div style={{
+        width: 296, background: '#fff', borderRight: `1px solid ${C.border}`,
+        display: 'flex', flexDirection: 'column', flexShrink: 0,
+      }}>
+        <div style={{ padding: '16px 16px 12px', borderBottom: `1px solid ${C.border}` }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: C.charcoal }}>Order Triage</div>
+            <button onClick={loadOrders} disabled={ordersLoading} title="Refresh queue" style={{
+              background: 'none', border: 'none', cursor: 'pointer', color: C.muted, padding: 2,
+              display: 'flex', alignItems: 'center', opacity: ordersLoading ? 0.4 : 1,
+            }}>
+              <RefreshCw size={13} />
+            </button>
+          </div>
+          <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
+            {ordersLoading
+              ? 'Loading queue…'
+              : ordersErr
+                ? 'Queue unavailable'
+                : `${orders.length} order${orders.length === 1 ? '' : 's'} flagged for evaluation`}
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: 10 }}>
+          {ordersLoading && (
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              padding: 40, color: C.muted, fontSize: 12, gap: 8,
+            }}>
+              <Loader2 size={14} className="animate-spin" /> Loading…
+            </div>
+          )}
+          {ordersErr && !ordersLoading && (
+            <div style={{
+              padding: '16px 12px', background: '#fde8ec', border: `1px solid ${C.red}40`,
+              borderRadius: 6, fontSize: 12, color: C.red,
+            }}>
+              {ordersErr}
+              <button onClick={loadOrders} style={{
+                display: 'block', marginTop: 8, padding: '4px 10px', fontSize: 11,
+                background: C.red, color: '#fff', border: 'none', borderRadius: 4,
+                cursor: 'pointer', fontFamily: 'inherit',
+              }}>Retry</button>
+            </div>
+          )}
+          {!ordersLoading && !ordersErr && orders.length === 0 && (
+            <div style={{ padding: 40, textAlign: 'center', color: C.muted, fontSize: 12 }}>
+              No orders currently flagged for AI evaluation.
+            </div>
+          )}
+          {orders.map(o =>
+            renderOrderRow(o, o.id === selectedId, decisionByOrder[o.id] ?? null, () => selectOrder(o)),
+          )}
+        </div>
       </div>
-    </button>
+
+      {/* ─── Right panel: evaluation ───────────────────────────────────── */}
+      <div style={{
+        flex: 1, overflowY: 'auto', padding: 20, background: C.off, position: 'relative',
+      }}>
+        {!selectedOrder && (
+          <div style={{
+            display: 'flex', flexDirection: 'column', alignItems: 'center',
+            justifyContent: 'center', height: '70%', color: C.muted,
+            textAlign: 'center', gap: 14,
+          }}>
+            <Zap size={48} style={{ opacity: 0.18, color: C.charcoal }} />
+            <div style={{ fontSize: 18, fontWeight: 600, color: C.charcoal }}>
+              Select an order to begin AI evaluation
+            </div>
+            <div style={{ fontSize: 13, maxWidth: 420, lineHeight: 1.65, color: C.muted }}>
+              The 5-agent system will evaluate supply, demand, transportation and
+              retail intelligence in parallel, then synthesize a single
+              recommendation for your approval or rejection.
+            </div>
+          </div>
+        )}
+
+        {selectedOrder && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+            {/* Order header */}
+            <div style={{
+              background: '#fff', border: `1px solid ${C.border}`, borderRadius: 8,
+              padding: '14px 18px', display: 'flex', gap: 16, alignItems: 'center',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.charcoal }}>
+                  {selectedOrder.customer} — {selectedOrder.desc || selectedOrder.sku}
+                </div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>
+                  {selectedOrder.id} · {selectedOrder.qty.toLocaleString()} cs · MABD {selectedOrder.mabd ?? '—'} · {selectedOrder.ship_to}
+                </div>
+              </div>
+              <Pill label={selectedOrder.flag} color={flagColor(selectedOrder.flag_type)} size={11} />
+            </div>
+
+            {/* IDLE — show Evaluate CTA */}
+            {phase === 'idle' && (
+              <div style={{
+                background: '#fff', border: `1px solid ${C.border}`, borderRadius: 8,
+                padding: 22, display: 'flex', flexDirection: 'column',
+                alignItems: 'center', gap: 12,
+              }}>
+                <Bot size={28} color={C.red} />
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.charcoal }}>
+                  Ready to evaluate this order with 5 agents
+                </div>
+                <div style={{
+                  fontSize: 12, color: C.muted, maxWidth: 460, textAlign: 'center', lineHeight: 1.55,
+                }}>
+                  Triage takes 30 to 180 seconds. You can cancel mid-flight.
+                </div>
+                <button onClick={() => runTriage(selectedOrder)} style={{
+                  marginTop: 4, padding: '10px 22px', background: C.red, color: '#fff',
+                  border: 'none', borderRadius: 6, fontSize: 14, fontWeight: 700,
+                  cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8,
+                  fontFamily: 'inherit',
+                }}>
+                  <Zap size={15} /> Evaluate Agents
+                </button>
+              </div>
+            )}
+
+            {/* EVALUATING — agent cards in pending state + timer + cancel */}
+            {phase === 'evaluating' && (
+              <>
+                <div style={{
+                  background: C.charcoal, borderRadius: 8, padding: '10px 16px',
+                  color: '#fff', display: 'flex', alignItems: 'center', gap: 12,
+                  justifyContent: 'space-between',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <Loader2 size={15} className="animate-spin" style={{ color: C.teal }} />
+                    <span style={{ fontSize: 13, color: C.teal }}>
+                      4 specialist agents running in parallel<Blinker />
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <span style={{ fontFamily: MONO, fontSize: 13, color: '#fff' }}>
+                      {fmtElapsed(elapsedMs)}
+                    </span>
+                    <button onClick={cancelTriage} style={{
+                      padding: '4px 12px', background: 'rgba(255,255,255,0.1)',
+                      border: '1px solid rgba(255,255,255,0.25)', borderRadius: 4,
+                      color: '#fff', fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}>Cancel</button>
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  {AGENT_KEYS.map(k => renderAgentCard(k, null, true))}
+                </div>
+              </>
+            )}
+
+            {/* RESULT or DECIDED — render the synthesis */}
+            {(phase === 'result' || phase === 'decided') && result && (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  {AGENT_KEYS.map(k => renderAgentCard(k, result.synthesis.signals[k] ?? null, false))}
+                </div>
+
+                {result.synthesis.conflicts.length > 0 && (
+                  <ConflictBanner conflict={result.synthesis.conflicts[0]} />
+                )}
+
+                <RecommendationCard
+                  syn={result.synthesis}
+                  decided={phase === 'decided'}
+                  onApprove={handleApprove}
+                  onReject={() => setRejectModalOpen(true)} />
+
+                {phase === 'decided' && selectedOrder && (
+                  <div style={{
+                    background: decisionByOrder[selectedOrder.id] === 'approved' ? C.green : C.red,
+                    borderRadius: 8, padding: '14px 20px', color: '#fff',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <CheckCircle2 size={20} />
+                      <div>
+                        <div style={{ fontSize: 15, fontWeight: 700 }}>
+                          {decisionByOrder[selectedOrder.id] === 'approved'
+                            ? 'Recommendation approved — executing'
+                            : 'Recommendation rejected — logged'}
+                        </div>
+                        <div style={{ fontSize: 11, opacity: 0.9, marginTop: 2 }}>
+                          session_id={result.session_id} · user={USER_ID}
+                        </div>
+                      </div>
+                    </div>
+                    <button onClick={backToQueue} style={{
+                      padding: '8px 14px', background: 'rgba(255,255,255,0.15)',
+                      border: '1px solid rgba(255,255,255,0.3)', borderRadius: 6,
+                      color: '#fff', fontSize: 12, fontWeight: 600,
+                      cursor: 'pointer', fontFamily: 'inherit',
+                    }}>Back to queue</button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* ERROR — show typed message + retry */}
+            {phase === 'error' && error && (
+              <ErrorPanel err={error}
+                          onTryAnother={backToQueue}
+                          onRetry={() => runTriage(selectedOrder)} />
+            )}
+          </div>
+        )}
+
+        {/* Reject modal */}
+        {rejectModalOpen && (
+          <RejectModal
+            onCancel={() => setRejectModalOpen(false)}
+            onSubmit={handleRejectSubmit} />
+        )}
+      </div>
+    </div>
   );
 }
