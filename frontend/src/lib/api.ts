@@ -32,6 +32,9 @@ import type {
   SimulatorIncident,
   DataHealthResponse, DashboardData,
   ExecutionTelemetryEntry,
+  // Phase 7 agent-overview responses
+  AgentsSupplyResponse, AgentsDemandResponse,
+  AgentsTransportResponse, AgentsRetailResponse,
   // Backwards-compat returned shapes
   V23OrdersResponse,
 } from './types';
@@ -250,6 +253,24 @@ export async function rejectSession(
     `/sessions/${encodeURIComponent(sessionId)}/reject`,
     { method: 'POST', body: { user_id: userId, reason }, noContent: true },
   );
+}
+
+// ─── /agents/{supply,demand,transport,retail} (Phase 7) ──────────────────────
+
+export async function fetchSupplyAgent(): Promise<AgentsSupplyResponse> {
+  return request<AgentsSupplyResponse>('/agents/supply');
+}
+
+export async function fetchDemandAgent(): Promise<AgentsDemandResponse> {
+  return request<AgentsDemandResponse>('/agents/demand');
+}
+
+export async function fetchTransportAgent(): Promise<AgentsTransportResponse> {
+  return request<AgentsTransportResponse>('/agents/transport');
+}
+
+export async function fetchRetailAgent(): Promise<AgentsRetailResponse> {
+  return request<AgentsRetailResponse>('/agents/retail');
 }
 
 // ─── /telemetry/execution (utility, used by Decision Log) ─────────────────────

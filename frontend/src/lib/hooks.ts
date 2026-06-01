@@ -10,8 +10,15 @@
  * request.
  */
 import { useCallback, useEffect, useState } from 'react';
-import { fetchDashboard, fetchDataHealth } from './api';
-import type { DashboardData, DataHealthResponse } from './types';
+import {
+  fetchDashboard, fetchDataHealth,
+  fetchSupplyAgent, fetchDemandAgent, fetchTransportAgent, fetchRetailAgent,
+} from './api';
+import type {
+  DashboardData, DataHealthResponse,
+  AgentsSupplyResponse, AgentsDemandResponse,
+  AgentsTransportResponse, AgentsRetailResponse,
+} from './types';
 
 export type DashboardState = {
   data: DashboardData | null;
@@ -79,3 +86,40 @@ export function useDataHealth(): DataHealthState {
 
   return { health, loading, err, reload, lastFetched };
 }
+
+// ─── /agents/{supply,demand,transport,retail} (Phase 7) ──────────────────────
+// Each hook follows the same shape: `{ data, loading, err, reload }`. Generic
+// helper below cuts copy-paste — the 4 wrappers below it are one-liners.
+
+type AgentState<T> = {
+  data: T | null;
+  loading: boolean;
+  err: string | null;
+  reload: () => void;
+};
+
+function useAgentData<T>(fetcher: () => Promise<T>): AgentState<T> {
+  const [data, setData]       = useState<T | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [err, setErr]         = useState<string | null>(null);
+
+  const reload = useCallback(() => {
+    setLoading(true);
+    setErr(null);
+    fetcher()
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => {
+        setErr(e?.message || 'Unable to load agent data');
+        setLoading(false);
+      });
+  }, [fetcher]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  return { data, loading, err, reload };
+}
+
+export function useSupplyAgent():    AgentState<AgentsSupplyResponse>    { return useAgentData(fetchSupplyAgent); }
+export function useDemandAgent():    AgentState<AgentsDemandResponse>    { return useAgentData(fetchDemandAgent); }
+export function useTransportAgent(): AgentState<AgentsTransportResponse> { return useAgentData(fetchTransportAgent); }
+export function useRetailAgent():    AgentState<AgentsRetailResponse>    { return useAgentData(fetchRetailAgent); }

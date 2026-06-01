@@ -10,8 +10,15 @@
  *
  *  2. Scenarios per incident id — cached so re-clicking an incident or
  *     switching tabs doesn't re-run the LP.
+ *
+ * Phase 3.1: both stores route through the typed spec functions in
+ * lib/api.ts (`fetchSimulatorIncidents` and `simulateFulfillment`) so
+ * the AbortError / ValidationError / BackendError classes apply and the
+ * api.ts base-URL resolution (VITE_API_BASE_URL vs /api proxy) is
+ * honoured here too.
  */
 import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } from 'react';
+import { fetchSimulatorIncidents, simulateFulfillment } from './api';
 
 // ─── Types (mirror backend FulfillmentIncident / FulfillmentScenario) ────────
 
@@ -141,19 +148,17 @@ export function useFulfillmentIncidentsStore() {
     if (!force && state.status === 'done' && state.incidents.length > 0) return;
     setState(prev => ({ ...prev, status: 'loading' }));
     try {
-      const res = await fetch('/api/fulfillment/incidents');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const body = await res.json();
+      const incidents = await fetchSimulatorIncidents();
       setState({
-        incidents: (body.incidents ?? []) as FulfillmentIncident[],
+        incidents: incidents as FulfillmentIncident[],
         status: 'done',
-        meta: body.meta,
       });
-    } catch (e: any) {
+    } catch (e) {
+      const err = e as Error;
       setState(prev => ({
         ...prev,
         status: 'error',
-        error: e?.message || 'fetch failed',
+        error: err?.message || 'fetch failed',
       }));
     }
   }, [state.status, state.incidents.length]);
@@ -210,33 +215,28 @@ export async function runFulfillmentSimulate(
   }
   setMap(prev => ({ ...prev, [incident.id]: { status: 'loading' } }));
   try {
-    const res = await fetch('/api/fulfillment/simulate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sold_to: incident.soldTo,
-        material_number: incident.materialNumber,
-        ordered_quantity_cases: incident.orderedQty,
-        requested_delivery_date: incident.mabd,
-        origin_plant: incident.originPlant,
-      }),
+    const body = await simulateFulfillment({
+      sold_to: incident.soldTo,
+      material_number: incident.materialNumber,
+      ordered_quantity_cases: incident.orderedQty,
+      requested_delivery_date: incident.mabd ?? null,
+      origin_plant: incident.originPlant ?? null,
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = await res.json();
     setMap(prev => ({
       ...prev,
       [incident.id]: {
         status: 'done',
-        scenarios: body.scenarios ?? [],
+        scenarios: (body.scenarios ?? []) as FulfillmentScenario[],
         meta: body.meta ?? {},
       },
     }));
-  } catch (e: any) {
+  } catch (e) {
+    const err = e as Error;
     setMap(prev => ({
       ...prev,
       [incident.id]: {
         status: 'error',
-        error: e?.message || 'simulate failed',
+        error: err?.message || 'simulate failed',
       },
     }));
   }

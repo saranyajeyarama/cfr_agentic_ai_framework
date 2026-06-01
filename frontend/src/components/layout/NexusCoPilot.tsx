@@ -2,77 +2,97 @@
  * NexusCoPilot — v2.3 AI chat panel.
  * Extracted from mars-supply-ai-v2_02-restyled.jsx (function NexusCoPilot).
  *
- * Inline-style aesthetic preserved. PHASE 0.2 NOTE: this is the
- * shell-only version — the Gemini API wiring is intentionally NOT
- * carried over yet. With no NEXUS_API_KEY configured the panel
- * renders its `no_key` warning state and the input stays disabled.
- * Phase 1/2 wires the chat backend (Gemini direct OR routed through
- * the Cloud Run /chat endpoint).
+ * Phase 4.1 — wired to the backend /chat route via chatNexus().
  *
- * New file alongside RightSidebar.tsx — App.tsx is not yet swapped over.
+ *   - No client-side Gemini / Vertex credentials. The backend service
+ *     account holds the Vertex AI auth. The frontend POSTs the user
+ *     message + history to /chat and renders response.text.
+ *   - Conversation history is held in component state and passed to
+ *     every chatNexus() call so the backend can stitch it into the
+ *     system prompt itself.
+ *   - All the legacy NEXUS_API_KEY / generativelanguage.googleapis.com
+ *     / buildNexusContext() machinery from the AI Studio source has
+ *     been removed.
+ *
+ * Visual aesthetic preserved verbatim from the reference (inline styles,
+ * red brand colour, bot avatar, quick prompts, animated dots).
  */
 
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { PanelRightClose, PanelRightOpen, Bot } from 'lucide-react';
-import { C, MONO } from '../../lib/constants';
+import { C } from '../../lib/constants';
+import { chatNexus, ValidationError, BackendError, NetworkError } from '../../lib/api';
+import type { ChatMessage } from '../../lib/types';
 
-// Read at module load so swapping in a build-time env var is straight-
-// forward later. Phase 0.2: deliberately blank.
-const NEXUS_API_KEY = '';
-
-type Role = 'user' | 'agent';
-type Message = { role: Role; text: string };
-type ApiStatus = 'ready' | 'error' | 'no_key' | 'idle';
+type ApiStatus = 'ready' | 'error';
 
 const STATUS_DOT: Record<ApiStatus, string> = {
-  ready: C.green, error: C.red, no_key: '#f59e0b', idle: '#94a3b8',
+  ready: C.green,
+  error: C.red,
 };
 
 const STATUS_LABEL: Record<ApiStatus, string> = {
-  ready:  'Gemini 2.0 Flash · Ready',
-  error:  'API Error',
-  no_key: 'API Key Required',
-  idle:   'Initialising…',
+  ready: 'Backend /chat · Ready',
+  error: 'Backend /chat · Error',
 };
 
 const QUICK_PROMPTS = [
   'What should I prioritize right now?',
-  'Summarize the Chewy stockout risk',
+  'Summarize the highest-risk order in the queue',
   'Which orders have agent conflicts?',
 ];
 
-const OPENING_MESSAGE: Message = {
+const OPENING_MESSAGE: ChatMessage = {
   role: 'agent',
-  text: 'Good morning. Phase 0.2 placeholder — Nexus is not wired up yet. Configure your API key (Phase 1/2) to begin chatting.',
+  text: 'Good morning. I have full visibility into your active orders, network status, and financial risk landscape. Ask me anything about the OpEx Tower — I have the same data the specialist agents do.',
 };
 
 export function NexusCoPilot() {
   const [col, setCol]       = useState(false);
   const [input, setInput]   = useState('');
   const [loading, setLoading] = useState(false);
-  const [apiStatus, setApiStatus] = useState<ApiStatus>(NEXUS_API_KEY ? 'ready' : 'no_key');
-  const [messages, setMessages]   = useState<Message[]>([OPENING_MESSAGE]);
+  const [apiStatus, setApiStatus] = useState<ApiStatus>('ready');
+  const [messages, setMessages]   = useState<ChatMessage[]>([OPENING_MESSAGE]);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!col) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, col]);
 
-  // Phase 0.2: send is a no-op apart from echoing a placeholder warning.
   async function handleSend() {
     if (!input.trim() || loading) return;
     const userText = input.trim();
     setInput('');
+
+    // Snapshot the conversation BEFORE appending — chatNexus() will append
+    // the new user message itself when building the request body.
+    const historyBeforeSend = [...messages];
+
     setMessages(prev => [...prev, { role: 'user', text: userText }]);
     setLoading(true);
-    // Simulate latency for visual fidelity, then surface the not-wired-yet state.
-    await new Promise(r => setTimeout(r, 400));
-    setMessages(prev => [...prev, {
-      role: 'agent',
-      text: 'Nexus is not connected in this Phase 0.2 build. Wire NEXUS_API_KEY or backend /chat route in Phase 1/2 to enable conversation.',
-    }]);
-    setApiStatus('no_key');
-    setLoading(false);
+
+    try {
+      const reply = await chatNexus(userText, historyBeforeSend);
+      setMessages(prev => [...prev, { role: 'agent', text: reply }]);
+      setApiStatus('ready');
+    } catch (e) {
+      let errMsg: string;
+      if (e instanceof ValidationError) {
+        errMsg = `⚠ Backend rejected the message (422). ${
+          typeof e.detail === 'string' ? e.detail : 'Check the chat payload shape.'
+        }`;
+      } else if (e instanceof BackendError) {
+        errMsg = `⚠ Backend error (HTTP ${e.status}). ${e.message}`;
+      } else if (e instanceof NetworkError) {
+        errMsg = '⚠ Could not reach the backend. Is the orchestrator container running?';
+      } else {
+        errMsg = `⚠ ${(e as Error)?.message ?? 'Chat failed for an unknown reason.'}`;
+      }
+      setMessages(prev => [...prev, { role: 'agent', text: errMsg }]);
+      setApiStatus('error');
+    } finally {
+      setLoading(false);
+    }
   }
 
   function handleKey(e: KeyboardEvent<HTMLInputElement>) {
@@ -84,7 +104,7 @@ export function NexusCoPilot() {
 
   const statusDot   = STATUS_DOT[apiStatus];
   const statusLabel = STATUS_LABEL[apiStatus];
-  const disabled    = loading || !NEXUS_API_KEY;
+  const disabled    = loading;
 
   // ── Collapsed ─────────────────────────────────────────────────────────────
   if (col) {
@@ -171,25 +191,6 @@ export function NexusCoPilot() {
         </button>
       </div>
 
-      {/* No-key warning */}
-      {apiStatus === 'no_key' && (
-        <div style={{
-          margin: '12px 12px 0', padding: '10px 12px', background: '#fffbeb',
-          border: '1px solid #fcd34d', borderRadius: 8, fontSize: 11,
-          color: '#92400e', lineHeight: 1.7,
-        }}>
-          <strong>API key required.</strong> Set{' '}
-          <code style={{
-            background: '#fef3c7', padding: '1px 5px', borderRadius: 3,
-            fontFamily: MONO, fontSize: 10,
-          }}>NEXUS_API_KEY</code>{' '}
-          in <code style={{
-            background: '#fef3c7', padding: '1px 5px', borderRadius: 3,
-            fontFamily: MONO, fontSize: 10,
-          }}>NexusCoPilot.tsx</code> to enable chat. Phase 1/2 wires this up.
-        </div>
-      )}
-
       {/* Messages */}
       <div style={{
         flex: 1, overflowY: 'auto', padding: '14px 12px',
@@ -250,12 +251,11 @@ export function NexusCoPilot() {
                  onChange={e => setInput(e.target.value)}
                  onKeyDown={handleKey}
                  disabled={disabled}
-                 placeholder={NEXUS_API_KEY ? 'Ask Nexus anything…' : 'Set NEXUS_API_KEY to chat'}
+                 placeholder="Ask Nexus anything…"
                  style={{
                    width: '100%', background: '#f1f5f9', border: 'none', borderRadius: 20,
                    padding: '9px 42px 9px 16px', fontSize: 12, color: C.charcoal,
                    fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box',
-                   opacity: !NEXUS_API_KEY ? 0.55 : 1,
                  }} />
           <button onClick={handleSend}
                   disabled={!input.trim() || disabled}

@@ -4,7 +4,7 @@
  *
  * v2.3 shell.
  *
- * Architecture (after Phase 2.1):
+ * Architecture (after Phase 4.1):
  *   • App.tsx no longer blocks rendering on /dashboard-data. Each
  *     read-only tab calls useDashboardData() and renders its own
  *     loading / error / data states. The 60-second cache inside
@@ -13,16 +13,18 @@
  *     It accepts only an optional onDecisionSaved callback so the
  *     Fulfillment Simulator can invalidate its incidents cache when
  *     a newly approved order becomes eligible.
- *   • App.tsx still uses useDashboardData() to feed TopBar /
- *     RightSidebar — those degrade gracefully to '—' when data is
- *     still loading or unreachable.
+ *   • App.tsx still uses useDashboardData() to feed TopBar — it
+ *     degrades gracefully to '—' when data is still loading or
+ *     unreachable.
+ *   • Right rail is NexusCoPilot — the AI chat panel wired to the
+ *     backend /chat route (no Gemini keys client-side).
  */
 
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TopBar } from './components/layout/TopBar';
 import { SidebarNav, TabId } from './components/layout/SidebarNav';
-import { RightSidebar } from './components/layout/RightSidebar';
+import { NexusCoPilot } from './components/layout/NexusCoPilot';
 import { Watchtower } from './components/tabs/Watchtower';
 import { OrderTriage } from './components/tabs/OrderTriage';
 import { FulfillmentSimulator } from './components/tabs/FulfillmentSimulator';
@@ -31,6 +33,11 @@ import { SafetyStockOptimizer } from './components/tabs/SafetyStockOptimizer';
 import { DecisionLog } from './components/tabs/DecisionLog';
 import { ManagerDashboard } from './components/tabs/ManagerDashboard';
 import { DataHealthPage } from './components/tabs/DataHealthPage';
+import { DataDictionaryPage } from './components/tabs/DataDictionaryPage';
+import { SupplyPlanningPage } from './components/tabs/SupplyPlanningPage';
+import { DemandPlanningPage } from './components/tabs/DemandPlanningPage';
+import { TransportationPage } from './components/tabs/TransportationPage';
+import { RetailIntelligencePage } from './components/tabs/RetailIntelligencePage';
 import { useDashboardData } from './lib/hooks';
 import {
   useFulfillmentIncidentsStore,
@@ -40,7 +47,7 @@ import {
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>('watchtower');
 
-  // Single dashboard hook for the shell — feeds TopBar + RightSidebar.
+  // Single dashboard hook for the shell — feeds TopBar.
   // Read-only tabs call useDashboardData() independently; the api.ts
   // cache makes that a no-op network-wise.
   const { data: dashboardData, loading: dashboardLoading, err: dashboardErr } = useDashboardData();
@@ -86,11 +93,16 @@ export default function App() {
               {activeTab === 'decisions'   && <DecisionLog />}
               {activeTab === 'manager'     && <ManagerDashboard onNavigate={setActiveTab} />}
               {activeTab === 'datahealth'  && <DataHealthPage />}
+              {activeTab === 'dictionary'  && <DataDictionaryPage />}
+              {activeTab === 'agent-supply'    && <SupplyPlanningPage />}
+              {activeTab === 'agent-demand'    && <DemandPlanningPage />}
+              {activeTab === 'agent-transport' && <TransportationPage />}
+              {activeTab === 'agent-retail'    && <RetailIntelligencePage />}
             </motion.div>
           </AnimatePresence>
         </main>
 
-        <RightSidebar data={dashboardData ?? {}} />
+        <NexusCoPilot />
       </div>
     </div>
   );

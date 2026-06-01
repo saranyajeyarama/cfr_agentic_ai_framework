@@ -831,6 +831,46 @@ def read_telemetry(limit: int = 20) -> ExecutionTelemetryListResponse:
     return ExecutionTelemetryListResponse(entries=entries, total=len(entries))
 
 
+# ---------------------------------------------------------------------------
+# Phase 7 — Agent overview pages (Supply / Demand / Transport / Retail)
+# ---------------------------------------------------------------------------
+# Each route returns {data: <PORT_* shape>, meta: {...}}. See data_pipeline.py
+# for the underlying BigQuery aggregation. All four routes degrade gracefully
+# if BQ is unavailable (return empty inner arrays + an error message in meta).
+# ---------------------------------------------------------------------------
+
+@app.get("/agents/supply")
+def agents_supply() -> dict:
+    """Inventory positions + production adherence + raw-material concerns.
+    Backs the Supply Planning agent overview page in the v2.3 UI."""
+    from data_pipeline import fetch_agents_supply
+    return fetch_agents_supply()
+
+
+@app.get("/agents/demand")
+def agents_demand() -> dict:
+    """Forecast positions (classified) + promotional calendar.
+    Backs the Demand Planning agent overview page in the v2.3 UI."""
+    from data_pipeline import fetch_agents_demand
+    return fetch_agents_demand()
+
+
+@app.get("/agents/transport")
+def agents_transport() -> dict:
+    """Active lanes + carrier league + per-customer OTIF scoreboard.
+    Backs the Transportation agent overview page in the v2.3 UI."""
+    from data_pipeline import fetch_agents_transport
+    return fetch_agents_transport()
+
+
+@app.get("/agents/retail")
+def agents_retail() -> dict:
+    """Per-(customer × SKU) demand classifications + 8-week POS trends.
+    Backs the Retail Intelligence agent overview page in the v2.3 UI."""
+    from data_pipeline import fetch_agents_retail
+    return fetch_agents_retail()
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0",

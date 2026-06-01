@@ -2,20 +2,20 @@
  * Sidebar — v2.3 visual identity.
  * Extracted from mars-supply-ai-v2_02-restyled.jsx (function Sidebar).
  *
- * Per Phase 0.4: the 5 screens with no live backend equivalent (Supply
- * Planning / Demand Planning / Transportation / Retail Intelligence
- * agent pages + Data Dictionary) are HIDDEN from the v2.3 navigation.
- * They will return in Phase 2 once the backend exposes routes for them.
- * Reference JSX still lives at /reference/original_ai_studio.jsx.
+ * Phase 6.1: Data Dictionary restored to the Info section as a static
+ * glossary. The 4 agent-view screens (Supply / Demand / Transport /
+ * Retail) remain hidden until the backend exposes /agents/{name}
+ * routes — see the plan file's Part B for the deferred scope.
  *
  * This file is a NEW component alongside SidebarNav.tsx — App.tsx is
- * not yet swapped over. Phase 1/2 wires it in.
+ * not yet swapped over (SidebarNav.tsx is the active sidebar).
  */
 
 import { useState } from 'react';
 import {
   LayoutDashboard, Inbox, GitMerge, FileSearch, ShieldCheck,
-  Home, Clock, ChevronLeft, ChevronRight, Activity,
+  Home, Clock, ChevronLeft, ChevronRight, Activity, BookOpen,
+  BarChart2, TrendingUp, Truck, ShoppingCart,
   type LucideIcon,
 } from 'lucide-react';
 import { C } from '../../lib/constants';
@@ -40,7 +40,16 @@ const NAV_ITEMS: NavItem[] = [
 ];
 
 const INFO_ITEMS: { id: ScreenId; label: string; Icon: LucideIcon }[] = [
-  { id: 'datahealth', label: 'Data Health', Icon: Activity },
+  { id: 'datahealth', label: 'Data Health',     Icon: Activity },
+  { id: 'dictionary', label: 'Data Dictionary', Icon: BookOpen },
+];
+
+// Agent overview pages restored in Phase 7 — backed by GET /agents/{name}.
+const AGENT_ITEMS: { id: ScreenId; label: string; Icon: LucideIcon; color: string }[] = [
+  { id: 'agent-supply',    label: 'Supply Planning',     Icon: BarChart2,    color: C.blue   },
+  { id: 'agent-demand',    label: 'Demand Planning',     Icon: TrendingUp,   color: C.orange },
+  { id: 'agent-transport', label: 'Transportation',      Icon: Truck,        color: C.teal   },
+  { id: 'agent-retail',    label: 'Retail Intelligence', Icon: ShoppingCart, color: C.purple },
 ];
 
 // ─── Main component ──────────────────────────────────────────────────────────
@@ -125,8 +134,34 @@ export function Sidebar({
           );
         })}
 
-        {/* Agent Views section — REMOVED in Phase 0.4 (no live backend yet).
-            Will be re-added when Phase 2 wires up per-agent endpoints. */}
+        {/* Agent Views section — Phase 7 (live backend at /agents/{name}). */}
+        <div style={{
+          display: col ? 'none' : 'block', margin: '8px 12px 2px',
+          borderTop: `1px solid ${C.border}`, paddingTop: 6,
+          fontSize: 9, color: C.muted,
+          textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 600,
+        }}>Agent Views</div>
+        {AGENT_ITEMS.map(({ id, label, Icon, color }) => {
+          const active = screen === id;
+          return (
+            <button key={id} onClick={() => setScreen(id)} style={{
+              display: 'flex', alignItems: 'center', gap: col ? 0 : 9, width: '100%',
+              padding: col ? '9px 0' : '7px 16px', border: 'none', cursor: 'pointer',
+              fontFamily: 'inherit', textAlign: 'left',
+              justifyContent: col ? 'center' : 'flex-start',
+              background: active ? `${color}12` : 'transparent',
+              borderRight: active ? `3px solid ${color}` : '3px solid transparent',
+              color: active ? color : C.muted,
+              fontSize: 12, fontWeight: active ? 600 : 500,
+            }}>
+              <Icon size={15}
+                color={active ? color : C.muted}
+                strokeWidth={active ? 2.5 : 1.8}
+                style={{ flexShrink: 0 }} />
+              {!col && <span>{label}</span>}
+            </button>
+          );
+        })}
 
         {/* Info section */}
         <div style={{

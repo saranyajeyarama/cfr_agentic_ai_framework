@@ -178,11 +178,8 @@ export interface ExecutionTelemetryEntry {
 export type DashboardData = Record<string, any>;
 
 // ─── ScreenId — canonical navigation type ────────────────────────────────────
-// Per Phase 0.4: only screens with a live backend equivalent are listed.
-// The 5 screens that were hidden (Supply / Demand / Transport / Retail
-// agent pages + Data Dictionary) will be re-added in Phase 2 once the
-// backend exposes routes for them. Reference JSX still lives at
-// /reference/original_ai_studio.jsx so those screens can be revived.
+// Phase 7: 4 agent overview pages restored after their backend routes shipped
+// (/agents/supply, /agents/demand, /agents/transport, /agents/retail).
 export type ScreenId =
   | 'watchtower'
   | 'triage'
@@ -191,7 +188,128 @@ export type ScreenId =
   | 'safetystock'
   | 'decisions'
   | 'manager'
-  | 'datahealth';
+  | 'datahealth'
+  | 'dictionary'
+  | 'agent-supply'
+  | 'agent-demand'
+  | 'agent-transport'
+  | 'agent-retail';
+
+// ─── /agents/{supply,demand,transport,retail} ────────────────────────────────
+// Field names match the backend dict shape and the AI Studio PORT_* constants
+// verbatim — no client-side remapping.
+
+export type AgentMeta = {
+  fetched_at?: string;
+  source?: string;
+  count?: number;
+  error?: string;
+};
+
+// /agents/supply ───────────────────────────────────────────────────────────
+export type SupplyInventoryRow = {
+  sku: string; desc: string; dc: string;
+  cs: number; dos: number;
+  status: 'STOCKOUT' | 'BELOW_SS' | 'OK' | string;
+  short: number;
+};
+
+export type SupplyProductionRow = {
+  pro: string; sku: string; desc: string; end: string;
+  status: string; adherence: number;
+  risk: 'HIGH' | 'MEDIUM' | 'LOW' | string;
+};
+
+export type SupplyRawMaterialRow = {
+  material: string; concern: boolean; dos: number;
+  rationale: string; skus: string;
+};
+
+export interface AgentsSupplyResponse {
+  data: {
+    inventory:     SupplyInventoryRow[];
+    production:    SupplyProductionRow[];
+    raw_materials: SupplyRawMaterialRow[];
+  };
+  meta: AgentMeta;
+}
+
+// /agents/demand ───────────────────────────────────────────────────────────
+export type DemandClassification =
+  'BUFFER_BUILD' | 'GENUINE_PULL' | 'PROMO_DRIVEN' | 'ONE_OFF_ANOMALY' | string;
+
+export type DemandPositionRow = {
+  customer: string; sku: string; desc: string;
+  vs_plan: number; plan_cs: number;
+  classification: DemandClassification;
+  conf: number; wmape: number; bias: number;
+  quality: 'HEALTHY' | 'SYSTEMATIC_OVER' | 'SYSTEMATIC_UNDER' | string;
+  promo: boolean; escalation: boolean;
+};
+
+export type DemandPromoRow = {
+  customer: string; sku: string; name: string;
+  type: string; dates: string; incr: number; status: string;
+};
+
+export interface AgentsDemandResponse {
+  data: {
+    positions:      DemandPositionRow[];
+    promo_calendar: DemandPromoRow[];
+  };
+  meta: AgentMeta;
+}
+
+// /agents/transport ────────────────────────────────────────────────────────
+export type TransportLaneRow = {
+  id: string; lane: string; origin: string; dest: string;
+  transit: number; otp: number; ships: number;
+  viable: boolean; carrier: string;
+};
+
+export type TransportCarrierRow = {
+  name: string; otp: number; target: number;
+  ships: number; cb: number; meets: boolean;
+};
+
+export type TransportOtifRow = {
+  customer: string; otif: number; target: number;
+  delta: number; cb: number; exposure: number;
+};
+
+export interface AgentsTransportResponse {
+  data: {
+    lanes:    TransportLaneRow[];
+    carriers: TransportCarrierRow[];
+    otif:     TransportOtifRow[];
+  };
+  meta: AgentMeta;
+}
+
+// /agents/retail ───────────────────────────────────────────────────────────
+export type RetailClassificationRow = {
+  customer: string; sku: string; desc: string;
+  cls: DemandClassification;
+  conf: number; pos: number;
+  trend: 'ACCELERATING' | 'FLAT' | 'DECELERATING' | string;
+  ohi: number | null; ohi_norm: number | null;
+  promo: boolean; risk: number;
+};
+
+export type RetailPosTrendRow = {
+  sku: string; desc: string;
+  trend: 'ACCELERATING' | 'FLAT' | 'DECELERATING' | string;
+  acv: number;
+  weekly: Array<{ w: string; v: number }>;
+};
+
+export interface AgentsRetailResponse {
+  data: {
+    classifications: RetailClassificationRow[];
+    pos_trends:      RetailPosTrendRow[];
+  };
+  meta: AgentMeta;
+}
 
 // ─── /chat ───────────────────────────────────────────────────────────────────
 // Backend ChatMessage shape (FastAPI schema). Roles are 'user' | 'agent'.

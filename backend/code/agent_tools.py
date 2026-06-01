@@ -237,25 +237,46 @@ def get_demo_scenario_candidates(limit: int = 10) -> dict:
     The caller (or the data chat) eyeballs the shortlist and pins the
     chosen anchor via DEMO_SOLD_TO / DEMO_MATERIAL env vars.
     """
-    params = [_p("lim", "INT64", limit)]
+    # Window over which we compare orders vs forecast. The original query
+    # did SUM(consensus_quantity) across ALL forecast versions × all weeks
+    # for a (sold_to, sku) pair — producing huge totals that no single order
+    # line could exceed, so the candidate list was always empty.
+    #
+    # Fix: aggregate orders by (sold_to, sku) over the next 60 days and
+    # compare against AVG consensus_quantity over the same window. That
+    # restores apples-to-apples grain and surfaces the real demand spikes.
+    horizon_days = 60
+    params = [
+        _p("lim", "INT64", limit),
+        _p("days", "INT64", horizon_days),
+    ]
     sql = f"""
-      WITH open_orders AS (
-        SELECT so.sold_to, so.sold_to_name, so.material_number,
-               so.material_description, so.material_brand,
-               so.ordered_quantity_sales_uom AS ordered_qty,
-               so.requested_delivery_date, so.sold_to_priority_tier,
-               m.zrep_parent_material
+      WITH order_window AS (
+        SELECT so.sold_to,
+               ANY_VALUE(so.sold_to_name)             AS sold_to_name,
+               so.material_number,
+               ANY_VALUE(so.material_description)     AS material_description,
+               ANY_VALUE(so.material_brand)           AS material_brand,
+               ANY_VALUE(so.sold_to_priority_tier)    AS sold_to_priority_tier,
+               m.zrep_parent_material,
+               SUM(so.ordered_quantity_sales_uom)     AS ordered_qty,
+               COUNT(*)                                AS order_line_count,
+               MIN(so.requested_delivery_date)         AS requested_delivery_date
         FROM `{SEMANTIC_DS}.fct_sales_orders` so
         JOIN `{SEMANTIC_DS}.dim_material` m
           ON so.material_number = m.material_number
         WHERE so.rejection_reason IS NULL
           AND so.sold_to_priority_tier = 1
           AND so.requested_delivery_date >= CURRENT_DATE()
+          AND so.requested_delivery_date <= DATE_ADD(CURRENT_DATE(), INTERVAL @days DAY)
+        GROUP BY so.sold_to, so.material_number, m.zrep_parent_material
       ),
-      fcst AS (
+      fc_window AS (
         SELECT material_zrep_number, sold_to,
-               SUM(consensus_quantity) AS consensus_qty
+               AVG(consensus_quantity) AS consensus_qty
         FROM `{SEMANTIC_DS}.fct_forecast`
+        WHERE forecast_week_start_date >= CURRENT_DATE()
+          AND forecast_week_start_date <= DATE_ADD(CURRENT_DATE(), INTERVAL @days DAY)
         GROUP BY material_zrep_number, sold_to
       ),
       proj AS (
@@ -263,6 +284,7 @@ def get_demo_scenario_candidates(limit: int = 10) -> dict:
                ANY_VALUE(projection_status) AS projection_status
         FROM `{SEMANTIC_DS}.fct_inventory_projection`
         WHERE projection_week_start_date >= CURRENT_DATE()
+          AND projection_week_start_date <= DATE_ADD(CURRENT_DATE(), INTERVAL @days DAY)
         GROUP BY material_fert_number
       )
       SELECT o.sold_to, o.sold_to_name, o.material_number,
@@ -273,15 +295,19 @@ def get_demo_scenario_candidates(limit: int = 10) -> dict:
                AS above_forecast_pct,
              p.min_dos AS forward_days_of_supply,
              p.projection_status
-      FROM open_orders o
-      LEFT JOIN fcst f
+      FROM order_window o
+      LEFT JOIN fc_window f
         ON o.zrep_parent_material = f.material_zrep_number
        AND o.sold_to = f.sold_to
       LEFT JOIN proj p
         ON o.material_number = p.material_fert_number
-      WHERE f.consensus_qty IS NOT NULL
-        AND o.ordered_qty > f.consensus_qty
-      ORDER BY above_forecast_pct DESC, p.min_dos ASC
+      -- Surface true demand spikes (ordered > forecast) ranked by inventory tightness.
+      -- If the forecast row is missing we still include the order, sorted last.
+      WHERE f.consensus_qty IS NULL
+         OR o.ordered_qty > f.consensus_qty
+      ORDER BY (f.consensus_qty IS NULL) ASC,
+               above_forecast_pct DESC,
+               p.min_dos ASC NULLS LAST
       LIMIT @lim
     """
     try:

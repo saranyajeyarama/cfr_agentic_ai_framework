@@ -36,6 +36,79 @@ import hashlib
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Defensive coercion helpers
+#
+# Gemini does not always honor the schema's float-typed `confidence` field
+# (and occasionally other numeric fields). It emits things like "HIGH",
+# "Medium", "very-low", or even null. Naive `float(value or 0.0)` then
+# raises ValueError mid-response and the whole /v23/triage/{id} request
+# 500s — even though the orchestrator already produced a valid synthesis.
+#
+# These helpers normalize the agent output back into the schema's expected
+# types without losing fidelity. Any unrecognized value falls back to a
+# sane default rather than crashing.
+# ──────────────────────────────────────────────────────────────────────────
+_CONFIDENCE_WORDS: dict[str, float] = {
+    "VERY HIGH": 0.95, "VERY_HIGH": 0.95, "VERYHIGH": 0.95,
+    "HIGH": 0.85,
+    "MEDIUM HIGH": 0.75, "MEDIUM_HIGH": 0.75,
+    "MEDIUM": 0.60, "MED": 0.60, "MODERATE": 0.60,
+    "MEDIUM LOW": 0.45, "MEDIUM_LOW": 0.45,
+    "LOW": 0.35,
+    "VERY LOW": 0.15, "VERY_LOW": 0.15, "VERYLOW": 0.15,
+    "UNKNOWN": 0.0, "NONE": 0.0, "N/A": 0.0,
+}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Coerce arbitrary agent output to float without raising.
+
+    Accepts ints/floats verbatim. Strips whitespace, %-signs, and underscores
+    from strings before parsing. Returns `default` on anything else."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+    if isinstance(value, str):
+        s = value.strip().replace("%", "").replace("_", "").replace(",", "")
+        if not s:
+            return default
+        try:
+            return float(s)
+        except ValueError:
+            return default
+    return default
+
+
+def _coerce_confidence(value: Any, default: float = 0.0) -> float:
+    """Like `_safe_float`, but also maps confidence WORDS the agents emit
+    ("HIGH", "Medium", "very low", ...) onto numeric scores in [0.0, 1.0].
+    Always returns a value clamped to [0.0, 1.0]."""
+    if value is None:
+        return max(0.0, min(1.0, default))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return max(0.0, min(1.0, default))
+    if isinstance(value, str):
+        key = value.strip().upper().replace("-", " ")
+        if key in _CONFIDENCE_WORDS:
+            return _CONFIDENCE_WORDS[key]
+        # Tolerate "0.85" style strings.
+        numeric = _safe_float(value, default=-1.0)
+        if 0.0 <= numeric <= 1.0:
+            return numeric
+        # And tolerate "85" / "85%" style strings (interpret as percent).
+        if 1.0 < numeric <= 100.0:
+            return numeric / 100.0
+    return max(0.0, min(1.0, default))
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Synthetic ID derivation
 #
 # The v2.3 UI needs stable, unique order identifiers. v2.1's
@@ -184,7 +257,9 @@ def _specialist_to_v23_signal(agent_key: str,
     ]
     return {
         "disposition": signal_doc.get("disposition", "CAUTION"),
-        "confidence": float(signal_doc.get("confidence") or 0.0),
+        # Agents sometimes emit "HIGH" / "Medium" / null instead of a float.
+        # _coerce_confidence handles all cases without raising.
+        "confidence": _coerce_confidence(signal_doc.get("confidence")),
         "hard_block": bool(signal_doc.get("hard_block", False)),
         "summary": signal_doc.get("reasoning_summary", ""),
         "evidence": evidence_out,
@@ -227,33 +302,49 @@ def decision_to_v23_synthesis(decision: dict[str, Any]) -> dict[str, Any]:
         for c in conflicts_in
     ]
 
-    # Recommendation — v2.3 field-name mapping
+    # Recommendation — v2.3 field-name mapping.
+    # Gemini occasionally emits `recommendation` as a bare string ("DEFER")
+    # instead of a {action, fulfill_qty_cs, confidence, ...} dict. Detect
+    # and rewrap.
+    if isinstance(rec, str):
+        rec = {"action": rec}
     alts_in = rec.get("alternative_options") or []
     alts_out = [
         {
             "label": a.get("label", ""),
-            "qty": float(a.get("fulfill_qty_cs") or 0),
+            "qty": _safe_float(a.get("fulfill_qty_cs"), 0.0),
             "outcome": a.get("estimated_outcome", ""),
         }
         for a in alts_in
     ]
     rec_out = {
         "action": rec.get("action", "DEFER"),
-        "qty": float(rec.get("fulfill_qty_cs") or 0),
-        "fill_pct": float(rec.get("partial_fill_pct") or 0),
-        "confidence": float(rec.get("confidence") or 0.0),
+        "qty": _safe_float(rec.get("fulfill_qty_cs"), 0.0),
+        "fill_pct": _safe_float(rec.get("partial_fill_pct"), 0.0),
+        "confidence": _coerce_confidence(rec.get("confidence")),
         "outcome": rec.get("expected_outcome", ""),
         "alternatives": alts_out,
     }
 
-    # Reasoning chain — v2.3 names
-    chain_out = {
-        "drivers": chain.get("which_specialists_drove_decision", []),
-        "tradeoffs": chain.get("key_trade_offs", []),
-        "flip": chain.get("what_would_change_the_decision", ""),
-    }
+    # Reasoning chain — v2.3 names.
+    # Gemini sometimes returns reasoning_chain as a list of bullet strings
+    # instead of a dict with named fields. Normalize either shape.
+    if isinstance(chain, list):
+        chain_out = {
+            "drivers": [],
+            "tradeoffs": [str(x) for x in chain if x is not None],
+            "flip": "",
+        }
+    elif isinstance(chain, dict):
+        chain_out = {
+            "drivers": chain.get("which_specialists_drove_decision", []) or [],
+            "tradeoffs": chain.get("key_trade_offs", []) or [],
+            "flip": chain.get("what_would_change_the_decision", "") or "",
+        }
+    else:
+        chain_out = {"drivers": [], "tradeoffs": [], "flip": ""}
 
-    # Escalations — v2.3 expects {team_key: {summary, severity, action}}
+    # Escalations — v2.3 expects {team_key: {summary, severity, action}}.
     # Backend schema has 3 fixed keys; explicit mapping is safer than
     # the naive "to_" prefix strip because "to_transportation_manager"
     # otherwise becomes "transportation_manager_team" which the v2.3 UI
@@ -264,19 +355,38 @@ def decision_to_v23_synthesis(decision: dict[str, Any]) -> dict[str, Any]:
         "to_supply_planning_team": "supply_planning_team",
     }
     escalations_out: dict[str, Any] = {}
-    for backend_key, v in escalations.items():
-        if not v or not isinstance(v, dict):
-            continue
-        v23_key = BACKEND_TO_V23_ESCALATION.get(backend_key)
-        if not v23_key:
-            # Unknown future escalation key — pass through as-is rather
-            # than silently drop. Better visible than missing.
-            v23_key = backend_key.replace("to_", "")
-        escalations_out[v23_key] = {
-            "summary": v.get("summary", ""),
-            "severity": v.get("severity", "LOW"),
-            "action": v.get("recommended_action", ""),
-        }
+    if isinstance(escalations, dict):
+        for backend_key, v in escalations.items():
+            if not v or not isinstance(v, dict):
+                continue
+            v23_key = BACKEND_TO_V23_ESCALATION.get(backend_key)
+            if not v23_key:
+                # Unknown future escalation key — pass through as-is rather
+                # than silently drop. Better visible than missing.
+                v23_key = backend_key.replace("to_", "")
+            escalations_out[v23_key] = {
+                "summary": v.get("summary", ""),
+                "severity": v.get("severity", "LOW"),
+                "action": v.get("recommended_action", ""),
+            }
+    elif isinstance(escalations, list):
+        # Gemini sometimes emits escalations as a list of free-form items
+        # with {level, description, escalation_point} fields. Map each onto
+        # a synthetic key so the v2.3 UI still has something to render.
+        for i, item in enumerate(escalations):
+            if not isinstance(item, dict):
+                continue
+            key = f"escalation_{i + 1}"
+            escalations_out[key] = {
+                "summary": item.get("description")
+                            or item.get("summary")
+                            or item.get("note", ""),
+                "severity": (item.get("level")
+                              or item.get("severity")
+                              or "MEDIUM"),
+                "action": item.get("escalation_point")
+                            or item.get("recommended_action", ""),
+            }
 
     return {
         # Order-level fields the v2.3 UI reads off SYNTHESIS[id]

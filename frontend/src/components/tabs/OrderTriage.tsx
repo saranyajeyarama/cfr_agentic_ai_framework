@@ -54,8 +54,13 @@ type DecisionKind = 'approved' | 'rejected';
 // Hardcoded planner identity — replace with auth context when available.
 const USER_ID = 'planner.ops@mars.com';
 
-// Triage timeout per the spec.
-const TIMEOUT_MS = 180_000;
+// Triage timeout. The 5-agent run + 2 debate rounds + synthesis regularly
+// takes 200-260s in practice (measured: 202s on a 4-agent fan-out with a
+// HARD_BLOCK that triggered a 2-round debate). 180s was too tight — the
+// frontend aborted before the synthesis arrived, dropping the user back at
+// the "Ready to evaluate" screen with no visible error. 360s gives a real
+// margin for the agent flow to complete.
+const TIMEOUT_MS = 360_000;
 
 // =============================================================================
 // Helpers
@@ -583,11 +588,17 @@ export function OrderTriage({
       setElapsedMs(Date.now() - startTsRef.current);
     }, 500);
 
-    // Timeout — 180s
+    // Timeout — the UI gives up after TIMEOUT_MS but the backend session keeps
+    // running. If the agent flow eventually produces a synthesis you can read
+    // it via GET /sessions/{sid} or it'll show up in the next /v23/orders list
+    // refresh once approved.
     const timeoutHandle = window.setTimeout(() => {
       ctrl.abort();
       if (timerRef.current != null) clearInterval(timerRef.current);
-      setError({ kind: 'timeout', message: `No response in ${TIMEOUT_MS / 1000}s` });
+      setError({
+        kind: 'timeout',
+        message: `Agents still running after ${TIMEOUT_MS / 1000}s — the backend session is unaffected. Click Retry to wait again or try a different order.`,
+      });
       setPhase('error');
     }, TIMEOUT_MS);
 
@@ -777,7 +788,8 @@ export function OrderTriage({
                 <div style={{
                   fontSize: 12, color: C.muted, maxWidth: 460, textAlign: 'center', lineHeight: 1.55,
                 }}>
-                  Triage takes 30 to 180 seconds. You can cancel mid-flight.
+                  Triage typically takes 60 to 240 seconds (5 agents in parallel
+                  plus debate-on-conflict). You can cancel mid-flight.
                 </div>
                 <button onClick={() => runTriage(selectedOrder)} style={{
                   marginTop: 4, padding: '10px 22px', background: C.red, color: '#fff',
