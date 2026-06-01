@@ -51,6 +51,9 @@ from agent_tools import (
     RETAIL_INTELLIGENCE_TOOLS,
 )
 
+import logging
+_log = logging.getLogger(__name__)
+
 
 PROMPTS_DIR = Path(os.environ.get(
     "PROMPTS_DIR",
@@ -62,6 +65,7 @@ def _load_prompt(name: str) -> str:
     """Load a system prompt from agents/{name}.md, unwrapping the first
     fenced ``` block if present."""
     path = PROMPTS_DIR / f"{name}.md"
+    _log.debug("Loading prompt name=%s path=%s", name, path)
     text = path.read_text(encoding="utf-8")
     if "```" in text:
         parts = text.split("```")
@@ -188,6 +192,7 @@ def get_agent(name: str) -> LlmAgent:
         return _AGENTS[name]
     if name not in _FACTORIES:
         raise ValueError(f"Unknown agent: {name}")
+    _log.info("Building agent singleton name=%s", name)
     _AGENTS[name] = _FACTORIES[name]()
     return _AGENTS[name]
 
@@ -198,4 +203,3 @@ SPECIALIST_AGENTS = (
     "transportation",
     "retail_intelligence",
 )
-print("test repo push")

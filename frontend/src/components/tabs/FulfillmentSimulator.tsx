@@ -1,8 +1,8 @@
-import { Activity, AlertTriangle, ArrowRight, ShieldAlert, ChevronRight, CheckCircle2, Loader2, Truck, Clock, Building2 } from 'lucide-react';
+import type { Dispatch, SetStateAction } from 'react';
+import { Activity, AlertTriangle, ShieldAlert, ChevronRight, CheckCircle2, Loader2, Truck, Clock, Building2 } from 'lucide-react';
 import { Pie, PieChart, ResponsiveContainer } from 'recharts';
 import { useEffect, useState } from 'react';
 import { cn } from '../../lib/utils';
-import { buildStartSessionRequest } from '../../lib/api';
 import {
   type FulfillmentIncident,
   type FulfillmentScenario,
@@ -21,7 +21,7 @@ export function FulfillmentSimulator({
     load: (force?: boolean) => Promise<void>;
   };
   scenariosMap: ScenarioMap;
-  setScenariosMap: React.Dispatch<React.SetStateAction<ScenarioMap>>;
+  setScenariosMap: Dispatch<SetStateAction<ScenarioMap>>;
 }) {
   const { state: incidentsState, load: loadIncidents } = incidentsStore;
   const INCIDENTS = incidentsState.incidents;
@@ -34,8 +34,17 @@ export function FulfillmentSimulator({
 
   const [activeIncidentId, setActiveIncidentId] = useState<string>('');
   const [expandedRationaleId, setExpandedRationaleId] = useState<string | null>(null);
-  const [isExecuting, setIsExecuting] = useState(false);
-  const [executeResult, setExecuteResult] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  // Phase 3.1: "Apply this plan" is informational only — no /api/sessions
+  // call. There is no execute endpoint for fulfillment plans; the LP output
+  // is the recommendation and the planner is expected to action it manually
+  // in SAP. We log the choice locally so the audit history shows what plan
+  // was applied to which incident.
+  const [appliedPlan, setAppliedPlan] = useState<{
+    incidentId: string;
+    scenarioId: string;
+    scenarioName: string;
+    appliedAt: string;
+  } | null>(null);
 
   // When the incident list arrives, default to the first row.
   useEffect(() => {
@@ -75,50 +84,21 @@ export function FulfillmentSimulator({
 
   const handleIncidentClick = (id: string) => {
     setActiveIncidentId(id);
-    setExecuteResult(null);
+    setAppliedPlan(null);
   };
 
-  const handleExecute = async () => {
-    if (!incident || !selectedScenario || isExecuting) return;
-    setIsExecuting(true);
-    setExecuteResult(null);
-    try {
-      const res = await fetch('/api/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(
-          buildStartSessionRequest(
-            {
-              soldTo: incident.soldTo,
-              materialNumber: incident.materialNumber,
-              requestedQty: incident.orderedQty ?? 1000,
-              mabd: incident.mabd,
-              customerName: incident.customer,
-              materialDescription: incident.skuName,
-              referenceNumber: `INC-${incident.id}-${selectedScenario.id}`,
-            },
-            'manual',
-          ),
-        ),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setExecuteResult({
-          type: 'success',
-          message: `Session ${data.session_id} started. Agents are processing ${selectedScenario.name}.`,
-        });
-      } else {
-        const err = await res.json().catch(() => ({}));
-        setExecuteResult({ type: 'error', message: err.detail || `Server error ${res.status}` });
-      }
-    } catch {
-      setExecuteResult({
-        type: 'error',
-        message: 'Backend unreachable — connect to backend to enable live execution.',
-      });
-    } finally {
-      setIsExecuting(false);
-    }
+  /** "Apply this plan" — Phase 3.1: informational only. No execute endpoint
+   *  exists on the backend; the LP output IS the recommendation and the
+   *  planner is expected to action it manually in SAP. We record the choice
+   *  locally so the simulator shows confirmation that a plan was applied. */
+  const handleApplyPlan = () => {
+    if (!incident || !selectedScenario) return;
+    setAppliedPlan({
+      incidentId: incident.id,
+      scenarioId: selectedScenario.id,
+      scenarioName: selectedScenario.name,
+      appliedAt: new Date().toISOString(),
+    });
   };
 
   // Empty / loading states for the whole tab.
@@ -236,9 +216,9 @@ export function FulfillmentSimulator({
                  <div className="w-10 h-10 rounded-full bg-[#DB033B]/10 flex items-center justify-center text-[#DB033B] flex-shrink-0 border border-[#DB033B]/20">
                     <AlertTriangle className="w-5 h-5" />
                  </div>
-                 <div>
+                 <div className="min-w-0 flex-1">
                    <div className="font-bold text-slate-800">{incident.customer} — {incident.skuName}</div>
-                   <div className="text-sm text-slate-600 mt-1 leading-relaxed">
+                   <div className="text-sm text-slate-600 mt-1 leading-relaxed break-words">
                      {incident.description}
                    </div>
                    {/* Origin plant & transit context from dim_plant + fct_shipments */}
@@ -287,13 +267,27 @@ export function FulfillmentSimulator({
                        <div className="text-lg font-black font-mono text-slate-800">{incident.maxDaysLate ?? 0}d</div>
                        <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Max Late</div>
                      </div>
-                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100">
-                       <div className="text-lg font-black font-mono text-slate-800">{incident.lastRootCause ?? 'N/A'}</div>
-                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Root Cause</div>
+                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100 overflow-hidden">
+                       <div
+                         className="text-sm font-bold text-slate-800 truncate leading-snug"
+                         title={incident.lastRootCause ?? 'N/A'}
+                       >
+                         {incident.lastRootCause
+                           ? incident.lastRootCause.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())
+                           : 'N/A'}
+                       </div>
+                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mt-0.5">Root Cause</div>
                      </div>
-                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100">
-                       <div className="text-lg font-black font-mono text-slate-800">{incident.mabdEnforcement ?? 'N/A'}</div>
-                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Enforcement</div>
+                     <div className="bg-slate-50 rounded-lg p-2 border border-slate-100 overflow-hidden">
+                       <div
+                         className="text-sm font-bold text-slate-800 truncate leading-snug"
+                         title={incident.mabdEnforcement ?? 'N/A'}
+                       >
+                         {incident.mabdEnforcement
+                           ? incident.mabdEnforcement.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())
+                           : 'N/A'}
+                       </div>
+                       <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mt-0.5">Enforcement</div>
                      </div>
                    </div>
                  </div>
@@ -564,28 +558,43 @@ export function FulfillmentSimulator({
             </div>
           </div>
 
-          {/* Execution Trigger */}
+          {/* Apply Plan — informational only (Phase 3.1).
+              No execute endpoint exists; the LP output IS the recommendation.
+              The planner actions it manually in SAP. We surface a
+              confirmation banner so the audit trail is visible inline. */}
           {selectedScenario && (
             <div className="mt-auto pt-4 border-t border-slate-200 space-y-3">
-              {executeResult && (
-                <div className={cn(
-                  'px-4 py-3 rounded-lg text-sm font-medium',
-                  executeResult.type === 'success'
-                    ? 'bg-emerald-50 border border-emerald-200 text-emerald-800'
-                    : 'bg-red-50 border border-red-200 text-red-800'
-                )}>
-                  {executeResult.message}
+              {appliedPlan && appliedPlan.incidentId === incident.id && (
+                <div className="px-4 py-3 rounded-lg text-sm font-medium bg-emerald-50 border border-emerald-200 text-emerald-800 flex items-start gap-3">
+                  <CheckCircle2 className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <div className="font-semibold">
+                      Plan applied: {appliedPlan.scenarioName}
+                    </div>
+                    <div className="text-xs text-emerald-700 mt-1">
+                      Logged at {new Date(appliedPlan.appliedAt).toLocaleString()} ·
+                      no SAP execute step exists yet — action this plan manually
+                      in your fulfillment system. The chosen scenario is recorded
+                      for audit.
+                    </div>
+                  </div>
                 </div>
               )}
-              <div className="flex justify-end">
+              <div className="flex items-center justify-between gap-4">
+                <p className="text-xs text-slate-500">
+                  This is the recommended fulfillment plan. There is no
+                  execute endpoint — applying logs the choice for audit.
+                </p>
                 <button
-                  disabled={isExecuting}
-                  onClick={handleExecute}
-                  className="bg-[#DB033B] hover:opacity-90 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold py-3 px-8 rounded-lg text-sm transition-opacity flex items-center justify-center gap-3 shadow-md focus:ring-4 focus:ring-[#DB033B]/20">
-                  {isExecuting
-                    ? <><Loader2 className="w-4 h-4 animate-spin" /> Starting Session…</>
-                    : <>Execute {selectedScenario.name.split(':')[0]} via SAP BAPI <ArrowRight className="w-5 h-5" /></>
+                  onClick={handleApplyPlan}
+                  disabled={
+                    !!appliedPlan &&
+                    appliedPlan.incidentId === incident.id &&
+                    appliedPlan.scenarioId === selectedScenario.id
                   }
+                  className="bg-[#DB033B] hover:opacity-90 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold py-3 px-8 rounded-lg text-sm transition-opacity flex items-center justify-center gap-3 shadow-md focus:ring-4 focus:ring-[#DB033B]/20 flex-shrink-0"
+                >
+                  <CheckCircle2 className="w-4 h-4" /> Apply this plan
                 </button>
               </div>
             </div>

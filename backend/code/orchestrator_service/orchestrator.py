@@ -38,6 +38,9 @@ from agents import get_agent, SPECIALIST_AGENTS
 from agent_tools import CustomerOrderEvent, dce_write
 from firestore_client import StepWriter, update_session
 from schemas import CustomerSupplyDecision, Conflict
+from logging_config import get_session_logger
+import logging
+_log = logging.getLogger(__name__)
 
 
 MAX_DEBATE_ROUNDS = 2          # follow-up rounds AFTER the initial fan-out
@@ -110,7 +113,7 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
     # DEFER. Agents sometimes emit MODIFY (an older verb) — map it to
     # PARTIAL_FULFILL, which is the closest schema-valid action.
     rec = d.get("recommendation")
-    print(f"[DEBUG][normalize #2] raw recommendation from agent: type={type(rec).__name__}, value={rec!r}")
+    _log.debug("normalize raw recommendation type=%s value=%r", type(rec).__name__, rec)
     if isinstance(rec, str):
         action_str = rec.strip().upper()
         canonical = {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}
@@ -134,7 +137,8 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
             "expected_outcome": "",
         }
     elif isinstance(rec, dict):
-        print(f"[DEBUG][normalize #3] agent returned dict. fulfill_qty_cs present={('fulfill_qty_cs' in rec)}, value={rec.get('fulfill_qty_cs')!r}")
+        _log.debug("normalize dict rec fulfill_qty_cs present=%s value=%r",
+                   "fulfill_qty_cs" in rec, rec.get("fulfill_qty_cs"))
         rec["confidence"] = _coerce_confidence(rec.get("confidence")) or _avg_specialist_confidence(d)
         # Replace missing OR explicitly-null values, not just absent keys.
         if rec.get("action") not in {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}:
@@ -274,7 +278,7 @@ def _save_raw_response(agent_name: str, adk_session_id: str,
     }
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, default=str)
-    print(f"[DEBUG] raw response saved → {filepath}")
+    _log.debug("Raw response saved path=%s", filepath)
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +289,7 @@ async def _invoke_agent(
     prompt_payload: dict,
     writer: StepWriter,
     round_idx: int,
+    log=None,
 ) -> dict:
     """Invoke one agent, streaming its tool calls and final response to
     Firestore. Returns the parsed structured JSON response.
@@ -298,6 +303,9 @@ async def _invoke_agent(
         responses(), the final text from event.content on the event where
         is_final_response() is true (Bug #6).
     """
+    _l = log if log is not None else _log
+    payload_bytes = len(str(prompt_payload).encode("utf-8"))
+    _l.info("Invoking agent=%s round=%d payload_bytes=%d", agent_name, round_idx, payload_bytes)
     agent = get_agent(agent_name)
     app_name = f"tiger-agents-v2-02-{agent_name}"
     # Unique per invocation. round_idx alone is not unique when one agent
@@ -340,9 +348,7 @@ async def _invoke_agent(
             # Bug #6 — real ADK Event API.
             for fc in event.get_function_calls():
                 _args = dict(fc.args) if fc.args else {}
-                # ───────── DEBUG-RDD: log every tool call ─────────
-                print(f"[DEBUG-RDD][orchestrator] {agent_name} → "
-                      f"{fc.name}({_args})")
+                _l.debug("Tool call: agent=%s tool=%s args=%s", agent_name, fc.name, _args)
                 writer.write(
                     agent=agent_name, round_idx=round_idx, action="tool_call",
                     tool_name=fc.name,
@@ -355,9 +361,7 @@ async def _invoke_agent(
                 rc = result.get("row_count")
                 summary = (f"{fr.name} returned {rc} rows" if rc is not None
                            else f"{fr.name} returned a result")
-                # ───────── DEBUG-RDD: log every tool response ─────────
-                print(f"[DEBUG-RDD][orchestrator] {agent_name} ← "
-                      f"{fr.name} returned row_count={rc}")
+                _l.debug("Tool response: agent=%s tool=%s row_count=%s", agent_name, fr.name, rc)
                 writer.write(
                     agent=agent_name, round_idx=round_idx, action="tool_call",
                     tool_name=fr.name, tool_result_summary=summary,
@@ -372,7 +376,7 @@ async def _invoke_agent(
                 try:
                     _save_raw_response(agent_name, adk_session_id, text, response_json)
                 except Exception as _save_err:
-                    print(f"[DEBUG] failed to save raw response: {_save_err}")
+                    _l.warning("Raw response save failed: %s", _save_err)
       finally:
         # Drop the ADK session immediately — InMemorySessionService keeps
         # every session forever otherwise. With sequential sessions + 4
@@ -386,9 +390,12 @@ async def _invoke_agent(
         except Exception:
             pass
 
+    _latency_ms = _now_ms() - t0
+    _l.info("Agent done agent=%s round=%d latency_ms=%d parsed=%s",
+            agent_name, round_idx, _latency_ms, response_json is not None)
     writer.write(
         agent=agent_name, round_idx=round_idx, action="response",
-        model_response_json=response_json, latency_ms=_now_ms() - t0,
+        model_response_json=response_json, latency_ms=_latency_ms,
     )
     if response_json is None:
         # Graceful error envelope — the synthesizer expects this shape.
@@ -531,6 +538,12 @@ async def run_session(session_id: str, trigger_type: str,
                       order_event: CustomerOrderEvent) -> None:
     """Run the 5-agent N-to-N parallel + debate-on-conflict flow."""
     writer = StepWriter(session_id)
+    log = get_session_logger(__name__, session_id)
+    log.info("Session started trigger=%s sold_to=%s material=%s qty=%s",
+             trigger_type,
+             getattr(order_event, "sold_to", "?"),
+             getattr(order_event, "material_number", "?"),
+             getattr(order_event, "ordered_quantity_cases", "?"))
     writer.write(agent="orchestrator", action="route",
                  notes=(f"Session started (trigger_source="
                         f"{order_event.trigger_source}) — fanning out to "
@@ -553,25 +566,35 @@ async def run_session(session_id: str, trigger_type: str,
         # ConnectError mid-stream. Sequential is slower but deterministic.
         results = []
         for name in SPECIALIST_AGENTS:
+            log.info("Specialist start agent=%s round=1", name)
+            _t_spec = _now_ms()
             results.append(
-                await _invoke_agent(name, order_payload, writer, round_idx=1))
+                await _invoke_agent(name, order_payload, writer, round_idx=1, log=log))
+            log.info("Specialist done agent=%s round=1 latency_ms=%d", name, _now_ms() - _t_spec)
         signals: dict[str, dict] = dict(zip(SPECIALIST_AGENTS, results))
+        log.info("Fan-out complete n_specialists=%d", len(signals))
         writer.write(agent="orchestrator", round_idx=1, action="route",
                      notes="Fan-out complete. Running conflict detection.")
 
         conflicts = _detect_conflicts(signals)
+        log.info("Conflicts detected n=%d", len(conflicts))
         for c in conflicts:
+            log.warning("Conflict type=%s disputants=%s summary=%.200s",
+                        c.type, c.disputants, c.summary)
             writer.write(agent="orchestrator", round_idx=1, action="route",
                          notes=(f"Conflict: {c.type} between "
                                 f"{' and '.join(c.disputants)} — {c.summary}"))
 
         for conflict in conflicts:
             for r in range(2, 2 + MAX_DEBATE_ROUNDS):
+                log.info("Debate round=%d conflict_type=%s agents=%s",
+                         r, conflict.type, conflict.disputants)
                 signals.update(
                     await _run_debate_round(conflict, signals, writer, r))
                 conflict.debate_rounds_used = r - 1
                 if _is_conflict_resolved(conflict, signals):
                     conflict.resolution = "RESOLVED"
+                    log.info("Conflict resolved type=%s round=%d", conflict.type, r)
                     writer.write(agent="orchestrator", round_idx=r,
                                  action="route",
                                  notes=(f"Conflict {conflict.type} resolved "
@@ -579,20 +602,25 @@ async def run_session(session_id: str, trigger_type: str,
                     break
             else:
                 conflict.resolution = "DEADLOCK"
+                log.warning("Conflict DEADLOCK type=%s after %d rounds",
+                            conflict.type, MAX_DEBATE_ROUNDS)
                 writer.write(agent="orchestrator", action="route",
                              notes=(f"Conflict {conflict.type} DEADLOCKED "
                                     f"after {MAX_DEBATE_ROUNDS} rounds."))
 
+        log.info("Synthesis starting n_signals=%d n_conflicts=%d",
+                 len(signals), len(conflicts))
         writer.write(agent="orchestrator", action="route",
                      notes="Synthesizing — Customer Supply Agent.")
         decision = await _synthesize(order_event, signals, conflicts, writer)
-        print(f"[DEBUG][synthesize #1] raw agent decision recommendation: {decision.get('recommendation')!r}")
+        log.debug("Synthesis raw recommendation: %r", decision.get("recommendation"))
 
         # Normalize Gemini's frequent flat shapes into the nested schema
         # the front-end expects. Idempotent — re-runs on already-nested
         # outputs are no-ops.
         _normalize_decision(decision, order_event, session_id)
-        print(f"[DEBUG][normalize #4] after _normalize_decision, fulfill_qty_cs={decision.get('recommendation', {}).get('fulfill_qty_cs')!r}")
+        log.debug("After normalize fulfill_qty_cs=%r",
+                  decision.get("recommendation", {}).get("fulfill_qty_cs"))
 
         # Schema enforcement moved orchestrator-side in v2.02A (ADK 1.0.0
         # forbids output_schema alongside tools — see agents.py). Validate
@@ -610,16 +638,25 @@ async def run_session(session_id: str, trigger_type: str,
                 notes=(f"Synthesizer output did not fully match "
                        f"CustomerSupplyDecision schema: {str(ve)[:200]}"))
 
+        if decision.get("_schema_valid"):
+            log.info("Schema validation passed")
+        else:
+            log.warning("Schema mismatch: %.200s", decision.get("_schema_error", ""))
+
         decision.setdefault("agent_model_versions", AGENT_MODEL_VERSIONS)
         decision.setdefault("orchestrator_version", ORCHESTRATOR_VERSION)
         decision["trigger_type"] = trigger_type
 
+        rec = decision.get("recommendation", {})
+        log.info("Session complete status=awaiting_approval action=%s confidence=%s",
+                 rec.get("action"), rec.get("confidence"))
         update_session(session_id, status="awaiting_approval",
                        final_action_card=decision)
         writer.write(agent="orchestrator", action="route",
                      notes="Recommendation ready. Awaiting human approval.")
 
     except Exception as exc:
+        log.error("Session error: %s", exc, exc_info=True)
         writer.write(agent="orchestrator", action="error",
                      notes=(f"{type(exc).__name__}: {exc}\n"
                             f"{traceback.format_exc()[:1000]}"))
@@ -633,6 +670,8 @@ async def run_session(session_id: str, trigger_type: str,
 def _finalize(session_id: str, action_card: dict, user_id: str,
               user_decision: str, rejection_reason: str | None) -> str:
     payload = dict(action_card)
+    _log.info("Finalizing session=%s user_decision=%s user_id=%s",
+              session_id, user_decision, user_id)
     payload.setdefault("orchestrator_version", ORCHESTRATOR_VERSION)
     payload.setdefault("agent_model_versions", AGENT_MODEL_VERSIONS)
 
@@ -643,6 +682,10 @@ def _finalize(session_id: str, action_card: dict, user_id: str,
         user_id=user_id,
         rejection_reason=rejection_reason,
     )
+    if "error" not in result:
+        _log.info("Session finalized decision_id=%s", result.get("decision_id"))
+    else:
+        _log.error("dce_write failed: %s session=%s", result["error"], session_id)
     if "error" in result:
         raise RuntimeError(f"dce_write failed: {result['error']}")
 

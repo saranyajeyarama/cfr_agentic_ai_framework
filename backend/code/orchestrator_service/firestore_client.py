@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from google.cloud import firestore
+import logging
+_log = logging.getLogger(__name__)
 
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "resilience-riskradar")
@@ -34,6 +36,7 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 def create_session(session_id: str, trigger_type: str,
                     trigger_payload: dict[str, Any]) -> None:
+    _log.info("Creating session session_id=%s trigger_type=%s", session_id, trigger_type)
     _db.collection(_SESSIONS).document(session_id).set({
         "session_id":        session_id,
         "started_at":        firestore.SERVER_TIMESTAMP,
@@ -50,6 +53,7 @@ def create_session(session_id: str, trigger_type: str,
 
 
 def update_session(session_id: str, **fields: Any) -> None:
+    _log.debug("Updating session session_id=%s fields=%s", session_id, list(fields.keys()))
     if fields.get("ended_at") == "NOW":
         fields["ended_at"] = firestore.SERVER_TIMESTAMP
     _db.collection(_SESSIONS).document(session_id).update(fields)
@@ -101,4 +105,10 @@ class StepWriter:
                 "latency_ms":          latency_ms,
                 "notes":               notes,
             }))
+        if action == "error":
+            _log.warning("Step error session=%s step=%d agent=%s notes=%.200s",
+                         self.session_id, idx, agent, notes or "")
+        else:
+            _log.debug("Step written session=%s step=%d agent=%s action=%s",
+                       self.session_id, idx, agent, action)
         return idx

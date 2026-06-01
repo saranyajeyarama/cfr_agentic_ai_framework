@@ -5,7 +5,25 @@ import { createProxyMiddleware } from "http-proxy-middleware";
 const app = express();
 const __dirname = new URL('.', import.meta.url).pathname;
 
-const BACKEND_URL = process.env.BACKEND_URL;
+const BACKEND_URL     = process.env.BACKEND_URL;
+const GIT_COMMIT_SHA  = process.env.GIT_COMMIT_SHA || 'unknown';
+const BUILD_ID        = process.env.BUILD_ID       || 'unknown';
+const SERVICE_NAME    = process.env.K_SERVICE      || 'cfr-frontend';
+
+// ── /healthz ───────────────────────────────────────────────────────────────
+// Cheap liveness probe + commit traceability for Cloud Run / Cloud Build.
+// Returns 200 with the git SHA so you can pin which build is live.
+app.get('/healthz', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: SERVICE_NAME,
+    commit:  GIT_COMMIT_SHA,
+    build_id: BUILD_ID,
+    backend_url: BACKEND_URL || null,
+    proxy_mode: Boolean(BACKEND_URL),
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // ── API proxy ──────────────────────────────────────────────────────────────
 // In local dev, Vite handles /api proxying. This proxy runs in production

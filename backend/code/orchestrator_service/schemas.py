@@ -482,3 +482,52 @@ class FulfillmentIncident(BaseModel):
 class FulfillmentIncidentsResponse(BaseModel):
     incidents: list[FulfillmentIncident]
     meta: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# User Execution Telemetry
+# Dedicated audit log in tiger_decisions.fct_user_execution_telemetry.
+# Written whenever a user clicks "Execute Override & Log Telemetry" or
+# "Confirm Allocation" in Order Triage (or "Execute" in the Fulfillment
+# Simulator in a future phase).
+# ---------------------------------------------------------------------------
+
+class ExecutionTelemetryRequest(BaseModel):
+    """Body the frontend sends for every human decision event."""
+    po_number: Optional[str] = None
+    sold_to: Optional[str] = None
+    customer_name: Optional[str] = None
+    material_number: Optional[str] = None
+    ordered_qty: Optional[float] = None
+    agent_recommendation: Optional[str] = None
+    user_decision: str          # accept / modify / reject
+    override_reason: Optional[str] = None
+    override_reason_code: Optional[str] = None
+    session_id: Optional[str] = None
+    decision_id: Optional[str] = None
+    outcome_note: Optional[str] = None
+    user_id: Optional[str] = "planner"
+    source_tab: Optional[str] = "order_triage"
+
+
+class ExecutionTelemetryEntry(BaseModel):
+    """One row from fct_user_execution_telemetry mapped to the UI shape
+    (field names match the front-end DecisionEntry type exactly)."""
+    id: str                          # telemetry_id
+    timestamp: str                   # event_timestamp ISO string
+    poNumber: str                    # po_number
+    customer: str                    # customer_name (falls back to sold_to)
+    agentRecommendation: str         # agent_recommendation
+    userDecision: str                # user_decision
+    overrideReason: Optional[str] = None
+    outcome: str                     # outcome_note
+
+
+class ExecutionTelemetryWriteResponse(BaseModel):
+    telemetry_id: str
+    status: str = "written"
+
+
+class ExecutionTelemetryListResponse(BaseModel):
+    entries: list[ExecutionTelemetryEntry]
+    total: int

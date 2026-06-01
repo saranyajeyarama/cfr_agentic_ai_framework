@@ -150,6 +150,11 @@ def _solve_lp(
     solver = pulp.PULP_CBC_CMD(msg=False)
     prob.solve(solver)
 
+    log.debug("LP status=%s ordered_qty=%s", pulp.LpStatus[prob.status], ordered_qty)
+    if pulp.LpStatus[prob.status] != "Optimal":
+        log.warning("LP non-optimal status=%s ordered_qty=%s",
+                    pulp.LpStatus[prob.status], ordered_qty)
+
     status = pulp.LpStatus[prob.status]
     if status != "Optimal":
         return {"status": status, "shipped": {}, "shortfall": float(ordered_qty),
@@ -429,6 +434,10 @@ def simulate(
       }
     """
     pm = plant_meta or {}
+    _t0_sim = time.monotonic()
+    log.info("LP solve start ordered_qty=%s origin=%s region=%s plants=%s",
+             ordered_qty, origin_plant, customer_region,
+             list(available_by_plant.keys()))
     t0 = time.time()
     freight_by_plant = {
         p: lookup_freight_cost(p, customer_region) for p in available_by_plant
@@ -463,6 +472,9 @@ def simulate(
         )
 
     elapsed_ms = int((time.time() - t0) * 1000)
+    _elapsed_ms = int((time.monotonic() - _t0_sim) * 1000)
+    log.info("LP solve complete elapsed_ms=%d scenarios=%d no_alternate=%s",
+             _elapsed_ms, len(scenarios), bool(no_alternate_reason))
     return {
         "scenarios": scenarios,
         "meta": {

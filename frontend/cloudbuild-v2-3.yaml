@@ -1,0 +1,155 @@
+# =============================================================================
+# Cloud Build pipeline — cfr-ui-v2-3 (Phase 5.1 cutover)
+# =============================================================================
+# Deploys the v2.3 frontend as a SECOND, parallel Cloud Run service alongside
+# the existing tiger-frontend (v2.1). The v2.1 service is not touched.
+#
+# Two operational changes vs. v2.1:
+#   1. VITE_API_BASE_URL is baked into the Vite bundle so the SPA calls the
+#      backend directly (no Node proxy hop). The proxy in server.js stays
+#      in the image as a fallback but is unused when the build arg is set.
+#   2. GIT_COMMIT_SHA + BUILD_ID are baked in so GET /healthz reports them.
+#
+# Submit:
+#   gcloud builds submit ./frontend \
+#     --config=frontend/cloudbuild-v2-3.yaml \
+#     --substitutions=_BACKEND_URL=https://tiger-orchestrator-xxx.run.app,_REGION=us-central1,_REPO=tiger-agents,_SERVICE=cfr-ui-v2-3
+#
+# Required substitutions:
+#   _BACKEND_URL  — the live tiger-orchestrator Cloud Run URL.
+#                   Get it via:
+#                     gcloud run services describe tiger-orchestrator \
+#                       --region=us-central1 --format='value(status.url)'
+# Optional substitutions:
+#   _REGION       — default: us-central1
+#   _REPO         — default: tiger-agents (Artifact Registry repo name)
+#   _SERVICE      — default: cfr-ui-v2-3  (Cloud Run service name)
+#   _SERVICE_ACCOUNT — default: empty (uses the v2.1 frontend's SA via project default)
+# =============================================================================
+
+substitutions:
+  _BACKEND_URL: ""                # required — must be provided at submit time
+  _REGION: "us-central1"
+  _REPO: "tiger-agents"
+  _SERVICE: "cfr-ui-v2-3"
+  _SERVICE_ACCOUNT: ""
+
+steps:
+  # ── 1. Validate that _BACKEND_URL was supplied ───────────────────────────
+  - name: gcr.io/cloud-builders/gcloud
+    id: validate-substitutions
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        if [[ -z "${_BACKEND_URL}" ]]; then
+          echo "ERROR: _BACKEND_URL substitution is required."
+          echo "Pass it with --substitutions=_BACKEND_URL=https://tiger-orchestrator-xxx.run.app"
+          exit 1
+        fi
+        echo "Building cfr-ui-v2-3 with VITE_API_BASE_URL=${_BACKEND_URL}"
+        echo "Commit SHA: ${COMMIT_SHA:-unknown}"
+
+  # ── 2. Build the v2.3 frontend image (multi-stage; VITE bundle + Node) ───
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${COMMIT_SHA}
+      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:latest
+      - --build-arg=VITE_API_BASE_URL=${_BACKEND_URL}
+      - --build-arg=GIT_COMMIT_SHA=${COMMIT_SHA}
+      - --build-arg=BUILD_ID=${BUILD_ID}
+      - .
+    waitFor: ['validate-substitutions']
+
+  # ── 3. Push both tags (SHA + latest) ──────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push-sha
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${COMMIT_SHA}
+    waitFor: ['build']
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-latest
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:latest
+    waitFor: ['build']
+
+  # ── 4. Deploy to Cloud Run as the v2.3 service ────────────────────────────
+  # NOTE: VITE_API_BASE_URL is baked at build time, so we deliberately do
+  # NOT set BACKEND_URL at runtime. That leaves the express proxy idle and
+  # all /api/* calls go direct to the v2.3 bundle's pre-injected URL.
+  # The runtime env carries GIT_COMMIT_SHA + BUILD_ID for /healthz.
+  - name: gcr.io/cloud-builders/gcloud
+    id: deploy
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # NOTE: $$VAR is the Cloud Build escape for a literal bash variable.
+        # Without the $$ prefix, Cloud Build's substitution engine sees
+        # $${SA_FLAG} as a substitution and rejects names that aren't
+        # built-ins (PROJECT_ID, COMMIT_SHA, BUILD_ID) or _-prefixed
+        # user substitutions. The escape passes a literal $SA_FLAG to bash.
+        SA_FLAG=""
+        if [[ -n "${_SERVICE_ACCOUNT}" ]]; then
+          SA_FLAG="--service-account=${_SERVICE_ACCOUNT}"
+        fi
+        gcloud run deploy "${_SERVICE}" \
+          --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${COMMIT_SHA} \
+          --region=${_REGION} \
+          --project=${PROJECT_ID} \
+          --platform=managed \
+          --allow-unauthenticated \
+          --port=8080 \
+          --memory=512Mi \
+          --cpu=1 \
+          --timeout=600 \
+          --concurrency=1000 \
+          --min-instances=0 \
+          --max-instances=5 \
+          --set-env-vars="GIT_COMMIT_SHA=${COMMIT_SHA},BUILD_ID=${BUILD_ID}" \
+          $$SA_FLAG \
+          --quiet
+    waitFor: ['push-sha']
+
+  # ── 5. Print the deployed URL ─────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/gcloud
+    id: report
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        URL=$(gcloud run services describe "${_SERVICE}" \
+          --region=${_REGION} --project=${PROJECT_ID} \
+          --format='value(status.url)')
+        echo ""
+        echo "================================================================"
+        echo "  cfr-ui-v2-3 deployed."
+        echo "  URL    : $URL"
+        echo "  Healthz: $URL/healthz"
+        echo "  Commit : ${COMMIT_SHA}"
+        echo "  Backend: ${_BACKEND_URL}"
+        echo "================================================================"
+        echo ""
+        echo "Verify with:"
+        echo "  curl -s $URL/healthz"
+    waitFor: ['deploy']
+
+# Both images are pushed to Artifact Registry by the steps above; Cloud Build
+# will also record the SHA-tagged image in its build history.
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${COMMIT_SHA}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+timeout: 1200s

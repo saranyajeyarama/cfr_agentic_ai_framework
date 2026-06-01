@@ -49,7 +49,7 @@ def _run(client: bigquery.Client, sql: str, params: list | None = None) -> list[
         cfg = bigquery.QueryJobConfig(query_parameters=params or [])
         return [dict(r) for r in client.query(sql, job_config=cfg).result()]
     except Exception as exc:
-        print(f"BQ query failed: {exc}\n SQL: {sql[:300]}", flush=True)
+        log.error("BQ query failed: %s sql=%.300s", exc, sql)
         return []
 
 
@@ -637,8 +637,7 @@ def _fetch_fulfillment_incidents(client: bigquery.Client) -> list[dict]:
 def _fetch_demo_seed_incidents(client: bigquery.Client) -> list[dict]:
     """Fallback: no approved+at-risk orders → seed 1-2 illustrative
     incidents from raw OTIF history so the UI is never blank."""
-    print("[fulfillment-incidents] no approved+at-risk orders found; "
-          "falling back to demo seeds from fct_otif", flush=True)
+    log.info("No approved+at-risk orders found; falling back to demo seed from fct_otif")
     fallback = _run(client, f"""
         SELECT
             o.delivery_number, o.sold_to_name, o.sold_to,
@@ -816,12 +815,12 @@ def fetch_fulfillment_incidents() -> dict:
     try:
         client = _bq_client()
     except Exception as exc:  # noqa: BLE001
-        print(f"[fulfillment-incidents] BQ client init failed: {exc}", flush=True)
+        log.error("Fulfillment incidents BQ init failed: %s", exc, exc_info=True)
         return {"incidents": [], "meta": {"error": "bigquery_client_unavailable"}}
     try:
         incidents = _fetch_fulfillment_incidents(client)
     except Exception as exc:  # noqa: BLE001
-        print(f"[fulfillment-incidents] query failed: {exc}", flush=True)
+        log.error("Fulfillment incidents query failed: %s", exc, exc_info=True)
         return {"incidents": [], "meta": {"error": str(exc)[:200]}}
     demo = any(i.get("_demo_seed") for i in incidents)
     return {
@@ -1082,10 +1081,7 @@ def _safe_section(name: str, fn, client, default):
     try:
         return fn(client)
     except Exception as exc:
-        import traceback
-        print(f"[dashboard] section '{name}' failed: "
-              f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-              flush=True)
+        log.error("Dashboard section '%s' failed: %s", name, exc, exc_info=True)
         return default
 
 
@@ -1095,10 +1091,7 @@ def fetch_dashboard_data() -> dict:
     except Exception as exc:
         # BigQuery client itself could not be created. Return an all-empty
         # dashboard rather than 500 — the front-end falls back to mock data.
-        import traceback
-        print(f"[dashboard] BigQuery client init failed: "
-              f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-              flush=True)
+        log.error("Dashboard BQ client init failed: %s", exc, exc_info=True)
         client = None
 
     if client is None:
@@ -1142,5 +1135,675 @@ def fetch_dashboard_data() -> dict:
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "source":     "bigquery",
             "project":    PROJECT_ID,
+        },
+    }
+
+
+# =============================================================================
+# Phase 7 — Agent overview pages (Supply / Demand / Transport / Retail)
+# =============================================================================
+# Public entry points: fetch_agents_supply, fetch_agents_demand,
+# fetch_agents_transport, fetch_agents_retail. Each is wired to a GET route
+# in main.py: /agents/{supply,demand,transport,retail}.
+#
+# Shape contract: { "data": {<port-specific subtree>}, "meta": {...} }
+# All routes degrade gracefully if BQ is unavailable — they return empty
+# inner arrays + an `error` string in meta. They NEVER raise (matches the
+# convention of fetch_fulfillment_incidents).
+#
+# Field names match the AI Studio reference PORT_* constants verbatim so
+# the frontend page components can render without a remapping step.
+# =============================================================================
+
+
+# ─── /agents/supply ───────────────────────────────────────────────────────────
+
+def _fetch_agents_supply(client: bigquery.Client) -> dict:
+    """Inventory positions + production schedule adherence + raw material
+    concerns. Matches PORT_SUPPLY shape from mars-supply-ai-v2_02-restyled.jsx
+    lines 1250–1275."""
+
+    # ── Inventory positions: latest snapshot per (material × plant), with
+    #    derived status + days-of-supply heuristic.
+    inv_rows = _run(client, f"""
+        WITH latest AS (
+          SELECT material_number, plant_code,
+                 SUM(batch_unrestricted_stock) AS on_hand_cs,
+                 MAX(snapshot_date)            AS snap_dt
+          FROM `{SEMANTIC_DS}.fct_inventory_batch_snapshot`
+          WHERE snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 120 DAY)
+          GROUP BY material_number, plant_code
+        ),
+        demand AS (
+          SELECT material_number,
+                 SAFE_DIVIDE(SUM(ordered_quantity_sales_uom), 90.0) AS avg_daily_demand
+          FROM `{SEMANTIC_DS}.fct_sales_orders`
+          WHERE order_creation_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+            AND rejection_reason IS NULL
+          GROUP BY material_number
+        )
+        SELECT
+          l.material_number      AS sku,
+          COALESCE(m.material_description, l.material_number) AS desc,
+          l.plant_code           AS dc,
+          CAST(l.on_hand_cs AS INT64) AS cs,
+          ROUND(SAFE_DIVIDE(l.on_hand_cs, NULLIF(d.avg_daily_demand, 0)), 1) AS dos
+        FROM latest l
+        LEFT JOIN `{SEMANTIC_DS}.dim_material` m ON l.material_number = m.material_number
+        LEFT JOIN demand d ON d.material_number = l.material_number
+        ORDER BY dos ASC NULLS LAST
+        LIMIT 50
+    """)
+
+    def _shape_inventory(r: dict) -> dict:
+        cs  = _safe_int(r.get("cs"))
+        dos = r.get("dos")
+        if cs <= 0:
+            status, short = "STOCKOUT", max(0, 2000 - cs)
+        elif dos is not None and dos < 7:
+            status, short = "BELOW_SS", max(0, int(2000 - cs))
+        else:
+            status, short = "OK", 0
+        return {
+            "sku":    r.get("sku") or "",
+            "desc":   r.get("desc") or "",
+            "dc":     r.get("dc") or "",
+            "cs":     cs,
+            "dos":    float(dos) if dos is not None else 0.0,
+            "status": status,
+            "short":  short,
+        }
+
+    # ── Production schedule adherence (open + recently complete runs).
+    prod_rows = _run(client, f"""
+        SELECT
+          production_order_number                AS pro,
+          item_material_number                   AS sku,
+          item_material_description              AS desc,
+          CAST(planned_end_date AS STRING)       AS end_date,
+          production_order_status                AS status,
+          plan_adherence_pct                     AS adherence
+        FROM `{SEMANTIC_DS}.fct_production_orders`
+        WHERE planned_end_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+          AND planned_end_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 60 DAY)
+        ORDER BY planned_end_date ASC
+        LIMIT 30
+    """)
+
+    def _shape_production(r: dict) -> dict:
+        adh = _safe_float(r.get("adherence"))
+        if adh < 85.0:
+            risk = "HIGH"
+        elif adh < 95.0:
+            risk = "MEDIUM"
+        else:
+            risk = "LOW"
+        return {
+            "pro":       r.get("pro") or "",
+            "sku":       r.get("sku") or "",
+            "desc":      r.get("desc") or "",
+            "end":       r.get("end_date") or "",
+            "status":    r.get("status") or "",
+            "adherence": round(adh, 1),
+            "risk":      risk,
+        }
+
+    # ── Raw-material concerns. fct_bills_of_materials links FERTs to
+    #    components; we surface the components with the lowest DoS.
+    raw_rows = _run(client, f"""
+        WITH components AS (
+          SELECT DISTINCT component_material_number AS material_number
+          FROM `{SEMANTIC_DS}.fct_bills_of_materials`
+        ),
+        comp_stock AS (
+          SELECT material_number,
+                 SUM(batch_unrestricted_stock) AS on_hand
+          FROM `{SEMANTIC_DS}.fct_inventory_batch_snapshot`
+          WHERE snapshot_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 120 DAY)
+          GROUP BY material_number
+        ),
+        fert_link AS (
+          SELECT component_material_number AS comp,
+                 STRING_AGG(DISTINCT fert_material_number, ', ' ORDER BY fert_material_number LIMIT 5) AS skus
+          FROM `{SEMANTIC_DS}.fct_bills_of_materials`
+          GROUP BY component_material_number
+        )
+        SELECT
+          c.material_number                            AS material_number,
+          COALESCE(m.material_description, c.material_number) AS material,
+          s.on_hand                                    AS on_hand_cs,
+          l.skus                                       AS skus
+        FROM components c
+        LEFT JOIN `{SEMANTIC_DS}.dim_material` m ON c.material_number = m.material_number
+        LEFT JOIN comp_stock s ON c.material_number = s.material_number
+        LEFT JOIN fert_link  l ON c.material_number = l.comp
+        ORDER BY s.on_hand ASC NULLS FIRST
+        LIMIT 10
+    """)
+
+    def _shape_raw(r: dict) -> dict:
+        on_hand = _safe_int(r.get("on_hand_cs"))
+        # Heuristic DoS — 100 cases/day average burn for components.
+        dos = round(on_hand / 100.0, 1) if on_hand > 0 else 0.0
+        concern = dos < 14.0
+        rationale = (
+            f"Low inventory: {on_hand:,} cs (~{dos}d)"
+            if concern
+            else f"Healthy buffer: {on_hand:,} cs (~{dos}d)"
+        )
+        return {
+            "material":  r.get("material") or "",
+            "concern":   concern,
+            "dos":       dos,
+            "rationale": rationale,
+            "skus":      r.get("skus") or "",
+        }
+
+    return {
+        "inventory":     [_shape_inventory(r) for r in inv_rows],
+        "production":    [_shape_production(r) for r in prod_rows],
+        "raw_materials": [_shape_raw(r) for r in raw_rows],
+    }
+
+
+def fetch_agents_supply() -> dict:
+    """Public entry point for GET /agents/supply."""
+    try:
+        client = _bq_client()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents supply BQ init failed: %s", exc, exc_info=True)
+        return {"data": {"inventory": [], "production": [], "raw_materials": []},
+                "meta": {"error": "bigquery_client_unavailable"}}
+    try:
+        data = _fetch_agents_supply(client)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents supply query failed: %s", exc, exc_info=True)
+        return {"data": {"inventory": [], "production": [], "raw_materials": []},
+                "meta": {"error": str(exc)[:200]}}
+    return {
+        "data": data,
+        "meta": {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "source":     "bigquery",
+            "count":      sum(len(v) for v in data.values()),
+        },
+    }
+
+
+# ─── /agents/demand ───────────────────────────────────────────────────────────
+
+def _classify_demand(vs_plan_pct: float, quality: str, has_promo: bool,
+                     confidence: float) -> tuple[str, float]:
+    """Mirror of the AI Studio classification logic. Returns (cls, conf)."""
+    if has_promo and 20.0 <= vs_plan_pct <= 80.0:
+        return "PROMO_DRIVEN", max(confidence, 0.85)
+    if vs_plan_pct >= 100.0 and quality == "SYSTEMATIC_OVER":
+        return "BUFFER_BUILD", max(confidence, 0.85)
+    if 30.0 <= vs_plan_pct <= 80.0 and quality in ("HEALTHY", "SYSTEMATIC_UNDER"):
+        return "GENUINE_PULL", max(confidence, 0.80)
+    if vs_plan_pct >= 20.0:
+        return "ONE_OFF_ANOMALY", max(confidence * 0.7, 0.55)
+    return "GENUINE_PULL", max(confidence, 0.90)
+
+
+def _fetch_agents_demand(client: bigquery.Client) -> dict:
+    """Forecast positions + promotional calendar. PORT_DEMAND shape."""
+
+    position_rows = _run(client, f"""
+        WITH actual_7d AS (
+          SELECT sold_to, material_number,
+                 SUM(ordered_quantity_sales_uom) AS actual_cs
+          FROM `{SEMANTIC_DS}.fct_sales_orders`
+          WHERE order_creation_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+            AND rejection_reason IS NULL
+          GROUP BY sold_to, material_number
+        ),
+        forecast_7d AS (
+          SELECT sold_to, material_zrep_number,
+                 SUM(forecast_quantity_consensus) AS plan_cs
+          FROM `{SEMANTIC_DS}.fct_forecast`
+          WHERE forecast_week_start_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+            AND forecast_week_start_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 7 DAY)
+          GROUP BY sold_to, material_zrep_number
+        ),
+        promo_active AS (
+          SELECT DISTINCT sold_to, material_zrep_number
+          FROM `{SEMANTIC_DS}.fct_promo_plan`
+          WHERE promo_start_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 14 DAY)
+            AND promo_end_date   >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+        )
+        SELECT
+          a.sold_to                              AS sold_to,
+          COALESCE(c.customer_name, a.sold_to)   AS customer,
+          a.material_number                      AS sku,
+          COALESCE(m.material_description, a.material_number) AS desc,
+          a.actual_cs                            AS actual_cs,
+          f.plan_cs                              AS plan_cs,
+          fa.wmape_pct                           AS wmape,
+          fa.bias_pct                            AS bias,
+          fa.quality_flag                        AS quality,
+          IF(pa.sold_to IS NOT NULL, TRUE, FALSE) AS has_promo
+        FROM actual_7d a
+        LEFT JOIN forecast_7d         f  ON a.sold_to = f.sold_to
+                                        AND a.material_number = f.material_zrep_number
+        LEFT JOIN `{SEMANTIC_DS}.dim_customer` c ON a.sold_to = c.sold_to
+        LEFT JOIN `{SEMANTIC_DS}.dim_material` m ON a.material_number = m.material_number
+        LEFT JOIN `{SEMANTIC_DS}.fct_forecast_accuracy` fa
+                                           ON a.sold_to = fa.sold_to
+                                          AND a.material_number = fa.material_zrep_number
+        LEFT JOIN promo_active        pa ON a.sold_to = pa.sold_to
+                                        AND a.material_number = pa.material_zrep_number
+        ORDER BY ABS(SAFE_DIVIDE(a.actual_cs - f.plan_cs, NULLIF(f.plan_cs, 0))) DESC NULLS LAST
+        LIMIT 20
+    """)
+
+    def _shape_position(r: dict) -> dict:
+        actual    = _safe_float(r.get("actual_cs"))
+        plan      = _safe_float(r.get("plan_cs"))
+        vs_plan   = round(((actual - plan) / plan * 100.0) if plan > 0 else 0.0, 1)
+        wmape     = _safe_float(r.get("wmape"))
+        bias      = _safe_float(r.get("bias"))
+        quality   = (r.get("quality") or "HEALTHY").upper()
+        promo     = bool(r.get("has_promo"))
+        # Confidence — backed off from wmape: lower wmape ⇒ higher conf.
+        base_conf = max(0.5, min(0.95, 1.0 - (wmape / 100.0)))
+        cls, conf = _classify_demand(vs_plan, quality, promo, base_conf)
+        escalation = vs_plan >= 100.0 and cls == "BUFFER_BUILD"
+        return {
+            "customer":       r.get("customer") or "",
+            "sku":            r.get("sku") or "",
+            "desc":           r.get("desc") or "",
+            "vs_plan":        vs_plan,
+            "plan_cs":        int(plan),
+            "classification": cls,
+            "conf":           round(conf, 2),
+            "wmape":          round(wmape, 1),
+            "bias":           round(bias, 1),
+            "quality":        quality,
+            "promo":          promo,
+            "escalation":     escalation,
+        }
+
+    promo_rows = _run(client, f"""
+        SELECT
+          p.sold_to                            AS sold_to,
+          COALESCE(c.customer_name, p.sold_to) AS customer,
+          p.material_zrep_number               AS sku,
+          p.promo_name                         AS name,
+          p.promo_type                         AS type,
+          CAST(p.promo_start_date AS STRING)   AS start_date,
+          CAST(p.promo_end_date   AS STRING)   AS end_date,
+          p.expected_incremental_quantity      AS incr,
+          p.promo_status                       AS status
+        FROM `{SEMANTIC_DS}.fct_promo_plan` p
+        LEFT JOIN `{SEMANTIC_DS}.dim_customer` c ON p.sold_to = c.sold_to
+        WHERE p.promo_end_date   >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+          AND p.promo_start_date <= DATE_ADD(CURRENT_DATE(), INTERVAL 30 DAY)
+        ORDER BY p.promo_start_date ASC
+        LIMIT 20
+    """)
+
+    def _shape_promo(r: dict) -> dict:
+        start = r.get("start_date") or ""
+        end   = r.get("end_date") or ""
+        dates = f"{start} → {end}" if start and end else (start or end)
+        return {
+            "customer": r.get("customer") or "",
+            "sku":      r.get("sku") or "",
+            "name":     r.get("name") or "",
+            "type":     (r.get("type") or "").upper().replace(" ", "_"),
+            "dates":    dates,
+            "incr":     _safe_int(r.get("incr")),
+            "status":   (r.get("status") or "").upper(),
+        }
+
+    return {
+        "positions":      [_shape_position(r) for r in position_rows],
+        "promo_calendar": [_shape_promo(r)    for r in promo_rows],
+    }
+
+
+def fetch_agents_demand() -> dict:
+    """Public entry point for GET /agents/demand."""
+    try:
+        client = _bq_client()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents demand BQ init failed: %s", exc, exc_info=True)
+        return {"data": {"positions": [], "promo_calendar": []},
+                "meta": {"error": "bigquery_client_unavailable"}}
+    try:
+        data = _fetch_agents_demand(client)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents demand query failed: %s", exc, exc_info=True)
+        return {"data": {"positions": [], "promo_calendar": []},
+                "meta": {"error": str(exc)[:200]}}
+    return {
+        "data": data,
+        "meta": {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "source":     "bigquery",
+            "count":      sum(len(v) for v in data.values()),
+        },
+    }
+
+
+# ─── /agents/transport ────────────────────────────────────────────────────────
+
+def _fetch_agents_transport(client: bigquery.Client) -> dict:
+    """Lanes + carrier league + OTIF scoreboard. PORT_TRANSPORT shape."""
+
+    lane_rows = _run(client, f"""
+        SELECT
+          s.plant_code                     AS origin,
+          s.ship_to                        AS dest,
+          ROUND(AVG(s.transit_hours_actual), 1) AS transit,
+          ROUND(SAFE_DIVIDE(
+            COUNTIF(s.is_on_time_flag = 'Y'), COUNT(*)), 2) AS otp,
+          COUNT(*)                         AS ships,
+          ANY_VALUE(c.carrier_name)        AS carrier
+        FROM `{SEMANTIC_DS}.fct_shipments` s
+        LEFT JOIN `{SEMANTIC_DS}.dim_carrier` c ON s.carrier_id = c.carrier_id
+        WHERE s.actual_departure_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+        GROUP BY origin, dest
+        HAVING ships >= 5
+        ORDER BY ships DESC
+        LIMIT 12
+    """)
+
+    def _shape_lane(r: dict, idx: int) -> dict:
+        otp = _safe_float(r.get("otp"))
+        ships = _safe_int(r.get("ships"))
+        return {
+            "id":      f"lane-{idx:03d}",
+            "lane":    f"{r.get('origin') or '—'} → {r.get('dest') or '—'}",
+            "origin":  r.get("origin") or "",
+            "dest":    r.get("dest") or "",
+            "transit": _safe_float(r.get("transit")),
+            "otp":     round(otp, 2),
+            "ships":   ships,
+            "viable":  otp >= 0.85 and ships >= 10,
+            "carrier": r.get("carrier") or "",
+        }
+
+    carrier_rows = _run(client, f"""
+        SELECT
+          c.carrier_name                   AS name,
+          ROUND(SAFE_DIVIDE(
+            COUNTIF(s.is_on_time_flag = 'Y'), COUNT(*)), 2) AS otp,
+          COALESCE(c.target_otp_pct / 100.0, 0.95) AS target,
+          COUNT(*)                         AS ships
+        FROM `{SEMANTIC_DS}.fct_shipments` s
+        JOIN `{SEMANTIC_DS}.dim_carrier`  c ON s.carrier_id = c.carrier_id
+        WHERE s.actual_departure_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+        GROUP BY name, c.target_otp_pct
+        HAVING ships >= 10
+        ORDER BY otp DESC
+        LIMIT 10
+    """)
+
+    def _shape_carrier(r: dict) -> dict:
+        otp    = _safe_float(r.get("otp"))
+        target = _safe_float(r.get("target"))
+        return {
+            "name":   r.get("name") or "",
+            "otp":    round(otp, 2),
+            "target": round(target, 2),
+            "ships":  _safe_int(r.get("ships")),
+            "cb":     0,           # Joined separately below when fct_chargebacks is reliable
+            "meets":  otp >= target,
+        }
+
+    otif_rows = _run(client, f"""
+        WITH otif_agg AS (
+          SELECT sold_to,
+                 ROUND(SAFE_DIVIDE(
+                   COUNTIF(otif_flag = 'Y'), COUNT(*)), 2) AS otif,
+                 COUNT(*) AS deliveries
+          FROM `{SEMANTIC_DS}.fct_otif`
+          WHERE delivery_date_promised >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+          GROUP BY sold_to
+          HAVING deliveries >= 20
+        ),
+        cb_agg AS (
+          SELECT sold_to,
+                 COUNT(*)                        AS cb_count,
+                 SUM(chargeback_amount_usd)      AS cb_usd
+          FROM `{SEMANTIC_DS}.fct_chargebacks`
+          WHERE chargeback_assessed_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+          GROUP BY sold_to
+        )
+        SELECT
+          o.sold_to                              AS sold_to,
+          COALESCE(c.customer_name, o.sold_to)   AS customer,
+          o.otif                                 AS otif,
+          COALESCE(c.otif_target_pct / 100.0, 0.95) AS target,
+          cb.cb_count                            AS cb,
+          cb.cb_usd                              AS exposure
+        FROM otif_agg o
+        LEFT JOIN `{SEMANTIC_DS}.dim_customer` c ON o.sold_to = c.sold_to
+        LEFT JOIN cb_agg                       cb ON o.sold_to = cb.sold_to
+        ORDER BY o.otif ASC
+        LIMIT 12
+    """)
+
+    def _shape_otif(r: dict) -> dict:
+        otif   = _safe_float(r.get("otif"))
+        target = _safe_float(r.get("target"))
+        delta  = round((otif - target) * 100.0, 1)
+        return {
+            "customer": r.get("customer") or "",
+            "otif":     round(otif, 2),
+            "target":   round(target, 2),
+            "delta":    delta,
+            "cb":       _safe_int(r.get("cb")),
+            "exposure": _safe_int(r.get("exposure")),
+        }
+
+    return {
+        "lanes":    [_shape_lane(r, i) for i, r in enumerate(lane_rows, start=1)],
+        "carriers": [_shape_carrier(r) for r in carrier_rows],
+        "otif":     [_shape_otif(r)    for r in otif_rows],
+    }
+
+
+def fetch_agents_transport() -> dict:
+    """Public entry point for GET /agents/transport."""
+    try:
+        client = _bq_client()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents transport BQ init failed: %s", exc, exc_info=True)
+        return {"data": {"lanes": [], "carriers": [], "otif": []},
+                "meta": {"error": "bigquery_client_unavailable"}}
+    try:
+        data = _fetch_agents_transport(client)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents transport query failed: %s", exc, exc_info=True)
+        return {"data": {"lanes": [], "carriers": [], "otif": []},
+                "meta": {"error": str(exc)[:200]}}
+    return {
+        "data": data,
+        "meta": {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "source":     "bigquery",
+            "count":      sum(len(v) for v in data.values()),
+        },
+    }
+
+
+# ─── /agents/retail ───────────────────────────────────────────────────────────
+
+def _fetch_agents_retail(client: bigquery.Client) -> dict:
+    """Demand classifications + POS velocity trends. PORT_RETAIL shape."""
+
+    # Classifications — 8-week aggregate per (sold_to × material).
+    cls_rows = _run(client, f"""
+        WITH d AS (
+          SELECT
+            d.sold_to,
+            d.material_zrep_number AS material_zrep_number,
+            SUM(d.pos_units_consumer_takeaway)            AS pos_total,
+            AVG(d.distribution_pct_acv)                    AS acv,
+            MAX(d.promo_active_flag)                       AS promo,
+            AVG(IF(d.driver_week_start_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 4 WEEK),
+                   d.pos_units_consumer_takeaway, NULL))  AS pos_recent,
+            AVG(IF(d.driver_week_start_date <  DATE_SUB(CURRENT_DATE(), INTERVAL 4 WEEK),
+                   d.pos_units_consumer_takeaway, NULL))  AS pos_prior
+          FROM `{SEMANTIC_DS}.fct_demand_drivers` d
+          WHERE d.driver_week_start_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 8 WEEK)
+          GROUP BY d.sold_to, d.material_zrep_number
+        )
+        SELECT
+          d.sold_to                                    AS sold_to,
+          COALESCE(c.customer_name, d.sold_to)         AS customer,
+          d.material_zrep_number                       AS sku,
+          COALESCE(m.material_description,
+                   d.material_zrep_number)             AS desc,
+          d.pos_total                                  AS pos,
+          d.pos_recent                                 AS pos_recent,
+          d.pos_prior                                  AS pos_prior,
+          d.acv                                        AS acv,
+          d.promo                                      AS promo
+        FROM d
+        LEFT JOIN `{SEMANTIC_DS}.dim_customer` c ON d.sold_to = c.sold_to
+        LEFT JOIN `{SEMANTIC_DS}.dim_material` m ON d.material_zrep_number = m.material_number
+        WHERE d.pos_total IS NOT NULL
+        ORDER BY d.pos_total DESC
+        LIMIT 12
+    """)
+
+    def _shape_classification(r: dict) -> dict:
+        pos        = _safe_int(r.get("pos"))
+        pos_recent = _safe_float(r.get("pos_recent"))
+        pos_prior  = _safe_float(r.get("pos_prior"))
+        promo      = bool(r.get("promo"))
+        # Trend ratio: recent vs prior. ≥1.1 accelerating; ≤0.9 decelerating.
+        if pos_prior > 0:
+            ratio = pos_recent / pos_prior
+        else:
+            ratio = 1.0
+        if ratio >= 1.10:
+            trend = "ACCELERATING"
+        elif ratio <= 0.90:
+            trend = "DECELERATING"
+        else:
+            trend = "FLAT"
+        # Classification: simple heuristic on trend × promo.
+        if promo:
+            cls, conf = "PROMO_DRIVEN", 0.88
+        elif trend == "ACCELERATING":
+            cls, conf = "GENUINE_PULL", 0.85
+        elif trend == "DECELERATING":
+            cls, conf = "BUFFER_BUILD", 0.80
+        else:
+            cls, conf = "GENUINE_PULL", 0.78
+        risk_score = (
+            5 if cls == "BUFFER_BUILD" else
+            3 if cls == "PROMO_DRIVEN" else
+            2 if trend == "ACCELERATING" else 1
+        )
+        return {
+            "customer": r.get("customer") or "",
+            "sku":      r.get("sku") or "",
+            "desc":     r.get("desc") or "",
+            "cls":      cls,
+            "conf":     round(conf, 2),
+            "pos":      pos,
+            "trend":    trend,
+            "ohi":      None,            # fct_demand_drivers retailer OHI not in current view
+            "ohi_norm": None,
+            "promo":    promo,
+            "risk":     risk_score,
+        }
+
+    # POS trends — 8 weekly points per top SKU. Network-level (no sold_to filter)
+    # for a clean weekly trend line.
+    trend_rows = _run(client, f"""
+        WITH top_skus AS (
+          SELECT material_zrep_number, SUM(pos_units_consumer_takeaway) AS total
+          FROM `{SEMANTIC_DS}.fct_demand_drivers`
+          WHERE driver_week_start_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 8 WEEK)
+          GROUP BY material_zrep_number
+          ORDER BY total DESC
+          LIMIT 5
+        ),
+        weeks AS (
+          SELECT d.material_zrep_number,
+                 d.driver_week_start_date,
+                 SUM(d.pos_units_consumer_takeaway) AS units,
+                 AVG(d.distribution_pct_acv)        AS acv,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY d.material_zrep_number
+                   ORDER BY d.driver_week_start_date DESC
+                 ) AS week_rank
+          FROM `{SEMANTIC_DS}.fct_demand_drivers` d
+          JOIN top_skus t ON d.material_zrep_number = t.material_zrep_number
+          WHERE d.driver_week_start_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 8 WEEK)
+          GROUP BY d.material_zrep_number, d.driver_week_start_date
+        )
+        SELECT
+          w.material_zrep_number                       AS sku,
+          COALESCE(m.material_description,
+                   w.material_zrep_number)             AS desc,
+          ARRAY_AGG(STRUCT(
+            CONCAT('W', CAST(9 - w.week_rank AS STRING)) AS w,
+            CAST(w.units AS INT64) AS v
+          ) ORDER BY w.week_rank DESC LIMIT 8)         AS weekly,
+          AVG(w.acv)                                   AS acv
+        FROM weeks w
+        LEFT JOIN `{SEMANTIC_DS}.dim_material` m
+                                   ON w.material_zrep_number = m.material_number
+        WHERE w.week_rank <= 8
+        GROUP BY w.material_zrep_number, desc
+        LIMIT 5
+    """)
+
+    def _shape_trend(r: dict) -> dict:
+        weekly = r.get("weekly") or []
+        # Determine overall trend by comparing first half vs second half.
+        if len(weekly) >= 4:
+            first_half = sum(_safe_int(w.get("v")) for w in weekly[:len(weekly)//2])
+            second_half = sum(_safe_int(w.get("v")) for w in weekly[len(weekly)//2:])
+            if second_half > first_half * 1.10:
+                trend = "ACCELERATING"
+            elif second_half < first_half * 0.90:
+                trend = "DECELERATING"
+            else:
+                trend = "FLAT"
+        else:
+            trend = "FLAT"
+        return {
+            "sku":    r.get("sku") or "",
+            "desc":   r.get("desc") or "",
+            "trend":  trend,
+            "acv":    round(_safe_float(r.get("acv")), 1),
+            "weekly": [{"w": w.get("w") or "", "v": _safe_int(w.get("v"))} for w in weekly],
+        }
+
+    return {
+        "classifications": [_shape_classification(r) for r in cls_rows],
+        "pos_trends":      [_shape_trend(r)          for r in trend_rows],
+    }
+
+
+def fetch_agents_retail() -> dict:
+    """Public entry point for GET /agents/retail."""
+    try:
+        client = _bq_client()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents retail BQ init failed: %s", exc, exc_info=True)
+        return {"data": {"classifications": [], "pos_trends": []},
+                "meta": {"error": "bigquery_client_unavailable"}}
+    try:
+        data = _fetch_agents_retail(client)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Agents retail query failed: %s", exc, exc_info=True)
+        return {"data": {"classifications": [], "pos_trends": []},
+                "meta": {"error": str(exc)[:200]}}
+    return {
+        "data": data,
+        "meta": {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "source":     "bigquery",
+            "count":      sum(len(v) for v in data.values()),
         },
     }
