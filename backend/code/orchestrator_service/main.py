@@ -158,6 +158,137 @@ def _ensure_telemetry_table() -> None:
         log.warning("Telemetry table ensure failed: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Triage result cache — fct_triage_cache
+# Persists each order's synthesized agent decision so re-clicking an order
+# returns the STORED result instantly and consistently, instead of re-running
+# the 200s+ 5-agent flow (whose output is non-deterministic between runs).
+# Two layers: an in-process dict (instant re-clicks within a live instance) +
+# BigQuery tiger_decisions (durable across restarts / instances).
+# ---------------------------------------------------------------------------
+import json as _json
+
+_TRIAGE_CACHE_TABLE = f"{PROJECT_ID}.tiger_decisions.fct_triage_cache"
+_triage_cache_table_ready: bool = False
+_TRIAGE_MEM_CACHE: dict[str, dict] = {}
+
+
+def _ensure_triage_cache_table() -> None:
+    """Create fct_triage_cache if it doesn't exist (idempotent)."""
+    global _triage_cache_table_ready
+    if _triage_cache_table_ready:
+        return
+    try:
+        client = _bq_telemetry()
+        schema = [
+            bigquery.SchemaField("order_id",                "STRING",    mode="REQUIRED"),
+            bigquery.SchemaField("sold_to",                 "STRING"),
+            bigquery.SchemaField("material_number",         "STRING"),
+            bigquery.SchemaField("ordered_quantity_cases",  "FLOAT64"),
+            bigquery.SchemaField("requested_delivery_date", "STRING"),
+            bigquery.SchemaField("session_id",              "STRING"),
+            bigquery.SchemaField("recommendation_action",   "STRING"),
+            bigquery.SchemaField("confidence",              "FLOAT64"),
+            bigquery.SchemaField("synthesis_json",          "STRING"),
+            bigquery.SchemaField("raw_decision_json",       "STRING"),
+            bigquery.SchemaField("created_at",              "TIMESTAMP", mode="REQUIRED"),
+        ]
+        table = bigquery.Table(_TRIAGE_CACHE_TABLE, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY, field="created_at")
+        table.description = (
+            "Order Triage agent-synthesis cache. One row per /v23/triage run; "
+            "the latest row per order_id is replayed so re-evaluating an order "
+            "returns the stored, consistent result without re-running the "
+            "5-agent flow. Written by POST /v23/triage, read on cache-hit + "
+            "by GET /v23/triage/{order_id}/cached.")
+        client.create_table(table, exists_ok=True)
+        _triage_cache_table_ready = True
+        log.info("Triage cache table ready: %s", _TRIAGE_CACHE_TABLE)
+    except Exception as exc:
+        log.warning("Triage cache table ensure failed: %s", exc)
+
+
+def _read_triage_cache(order_id: str) -> dict | None:
+    """Return cached {order_id, session_id, synthesis, raw_decision, cached_at}
+    for order_id, or None. Checks the in-process layer first, then BigQuery
+    (latest row by created_at)."""
+    mem = _TRIAGE_MEM_CACHE.get(order_id)
+    if mem:
+        return mem
+    _ensure_triage_cache_table()
+    try:
+        client = _bq_telemetry()
+        rows = list(client.query(
+            f"""
+            SELECT session_id, synthesis_json, raw_decision_json,
+                   CAST(created_at AS STRING) AS created_at
+            FROM `{_TRIAGE_CACHE_TABLE}`
+            WHERE order_id = @oid
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("oid", "STRING", order_id)]),
+        ).result())
+    except Exception as exc:
+        log.warning("Triage cache read failed for %s: %s", order_id, exc)
+        return None
+    if not rows:
+        return None
+    r = dict(rows[0])
+    try:
+        synthesis = _json.loads(r.get("synthesis_json") or "{}")
+        raw_decision = _json.loads(r.get("raw_decision_json") or "{}")
+    except Exception:
+        return None
+    entry = {
+        "order_id":     order_id,
+        "session_id":   r.get("session_id") or "",
+        "synthesis":    synthesis,
+        "raw_decision": raw_decision,
+        "cached_at":    r.get("created_at"),
+    }
+    _TRIAGE_MEM_CACHE[order_id] = entry
+    return entry
+
+
+def _write_triage_cache(order_id: str, backend: dict, session_id: str,
+                        synthesis: dict, raw_decision: dict) -> None:
+    """Persist a triage result to the in-process cache (L1) + BigQuery (L2)."""
+    now = datetime.now(timezone.utc)
+    _TRIAGE_MEM_CACHE[order_id] = {
+        "order_id":     order_id,
+        "session_id":   session_id,
+        "synthesis":    synthesis,
+        "raw_decision": raw_decision,
+        "cached_at":    now.isoformat(),
+    }
+    _ensure_triage_cache_table()
+    try:
+        rec = (synthesis.get("rec") or {}) if isinstance(synthesis, dict) else {}
+        row = {
+            "order_id":                order_id,
+            "sold_to":                 backend.get("sold_to"),
+            "material_number":         backend.get("material_number"),
+            "ordered_quantity_cases":  backend.get("ordered_quantity_cases"),
+            "requested_delivery_date": backend.get("requested_delivery_date"),
+            "session_id":              session_id,
+            "recommendation_action":   rec.get("action"),
+            "confidence":              rec.get("confidence"),
+            "synthesis_json":          _json.dumps(synthesis),
+            "raw_decision_json":       _json.dumps(raw_decision, default=str),
+            "created_at":              now.isoformat(),
+        }
+        errors = _bq_telemetry().insert_rows_json(_TRIAGE_CACHE_TABLE, [row])
+        if errors:
+            log.error("Triage cache insert errors: %s", errors)
+        else:
+            log.info("Triage cached: order=%s session=%s", order_id, session_id)
+    except Exception as exc:
+        log.warning("Triage cache write failed for %s: %s", order_id, exc)
+
+
 @app.exception_handler(RequestValidationError)
 async def _log_validation_error(request: Request, exc: RequestValidationError):
     body = await request.body()
@@ -502,8 +633,26 @@ def data_health() -> dict:
     return get_data_health()
 
 
+@app.get("/v23/triage/{order_id}/cached")
+def v23_triage_cached(order_id: str) -> dict:
+    """Cache-only peek: return the stored synthesis for order_id if a prior
+    /v23/triage run was persisted, else {cached: false}. Lets the UI replay a
+    result instantly on order-select without re-running the 5-agent flow."""
+    cached = _read_triage_cache(order_id)
+    if not cached:
+        return {"order_id": order_id, "cached": False}
+    return {
+        "order_id":     order_id,
+        "cached":       True,
+        "session_id":   cached["session_id"],
+        "synthesis":    cached["synthesis"],
+        "raw_decision": cached["raw_decision"],
+        "cached_at":    cached.get("cached_at"),
+    }
+
+
 @app.post("/v23/triage/{order_id}")
-async def v23_triage(order_id: str, backend: dict) -> dict:
+async def v23_triage(order_id: str, backend: dict, force: bool = False) -> dict:
     """Run the full 5-agent flow for one v2.3 UI order, return the
     result in the v2.3 SYNTHESIS[order_id] shape.
 
@@ -513,7 +662,12 @@ async def v23_triage(order_id: str, backend: dict) -> dict:
     payload back so we can resolve the CustomerOrderEvent without
     re-querying the candidate shortlist.
 
-    Response: { order_id, synthesis: <v2.3 SYNTHESIS entry>, session_id }
+    Caching: the synthesized result is persisted to tiger_decisions.
+    fct_triage_cache. Unless `?force=true`, a cached result for this
+    order_id is returned immediately (no agent run) so re-evaluating is
+    instant + consistent. `force=true` re-runs the agents and overwrites.
+
+    Response: { order_id, synthesis, session_id, raw_decision, cached }
     """
     # Validate the round-tripped payload
     required = ("sold_to", "material_number")
@@ -522,6 +676,21 @@ async def v23_triage(order_id: str, backend: dict) -> dict:
         raise HTTPException(
             status_code=422,
             detail=f"_backend payload missing required keys: {missing}")
+
+    # Cache hit → replay the stored synthesis, skip the 5-agent run.
+    if not force:
+        cached = _read_triage_cache(order_id)
+        if cached:
+            log.info("Triage cache HIT order=%s session=%s",
+                     order_id, cached.get("session_id"))
+            return {
+                "order_id":     order_id,
+                "session_id":   cached["session_id"],
+                "synthesis":    cached["synthesis"],
+                "raw_decision": cached["raw_decision"],
+                "cached":       True,
+                "cached_at":    cached.get("cached_at"),
+            }
 
     # Resolve to a CustomerOrderEvent via the demo trigger path
     try:
@@ -563,13 +732,18 @@ async def v23_triage(order_id: str, backend: dict) -> dict:
             status_code=500,
             detail="Session completed but produced no decision")
 
+    synthesis = decision_to_v23_synthesis(decision)
+    # Persist so re-evaluating this order replays the stored result.
+    _write_triage_cache(order_id, backend, session_id, synthesis, decision)
+
     return {
         "order_id": order_id,
         "session_id": session_id,
-        "synthesis": decision_to_v23_synthesis(decision),
+        "synthesis": synthesis,
         # Bonus — also return the unmapped v2.1 contract for clients that
         # want it. Frontend can ignore.
         "raw_decision": decision,
+        "cached": False,
     }
 
 

@@ -156,14 +156,30 @@ export async function fetchOrders(limit?: number): Promise<Order[]> {
 
 // ─── /v23/triage/{order_id} ──────────────────────────────────────────────────
 
+/** Run (or replay cached) the 5-agent triage for an order. The backend
+ *  returns a cached result unless `force` is true; `force` re-runs the
+ *  agents and overwrites the cache. The result carries `cached: boolean`. */
 export async function triageOrder(
   orderId: string,
   backend: BackendPayload,
   signal?: AbortSignal,
+  force = false,
 ): Promise<TriageResponse> {
+  const qs = force ? '?force=true' : '';
   return request<TriageResponse>(
-    `/v23/triage/${encodeURIComponent(orderId)}`,
+    `/v23/triage/${encodeURIComponent(orderId)}${qs}`,
     { method: 'POST', body: backend, signal },
+  );
+}
+
+/** Cache-only peek — returns the stored synthesis for an order if a prior
+ *  run was persisted, else { cached: false }. Used to replay results on
+ *  order-select without re-running the agents. */
+export async function getTriageCached(
+  orderId: string,
+): Promise<{ cached: boolean } & Partial<TriageResponse>> {
+  return request<{ cached: boolean } & Partial<TriageResponse>>(
+    `/v23/triage/${encodeURIComponent(orderId)}/cached`,
   );
 }
 

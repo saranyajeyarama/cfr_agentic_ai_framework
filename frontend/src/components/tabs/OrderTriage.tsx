@@ -31,11 +31,11 @@ import {
 } from '../../lib/constants';
 import { Pill, Blinker } from '../primitives';
 import {
-  fetchOrders, triageOrder, approveSession, rejectSession,
+  fetchOrders, triageOrder, getTriageCached, approveSession, rejectSession, simulateFulfillment,
   invalidateDashboard,
   AbortError, ValidationError, BackendError, NetworkError,
 } from '../../lib/api';
-import type { Order, TriageResponse, AgentKey } from '../../lib/types';
+import type { Order, TriageResponse, AgentKey, SimulateResponse } from '../../lib/types';
 
 // =============================================================================
 // Types
@@ -508,6 +508,294 @@ function ErrorPanel({
 }
 
 // =============================================================================
+// Rich per-agent detail (mockup: tool-call terminal + structured field rows)
+// =============================================================================
+
+type PlantInv = { ending: number; committed: number; available: number };
+
+function humanizeKey(k: string): string {
+  return k
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .replace(/\bUsd\b/g, 'USD').replace(/\bAtp\b/g, 'ATP')
+    .replace(/\bOtif\b/g, 'OTIF').replace(/\bDc\b/g, 'DC')
+    .replace(/\bPos\b/g, 'POS').replace(/\bFg\b/g, 'FG')
+    .replace(/\bOhi\b/g, 'OHI').replace(/\bAcv\b/g, 'ACV')
+    .replace(/\bWmape\b/gi, 'WMAPE').replace(/\bMabd\b/g, 'MABD');
+}
+
+function fmtSignalValue(v: unknown): string {
+  if (v === null || v === undefined || v === '') return '—';
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+  if (typeof v === 'number') return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
+  return String(v);
+}
+
+/** A labeled value row. */
+function detailRow(label: string, value: unknown, key: string) {
+  return (
+    <div key={key} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: '4px 0', fontSize: 12 }}>
+      <span style={{ color: C.muted }}>{label}</span>
+      <span style={{ color: C.charcoal, fontWeight: 600, fontFamily: MONO, textAlign: 'right', maxWidth: '60%' }}>
+        {fmtSignalValue(value)}
+      </span>
+    </div>
+  );
+}
+
+/** Generic structured renderer over a specialist's full_signal. Handles the
+ *  Gemini-shaped nesting without assuming exact field names: scalars become
+ *  rows, nested objects become labeled sub-sections, string arrays become
+ *  bullet lists, object arrays become compact rows. */
+function renderSignalDetail(full: Record<string, unknown>, accent: string) {
+  const entries = Object.entries(full).filter(([, v]) => v !== null && v !== undefined && v !== '');
+  if (entries.length === 0) {
+    return <div style={{ fontSize: 12, color: C.muted, fontStyle: 'italic' }}>No structured detail returned for this agent.</div>;
+  }
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {entries.map(([k, v]) => {
+        // string[] → bullets (e.g. classification_basis)
+        if (Array.isArray(v) && v.every((x) => typeof x === 'string')) {
+          return (
+            <div key={k}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: accent, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>{humanizeKey(k)}</div>
+              {(v as string[]).map((s, i) => (
+                <div key={i} style={{ display: 'flex', gap: 8, fontSize: 12, color: C.charcoal, marginBottom: 4 }}>
+                  <span style={{ color: accent, flexShrink: 0 }}>•</span>{s}
+                </div>
+              ))}
+            </div>
+          );
+        }
+        // object[] → compact rows (e.g. top_chargeback_types, evidence)
+        if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
+          return (
+            <div key={k}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: accent, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>{humanizeKey(k)}</div>
+              {(v as Record<string, unknown>[]).map((o, i) => (
+                <div key={i} style={{ fontSize: 11, color: C.charcoal, marginBottom: 3 }}>
+                  {Object.entries(o).map(([ok, ov]) => `${humanizeKey(ok)}: ${fmtSignalValue(ov)}`).join(' · ')}
+                </div>
+              ))}
+            </div>
+          );
+        }
+        // nested object → labeled sub-section of scalar rows
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          const obj = v as Record<string, unknown>;
+          const scalarRows = Object.entries(obj).filter(([, ov]) => ov === null || typeof ov !== 'object');
+          const longText = Object.entries(obj).find(([ok]) => /summary|rationale|note|comment/i.test(ok));
+          return (
+            <div key={k} style={{ borderTop: `1px solid ${C.border}`, paddingTop: 8 }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: accent, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>{humanizeKey(k)}</div>
+              {scalarRows
+                .filter(([ok]) => !/summary|rationale|note|comment|evidence/i.test(ok))
+                .map(([ok, ov]) => detailRow(humanizeKey(ok), ov, `${k}-${ok}`))}
+              {longText && (
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.5 }}>{String(longText[1])}</div>
+              )}
+            </div>
+          );
+        }
+        // scalar
+        return detailRow(humanizeKey(k), v, k);
+      })}
+    </div>
+  );
+}
+
+/** Rich agent panel: header + tool-call terminal (from evidence) + structured
+ *  detail (from full_signal) + confidence bar. Replaces the simple card in the
+ *  result view. */
+function AgentDetailPanel({
+  agentKey, signal,
+}: {
+  agentKey: AgentKey;
+  signal: TriageResponse['synthesis']['signals'][AgentKey] | undefined;
+  key?: string | number;
+}) {
+  const meta = AGENT_LABELS[agentKey];
+  const disp = signal?.disposition ?? 'CAUTION';
+  const conf = signal?.confidence ?? 0;
+  const full = (signal?.full_signal ?? {}) as Record<string, unknown>;
+  const evidence = signal?.evidence ?? [];
+
+  return (
+    <div style={{
+      background: '#fff', border: `1px solid ${C.border}`, borderRadius: 8,
+      borderTop: `3px solid ${meta.color}`, display: 'flex', flexDirection: 'column',
+    }}>
+      {/* header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px 0' }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: meta.color }}>{meta.label}</div>
+        <Pill label={disp} color={dispColor(disp)} size={10} />
+      </div>
+
+      {/* tool-call terminal — lines derived from evidence */}
+      <div style={{ margin: '10px 16px 0', background: '#161922', borderRadius: 6, padding: '8px 10px', fontFamily: MONO, fontSize: 10.5, lineHeight: 1.7, color: '#9aa4b2', maxHeight: 92, overflow: 'auto' }}>
+        {evidence.length > 0
+          ? evidence.slice(0, 4).map((e, i) => (
+              <div key={i} style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                <span style={{ color: meta.color }}>▸ {e.tool || 'tool_call'}</span>
+                {e.finding ? <span style={{ color: '#9aa4b2' }}> → {e.finding}</span> : null}
+              </div>
+            ))
+          : <div style={{ color: '#5b6472' }}>▸ tool calls not reported by agent</div>}
+        <div style={{ color: dispColor(disp), marginTop: 2 }}>
+          ◆ {disp}{signal?.summary ? ` — ${signal.summary}` : ''}
+        </div>
+      </div>
+
+      {/* structured detail */}
+      <div style={{ padding: '12px 16px 4px' }}>
+        {renderSignalDetail(full, meta.color)}
+      </div>
+
+      {/* confidence bar */}
+      <div style={{ padding: '8px 16px 14px', marginTop: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 10, color: C.muted, flexShrink: 0, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Confidence</span>
+          <div style={{ flex: 1, height: 4, background: C.border, borderRadius: 2 }}>
+            <div style={{ width: `${Math.round(conf * 100)}%`, height: '100%', background: meta.color, borderRadius: 2 }} />
+          </div>
+          <span style={{ color: meta.color, fontWeight: 700, fontSize: 11, fontFamily: MONO }}>{Math.round(conf * 100)}%</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Real-Time Inventory Snapshot — per-DC table + committed-vs-ATP panel,
+ *  sourced from a /fulfillment/simulate run for the order. */
+function InventorySnapshot({
+  order, sim, status,
+}: {
+  order: Order;
+  sim: SimulateResponse | null;
+  status: 'loading' | 'done' | 'error' | 'idle';
+}) {
+  const orderedQty = order.qty;
+  const meta = (sim?.meta ?? {}) as Record<string, unknown>;
+  const inv = (meta.inventory_by_plant as Record<string, PlantInv> | undefined) ?? {};
+  const freight = (meta.freight_costs_used as Record<string, number> | undefined) ?? {};
+  const originPlant = (meta.origin_plant as string | undefined) ?? '';
+  const rec = sim?.scenarios?.find((s) => s.isRecommended) ?? sim?.scenarios?.[0];
+  const split: Record<string, number> = {};
+  for (const p of (rec?.plantDetails ?? []) as Array<{ code: string; qty: number }>) {
+    split[p.code] = (split[p.code] ?? 0) + (Number(p.qty) || 0);
+  }
+  const codes = Object.keys(inv).sort((a, b) => (inv[b].available || 0) - (inv[a].available || 0));
+  const totalAvail = codes.reduce((s, c) => s + (inv[c].available || 0), 0);
+  const totalEnding = codes.reduce((s, c) => s + (inv[c].ending || 0), 0);
+  const totalCommitted = codes.reduce((s, c) => s + (inv[c].committed || 0), 0);
+  const coveragePct = orderedQty > 0 ? Math.min(100, Math.round((totalAvail / orderedQty) * 100)) : 0;
+  const shortfall = Math.max(0, orderedQty - totalAvail);
+
+  return (
+    <div style={{ background: '#fff', border: `1px solid ${C.teal}`, borderRadius: 10, overflow: 'hidden' }}>
+      <div style={{ padding: '14px 18px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: `1px solid ${C.border}` }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.charcoal }}>Real-Time Inventory Snapshot — {order.sku}</div>
+          <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>Network availability vs. order of {orderedQty.toLocaleString()} cs</div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div style={{ fontSize: 10, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Network Coverage</div>
+          <div style={{ fontSize: 22, fontWeight: 900, color: coveragePct >= 100 ? C.green : C.orange, fontFamily: MONO }}>{coveragePct}%</div>
+          <div style={{ fontSize: 10, color: C.muted }}>{totalAvail.toLocaleString()} cs network-wide</div>
+        </div>
+      </div>
+
+      {status === 'loading' && (
+        <div style={{ padding: 24, textAlign: 'center', color: C.muted, fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          <Loader2 size={14} className="animate-spin" /> Pulling live network inventory…
+        </div>
+      )}
+      {status === 'error' && (
+        <div style={{ padding: 16, fontSize: 12, color: C.muted }}>Inventory snapshot unavailable for this order.</div>
+      )}
+
+      {status === 'done' && codes.length > 0 && (
+        <>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+            <thead>
+              <tr style={{ color: C.muted, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                <th style={{ textAlign: 'left', padding: '8px 18px', fontWeight: 700 }}>DC</th>
+                <th style={{ textAlign: 'right', padding: '8px 6px', fontWeight: 700 }}>Available</th>
+                <th style={{ textAlign: 'left', padding: '8px 12px', fontWeight: 700 }}>Coverage vs order</th>
+                <th style={{ textAlign: 'right', padding: '8px 6px', fontWeight: 700 }}>Allocated</th>
+                <th style={{ textAlign: 'right', padding: '8px 18px', fontWeight: 700 }}>After Fill</th>
+              </tr>
+            </thead>
+            <tbody>
+              {codes.map((code) => {
+                const a = inv[code];
+                const allocated = split[code] ?? 0;
+                const afterFill = (a.available || 0) - allocated;
+                const cov = orderedQty > 0 ? Math.min(100, ((a.available || 0) / orderedQty) * 100) : 0;
+                const ok = (a.available || 0) >= orderedQty;
+                const barCol = ok ? C.green : cov >= 40 ? C.orange : C.red;
+                return (
+                  <tr key={code} style={{ borderTop: `1px solid ${C.border}`, background: allocated > 0 ? '#fff7f9' : '#fff' }}>
+                    <td style={{ padding: '10px 18px' }}>
+                      <div style={{ fontWeight: 700, color: code === originPlant ? C.blue : C.charcoal, fontFamily: MONO }}>{code}</div>
+                      <div style={{ fontSize: 10, color: C.muted }}>
+                        {code === originPlant ? 'Primary DC' : 'Alternate'}{freight[code] != null ? ` · $${freight[code]}/cs` : ''}
+                      </div>
+                    </td>
+                    <td style={{ padding: '10px 6px', textAlign: 'right', fontFamily: MONO }}>{(a.available || 0).toLocaleString()} cs</td>
+                    <td style={{ padding: '10px 12px' }}>
+                      <div style={{ height: 6, background: C.border, borderRadius: 3, overflow: 'hidden' }}>
+                        <div style={{ width: `${cov}%`, height: '100%', background: barCol, borderRadius: 3 }} />
+                      </div>
+                      <div style={{ fontSize: 10, color: ok ? C.green : C.red, marginTop: 2, fontWeight: 600 }}>{ok ? 'OK' : 'BELOW SS'} · {Math.round(cov)}%</div>
+                    </td>
+                    <td style={{ padding: '10px 6px', textAlign: 'right', fontFamily: MONO }}>
+                      {allocated > 0 ? <span style={{ color: C.red, fontWeight: 700 }}>{allocated.toLocaleString()} cs</span> : <span style={{ color: C.border }}>—</span>}
+                    </td>
+                    <td style={{ padding: '10px 18px', textAlign: 'right', fontFamily: MONO, color: afterFill <= 0 ? C.orange : C.charcoal }}>
+                      {afterFill <= 0 ? 'Depleted' : `${afterFill.toLocaleString()} cs`}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {/* Committed vs Available to Promise */}
+          <div style={{ margin: 18, borderRadius: 8, border: `1px solid ${shortfall > 0 ? C.red : C.border}`, padding: 16, background: C.off }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: C.charcoal, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 12 }}>
+              Committed vs Available to Promise — Network
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+              {([
+                ['On Hand (Total)', `${totalEnding.toLocaleString()} cs`, C.charcoal],
+                ['Committed', `${totalCommitted.toLocaleString()} cs`, C.orange],
+                ['Avail. to Promise', `${totalAvail.toLocaleString()} cs`, C.green],
+                ['Order Requires', `${orderedQty.toLocaleString()} cs`, C.red],
+              ] as [string, string, string][]).map(([l, v, col]) => (
+                <div key={l}>
+                  <div style={{ fontSize: 10, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{l}</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, fontFamily: MONO, color: col, marginTop: 3 }}>{v}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 12, fontSize: 12, fontWeight: 600, color: shortfall > 0 ? C.red : C.green }}>
+              {shortfall > 0
+                ? `⚠ ATP shortfall of ${shortfall.toLocaleString()} cs — partial fulfillment or split sourcing required`
+                : '✓ Network ATP fully covers the order'}
+              {rec && (rec.plantDetails?.length ?? 0) > 1 && (
+                <span style={{ color: C.green, fontWeight: 600 }}> · Network can cover full order via split sourcing</span>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
 // Main component
 // =============================================================================
 
@@ -536,9 +824,23 @@ export function OrderTriage({
   const [decisionByOrder, setDecisionByOrder] = useState<Record<string, DecisionKind>>({});
   const [rejectModalOpen, setRejectModalOpen] = useState<boolean>(false);
 
+  // Real-Time Inventory Snapshot — a fast /fulfillment/simulate run for the
+  // selected order (per-DC ATP). Keyed by order id so it doesn't refire.
+  const [invSim, setInvSim] = useState<{
+    orderId: string;
+    status: 'loading' | 'done' | 'error';
+    sim: SimulateResponse | null;
+  } | null>(null);
+
+  // True when the displayed result was replayed from the BigQuery cache
+  // (not a fresh agent run this session).
+  const [fromCache, setFromCache] = useState<boolean>(false);
+
   const abortRef    = useRef<AbortController | null>(null);
   const timerRef    = useRef<number | null>(null);
   const startTsRef  = useRef<number>(0);
+  // Guards async cache-peeks against rapid order switching.
+  const latestSelectRef = useRef<string | null>(null);
 
   // Load orders
   const loadOrders = useCallback(() => {
@@ -566,21 +868,66 @@ export function OrderTriage({
     // Hard reset triage state when picking a new order.
     abortRef.current?.abort();
     if (timerRef.current != null) clearInterval(timerRef.current);
+    latestSelectRef.current = o.id;
     setSelectedId(o.id);
     setPhase('idle');
     setResult(null);
     setError(null);
     setElapsedMs(0);
     setRejectModalOpen(false);
+    setInvSim(null);
+    setFromCache(false);
+    // Replay a stored result instantly if this order was evaluated before.
+    void peekCache(o);
   }
 
-  async function runTriage(order: Order) {
+  /** Cache-only peek on select — replay a stored synthesis without re-running
+   *  the 5-agent flow. Guarded so a slow peek for a previously-selected order
+   *  doesn't clobber the current selection. */
+  async function peekCache(o: Order) {
+    try {
+      const c = await getTriageCached(o.id);
+      if (latestSelectRef.current !== o.id) return;        // selection moved on
+      if (c.cached && c.synthesis) {
+        setResult({
+          order_id: o.id,
+          session_id: c.session_id ?? '',
+          synthesis: c.synthesis,
+        } as TriageResponse);
+        setFromCache(true);
+        setPhase('result');
+        void loadInventorySnapshot(o);
+      }
+    } catch {
+      /* no cache / backend down — leave the Evaluate CTA in place */
+    }
+  }
+
+  /** Fire a fast /fulfillment/simulate for the Real-Time Inventory Snapshot.
+   *  Independent of the long triage call — populates per-DC ATP. */
+  async function loadInventorySnapshot(order: Order) {
+    setInvSim({ orderId: order.id, status: 'loading', sim: null });
+    try {
+      const sim = await simulateFulfillment({
+        sold_to: order._backend.sold_to,
+        material_number: order._backend.material_number,
+        ordered_quantity_cases: order._backend.ordered_quantity_cases,
+        requested_delivery_date: order._backend.requested_delivery_date,
+      });
+      setInvSim({ orderId: order.id, status: 'done', sim });
+    } catch {
+      setInvSim({ orderId: order.id, status: 'error', sim: null });
+    }
+  }
+
+  async function runTriage(order: Order, force = false) {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     startTsRef.current = Date.now();
     setElapsedMs(0);
     setError(null);
     setResult(null);
+    setFromCache(false);
     setPhase('evaluating');
 
     // Wall-clock tick
@@ -603,11 +950,14 @@ export function OrderTriage({
     }, TIMEOUT_MS);
 
     try {
-      const r = await triageOrder(order.id, order._backend, ctrl.signal);
+      const r = await triageOrder(order.id, order._backend, ctrl.signal, force);
       window.clearTimeout(timeoutHandle);
       if (timerRef.current != null) clearInterval(timerRef.current);
       setResult(r);
+      setFromCache(Boolean((r as { cached?: boolean }).cached));
       setPhase('result');
+      // Pull the per-DC inventory snapshot once the synthesis is in.
+      void loadInventorySnapshot(order);
     } catch (e) {
       window.clearTimeout(timeoutHandle);
       if (timerRef.current != null) clearInterval(timerRef.current);
@@ -838,14 +1188,49 @@ export function OrderTriage({
             {/* RESULT or DECIDED — render the synthesis */}
             {(phase === 'result' || phase === 'decided') && result && (
               <>
+                {/* Cache banner — replayed stored result, with force re-run */}
+                {fromCache && phase === 'result' && (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    gap: 12, background: '#eef6ff', border: `1px solid ${C.blue}33`,
+                    borderRadius: 8, padding: '10px 14px',
+                  }}>
+                    <div style={{ fontSize: 12, color: C.charcoal }}>
+                      <strong style={{ color: C.blue }}>Stored result</strong> — replayed from the
+                      decision cache (not re-run). Consistent across reloads.
+                    </div>
+                    <button onClick={() => runTriage(selectedOrder, true)} style={{
+                      padding: '6px 14px', background: '#fff', color: C.red,
+                      border: `1px solid ${C.red}`, borderRadius: 6, fontSize: 12,
+                      fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit',
+                      display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
+                    }}>
+                      <RefreshCw size={13} /> Re-evaluate
+                    </button>
+                  </div>
+                )}
+
+                {/* 1 — Real-Time Inventory Snapshot (metrics first) */}
+                <InventorySnapshot
+                  order={selectedOrder}
+                  sim={invSim && invSim.orderId === selectedOrder.id ? invSim.sim : null}
+                  status={invSim && invSim.orderId === selectedOrder.id ? invSim.status : 'loading'} />
+
+                {/* 2 — Each agent's detailed decision */}
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 4 }}>
+                  Specialist Agent Decisions
+                </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  {AGENT_KEYS.map(k => renderAgentCard(k, result.synthesis.signals[k] ?? null, false))}
+                  {AGENT_KEYS.map(k => (
+                    <AgentDetailPanel key={k} agentKey={k} signal={result.synthesis.signals[k]} />
+                  ))}
                 </div>
 
                 {result.synthesis.conflicts.length > 0 && (
                   <ConflictBanner conflict={result.synthesis.conflicts[0]} />
                 )}
 
+                {/* 3 — Synthesized recommendation */}
                 <RecommendationCard
                   syn={result.synthesis}
                   decided={phase === 'decided'}

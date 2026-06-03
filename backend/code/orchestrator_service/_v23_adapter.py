@@ -249,12 +249,35 @@ def _specialist_to_v23_signal(agent_key: str,
     evidence_in = signal_doc.get("evidence") or []
     evidence_out = [
         {
-            "tool": e.get("tool_called", ""),
-            "finding": e.get("key_finding", ""),
-            "point": e.get("data_point", ""),
+            "tool": e.get("tool_called", "") if isinstance(e, dict) else "",
+            "finding": e.get("key_finding", "") if isinstance(e, dict) else str(e),
+            "point": e.get("data_point", "") if isinstance(e, dict) else "",
         }
         for e in evidence_in
     ]
+
+    # full_signal: surface the agent's structured detail for the v2.3 UI's
+    # per-agent panels (Supply Planning ATP/production order, Demand forecast
+    # position, Transportation lane/carrier/chargeback, Retail POS takeaway).
+    #
+    # Earlier this was `signal_doc.get("signal", {})`, but the specialists put
+    # their detail at the TOP LEVEL of the signal doc (fg_position,
+    # production_order_risk, chargeback_exposure, ...), not under a nested
+    # "signal" key — so the old code returned {} and the panels were blank.
+    #
+    # We now merge: start from the nested "signal" payload if present, then
+    # layer in every top-level key that isn't part of the response envelope.
+    _ENVELOPE = {
+        "disposition", "confidence", "hard_block", "evidence",
+        "reasoning_summary", "agent",
+    }
+    nested = signal_doc.get("signal")
+    full_signal: dict[str, Any] = dict(nested) if isinstance(nested, dict) else {}
+    for k, v in signal_doc.items():
+        if k in _ENVELOPE or k == "signal":
+            continue
+        full_signal[k] = v
+
     return {
         "disposition": signal_doc.get("disposition", "CAUTION"),
         # Agents sometimes emit "HIGH" / "Medium" / null instead of a float.
@@ -263,7 +286,7 @@ def _specialist_to_v23_signal(agent_key: str,
         "hard_block": bool(signal_doc.get("hard_block", False)),
         "summary": signal_doc.get("reasoning_summary", ""),
         "evidence": evidence_out,
-        "full_signal": signal_doc.get("signal", {}) or {},
+        "full_signal": full_signal,
     }
 
 
