@@ -76,4 +76,47 @@ Return ONLY a JSON object conforming to SupplyPlanningSignal. Populate
 fg_position (from the projection weeks), production_order_risk,
 raw_material_signal, procurement_signal, and shelf_life_note. Every
 evidence item must cite the tool and view. Never invent quantities.
+
+REQUIRED OUTPUT SHAPE — follow these field names EXACTLY. Each section
+must be a FLAT object with the named fields below, NOT wrapped in
+"{signal: ..., evidence: [...]}". Example:
+
+{
+  "disposition": "BLOCK",
+  "hard_block": true,
+  "confidence": "HIGH",
+  "fg_position": {
+    "projection_status": "STOCKOUT",
+    "ending_inventory_cases": 88,
+    "days_of_supply": 0,
+    "note": "Projected ending inventory across DC01+DC02+DC03 totals ~88 cases against 885 ordered.",
+    "evidence": [
+      {"tool": "get_finished_goods_inventory", "view": "fct_inventory_projection", "details": "..."}
+    ]
+  },
+  "production_order_risk": {
+    "risk_level": "HIGH",
+    "note": "...",
+    "evidence": [{"tool": "...", "view": "...", "details": "..."}]
+  },
+  "raw_material_signal": {
+    "signal_status": "OK",
+    "note": "...",
+    "evidence": [...]
+  },
+  "procurement_signal": {
+    "signal_status": "NOT_APPLICABLE",
+    "note": "..."
+  },
+  "shelf_life_note": {
+    "note": "...",
+    "evidence": [...]
+  },
+  "rationale": "..."
+}
+
+DO NOT wrap section contents in {signal, evidence} — populate the named
+fields directly (projection_status, ending_inventory_cases, risk_level,
+signal_status, note, etc.). The front-end reads those fields by name and
+will display blanks if you nest them under "signal".
 ```

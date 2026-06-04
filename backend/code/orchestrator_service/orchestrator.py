@@ -99,6 +99,42 @@ def _avg_specialist_confidence(d: dict) -> float:
     return round(sum(confs) / len(confs), 2) if confs else 0.0
 
 
+def _unwrap_signal_sections(signals: dict) -> None:
+    """Defensive unwrap for the {signal, evidence} drift pattern.
+
+    Some agents (notably supply_planning) wrap each section's contents
+    inside a nested 'signal' key like:
+       fg_position: {signal: {projection_status: ..., note: ...}, evidence: [...]}
+    instead of the schema-required flat shape:
+       fg_position: {projection_status: ..., note: ..., evidence: [...]}
+
+    This helper promotes the 'signal' sub-dict's keys up one level so the
+    front-end sees the expected flat fields. Idempotent — safe to call on
+    already-flat structures.
+    """
+    section_names = (
+        "fg_position", "production_order_risk", "raw_material_signal",
+        "procurement_signal", "shelf_life_note",
+    )
+    for agent_name, agent_signal in (signals or {}).items():
+        if not isinstance(agent_signal, dict):
+            continue
+        for sec in section_names:
+            obj = agent_signal.get(sec)
+            if not isinstance(obj, dict):
+                continue
+            inner = obj.get("signal")
+            if isinstance(inner, dict):
+                # Promote inner keys to top level; keep evidence at top level.
+                evidence = obj.get("evidence")
+                merged = dict(inner)
+                if evidence is not None and "evidence" not in merged:
+                    merged["evidence"] = evidence
+                agent_signal[sec] = merged
+                print(f"[DEBUG-NORM] unwrapped {agent_name}.{sec}.signal — "
+                      f"promoted keys: {list(inner.keys())}")
+
+
 def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
     """Reshape Gemini's frequent flat synthesizer output into the nested
     CustomerSupplyDecision shape the front-end expects. Mutates in place.
@@ -107,7 +143,10 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
       recommendation : "REJECT"  ->  {action: "REJECT", ...}
       reasoning_chain: ["...","..."]  ->  {key_trade_offs: [...], ...}
       confidence     : "HIGH"  ->  0.85
+      fg_position    : {signal: {...}, evidence: [...]}  ->  flat fields
     """
+    # ───────── BUG-FIX-PHASE1: unwrap {signal, evidence} drift ─────────
+    _unwrap_signal_sections(d.get("specialist_signals") or {})
     # recommendation: flat string -> wrapped dict.
     # The schema's valid actions are ACCEPT / REJECT / PARTIAL_FULFILL /
     # DEFER. Agents sometimes emit MODIFY (an older verb) — map it to
@@ -141,10 +180,23 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
                    "fulfill_qty_cs" in rec, rec.get("fulfill_qty_cs"))
         rec["confidence"] = _coerce_confidence(rec.get("confidence")) or _avg_specialist_confidence(d)
         # Replace missing OR explicitly-null values, not just absent keys.
+        # ───────── BUG-FIX-PHASE1: disposition → action mapping ─────────
+        # Agents sometimes emit "disposition" instead of "action" (schema
+        # field-name drift). Treat disposition as a fallback for action.
         if rec.get("action") not in {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}:
-            raw = (rec.get("action") or "").strip().upper()
+            raw = (rec.get("action") or rec.get("disposition") or "").strip().upper()
+            print(f"[DEBUG-NORM] customer_supply.action drift detected — "
+                  f"action={rec.get('action')!r}, disposition={rec.get('disposition')!r}, "
+                  f"resolved raw={raw!r}")
             rec["raw_action"] = raw or rec.get("raw_action")
-            rec["action"] = "PARTIAL_FULFILL" if raw == "MODIFY" else "ACCEPT"
+            canonical = {"ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"}
+            if raw == "MODIFY":
+                rec["action"] = "PARTIAL_FULFILL"
+            elif raw in canonical:
+                rec["action"] = raw
+            else:
+                rec["action"] = "ACCEPT"
+            print(f"[DEBUG-NORM] final action={rec['action']}")
         if rec.get("fulfill_qty_cs") is None:
             order_qty = float(getattr(order_event, "ordered_quantity_cases", 0) or 0)
             rec["fulfill_qty_cs"] = 0 if rec["action"] in {"REJECT", "DEFER"} else order_qty
@@ -160,11 +212,32 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
                                "confidence": _avg_specialist_confidence(d), "expected_outcome": ""}
 
     # reasoning_chain: list of strings -> nested dict
+    # ───────── BUG-FIX-PHASE1: skip meta-statements when flattening ─────────
+    # When the agent returns a list, the FIRST item is often a meta-statement
+    # like "The recommendation is to REJECT..." which clutters key_trade_offs
+    # in the UI. Detect and extract it to what_would_change_the_decision so
+    # the trade-offs panel shows actual trade-offs, not the headline action.
     rc = d.get("reasoning_chain")
     if isinstance(rc, list):
+        items = [str(x).strip() for x in rc if str(x).strip()]
+        meta_phrases = (
+            "the recommendation is",
+            "recommendation is to",
+            "the decision is to",
+            "this order is",
+        )
+        meta_item = ""
+        trade_offs = items
+        if items:
+            first_lower = items[0].lower()
+            if any(p in first_lower for p in meta_phrases):
+                meta_item = items[0]
+                trade_offs = items[1:]
+                print(f"[DEBUG-NORM] reasoning_chain meta-statement extracted: "
+                      f"{meta_item[:120]}")
         d["reasoning_chain"] = {
-            "key_trade_offs": [str(x) for x in rc],
-            "what_would_change_the_decision": "",
+            "key_trade_offs": trade_offs,
+            "what_would_change_the_decision": meta_item,
             "evidence_by_agent": {},
         }
     elif isinstance(rc, dict):
@@ -377,6 +450,14 @@ async def _invoke_agent(
                     _save_raw_response(agent_name, adk_session_id, text, response_json)
                 except Exception as _save_err:
                     _l.warning("Raw response save failed: %s", _save_err)
+                # ───── BUG-FIX-PHASE1: unwrap {signal, evidence} drift ─────
+                # Apply early so debate-round + conflict-detection see flat
+                # fields too, not just the synthesized final decision.
+                if response_json:
+                    try:
+                        _unwrap_signal_sections({agent_name: response_json})
+                    except Exception as _uw_err:
+                        _l.warning("Signal unwrap failed: %s", _uw_err)
       finally:
         # Drop the ADK session immediately — InMemorySessionService keeps
         # every session forever otherwise. With sequential sessions + 4

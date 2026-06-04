@@ -357,9 +357,17 @@ def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulate
     Synchronous, no LLM involved. Typical latency: 0.5-2s dominated by
     the two BigQuery lookups (network inventory + penalty profile)."""
     # 1) Per-plant available inventory from BigQuery (commitment-aware).
+    # ───────── BUG-FIX-PHASE2: pass RDD so widget reflects delivery week ─────
+    # When the Order Triage Inventory Snapshot calls this endpoint, the
+    # request body carries requested_delivery_date. Forward it so the
+    # tool can anchor on the delivery window instead of the earliest
+    # projection week (which was 2024 historical data after the data
+    # team's table refresh). Fulfillment Simulator clients that don't
+    # pass RDD continue to get the earliest-week behavior.
     inv_resp = get_network_inventory(
         material_number=req.material_number,
         sold_to=req.sold_to,
+        requested_delivery_date=req.requested_delivery_date,
     )
     available_by_plant: dict[str, float] = {}
     inventory_by_plant: dict[str, dict[str, float]] = {}

@@ -85,4 +85,33 @@ order (echo the real field names), specialist_signals, conflicts_detected,
 recommendation, reasoning_chain, escalations, and dce_payload
 (cdm_domains_referenced, scenario_tag). Never invent data; every
 quantitative claim must trace to a tool result or a specialist signal.
+
+REQUIRED OUTPUT SHAPE — follow these field names EXACTLY:
+
+recommendation MUST be a nested object with field name "action" (NOT
+"disposition"). Allowed action values: ACCEPT | REJECT | PARTIAL_FULFILL |
+DEFER. Example:
+  "recommendation": {
+    "action": "REJECT",
+    "fulfill_qty_cs": 0,
+    "partial_fill_pct": 0.0,
+    "confidence": 0.85,
+    "expected_outcome": "Order rejected due to supply hard_block..."
+  }
+
+reasoning_chain MUST be a nested object (NOT a flat list of strings) with
+these three fields:
+  "reasoning_chain": {
+    "which_specialists_drove_decision": ["supply_planning"],
+    "key_trade_offs": [
+      "Inventory short: ~88 cases available vs 885 ordered",
+      "Existing stock expired",
+      "Production order insufficient and uncertain"
+    ],
+    "what_would_change_the_decision": "If supply_planning lifted its hard_block or a firm production receipt closed the gap"
+  }
+
+Do NOT put a meta-statement like "The recommendation is to REJECT..." in
+key_trade_offs — that is the decision, not a trade-off. Put actual
+trade-offs (the constraints that drove it) in key_trade_offs.
 ```

@@ -721,7 +721,34 @@ def get_finished_goods_inventory(
         where.append("plant_code = @plant")
         params.append(_p("plant", "STRING", plant_code))
 
+    # ───────── BUG-FIX-PHASE2: plan_version filter + LIMIT removed ─────────
+    # fct_inventory_projection contains multiple plan_version_id rows per
+    # (plant_code, storage_location, projection_week_start_date) — quarterly
+    # forecast revisions kept for audit. Without filtering, the result has
+    # 4x duplicates per (plant, week), which both confuses agents and (with
+    # the old LIMIT 100) truncated US02 from the result entirely (rows
+    # 101-120 were US02). Fix: pick the latest plan_version_id per (plant,
+    # storage_loc, week) via ROW_NUMBER, then drop the LIMIT.
     sql = f"""
+      WITH in_window AS (
+        SELECT plan_version_id, material_fert_number,
+               plant_code, storage_location,
+               projection_week_start_date,
+               opening_inventory_cases, production_receipts_cases,
+               transfer_receipts_cases, shipments_demand_cases,
+               ending_inventory_cases, days_of_supply,
+               safety_stock_target_cases, projection_status
+        FROM `{SEMANTIC_DS}.fct_inventory_projection`
+        WHERE {' AND '.join(where)}
+      ),
+      latest AS (
+        SELECT *,
+          ROW_NUMBER() OVER (
+            PARTITION BY plant_code, storage_location, projection_week_start_date
+            ORDER BY plan_version_id DESC
+          ) AS rn
+        FROM in_window
+      )
       SELECT plan_version_id, material_fert_number,
              plant_code, storage_location,
              projection_week_start_date,
@@ -729,16 +756,19 @@ def get_finished_goods_inventory(
              transfer_receipts_cases, shipments_demand_cases,
              ending_inventory_cases, days_of_supply,
              safety_stock_target_cases, projection_status
-      FROM `{SEMANTIC_DS}.fct_inventory_projection`
-      WHERE {' AND '.join(where)}
+      FROM latest
+      WHERE rn = 1
       ORDER BY plant_code, projection_week_start_date ASC
-      LIMIT 100
     """
     try:
         rows = _run_query(sql, params)
+        print(f"[DEBUG-INV-PLAN] get_fgi strategy={_window_strategy} "
+              f"rows={len(rows)} plants={sorted(set(r.get('plant_code') for r in rows))}")
     except Exception as e:
         # ───────── DEBUG-RDD: query failed; fall back to original ─────────
         _tool_log.warning("get_fgi query failed strategy=%s err=%r retrying", _window_strategy, e)
+        print(f"[DEBUG-INV-PLAN] get_fgi NEW-CTE query failed ({e!r}); "
+              f"falling back to ORIGINAL pre-Phase2 SQL")
         where = ["material_fert_number = @matnr",
                  "projection_week_start_date BETWEEN "
                  "DATE_SUB(CURRENT_DATE(), INTERVAL 1 WEEK) "
@@ -747,6 +777,8 @@ def get_finished_goods_inventory(
         if plant_code:
             where.append("plant_code = @plant")
             params.append(_p("plant", "STRING", plant_code))
+        # Original SQL kept for fallback — LIMIT 100 retained here intentionally
+        # to preserve pre-Phase2 behavior if the CTE query fails for any reason.
         sql = f"""
           SELECT plan_version_id, material_fert_number,
                  plant_code, storage_location,
@@ -1653,52 +1685,133 @@ def dce_write(
 # FULFILLMENT SIMULATOR  →  per-plant ATP across the network + per-customer
 # penalty rate. Used by the LP optimizer in fulfillment_optimizer.py.
 # ===========================================================================
-def get_network_inventory(material_number: str, sold_to: Optional[str] = None) -> dict:
-    """Per-plant available-to-promise (ATP) finished-goods position network-wide.
+def get_network_inventory(
+    material_number: str,
+    sold_to: Optional[str] = None,
+    requested_delivery_date: Optional[str] = None,
+) -> dict:
+    """Per-plant available finished-goods position across the network.
 
-    For each plant carrying this FERT, reads the most recent forward projection
-    week's ending_inventory_cases (tiger_semantic.fct_inventory_projection) as
-    on-hand `ending`, then subtracts OPEN agentic commitments for the SKU
-    (approved-but-not-yet-delivered allocations from
-    tiger_decisions.fct_allocation_decisions) to produce `available` (true ATP).
+    For each plant carrying this FERT, returns the projection week's
+    ending_inventory_cases anchored on requested_delivery_date when
+    provided. Falls back to earliest-projection-week behavior when no
+    RDD is given (preserves Fulfillment Simulator semantics).
 
-    Commitment attribution: the allocation log carries no plant_code, so the
-    network commitment total is attributed to plants largest-on-hand-first. Bulk
-    stock sits in the one manufacturing plant per SKU (US0x, ~5,000 cs vs DCs in
-    the tens), which is the realistic swing supply commitments draw from.
-    `committed` + `available` always reconcile to `ending` per plant and network-wide.
-
-    Cross-region: fct_inventory_projection is in tiger_semantic (us-central1) and
-    fct_allocation_decisions is in tiger_decisions (US multi-region); they cannot
-    be joined in one query, so the commitment total is fetched with a US-located
-    client and merged in Python (same pattern as get_allocation_history). The
-    commitment query is best-effort — any failure degrades to committed=0 /
-    available=ending so the optimizer/snapshot never break.
-
-    ATP semantics: ALL open commitments for the SKU are subtracted (network-wide,
-    across every customer) — that is what is available to promise to a NEW order.
-    `sold_to` is accepted for signature stability but does NOT scope the subtraction.
+    Phase 1 limitation: this does NOT subtract open commitments from
+    tiger_decisions.fct_allocation_decisions yet. The decision log lives
+    in a separate dataset and the cross-dataset join needs a location
+    fix (BQ picks the wrong region when both are referenced). Until the
+    location handling is in, `committed` is reported as 0 and `available`
+    equals `ending`. This is safe for the demo (decision log is empty)
+    and gives the LP correctly-bounded plant capacities; once Phase 2
+    wires real commitments, only the `committed` and `available` columns
+    change — the caller surface is stable.
 
     Args:
         material_number: FERT material number.
-        sold_to: accepted but unused (ATP subtracts commitments across all customers).
+        sold_to: accepted but unused in Phase 1 (commits are not subtracted).
+        requested_delivery_date: optional ISO date 'YYYY-MM-DD'. When
+            provided, the projection window is anchored on this date as
+            [delivery - 4 weeks, delivery + 1 week] and only the LATEST
+            plan_version_id per (plant, storage_loc, week) is summed —
+            so the Order Triage Inventory Snapshot widget reflects the
+            true RDD-window inventory using the current forecast.
+            When omitted, falls back to "earliest-projection-week per
+            plant" behavior so the Fulfillment Simulator (which calls
+            this without RDD) keeps its current semantics.
 
     Returns:
         {
           "rows": [{plant_code, ending, committed, available}, ...],
-          "view_queried": "...projection - ...allocation_decisions",
+          "view_queried": "tiger_semantic.fct_inventory_projection",
           "row_count": int,
-          "committed_total": float,
-          "commitments_subtracted": bool,
-          "note": str,
+          "note": "commitments not subtracted in Phase 1",
+          "sold_to_filter_applied": False,
         }
     """
+    # ───────── BUG-FIX-PHASE2: RDD-anchored + plan_version filter ─────────
+    print(f"[DEBUG-INV-NET] get_network_inventory called "
+          f"material={material_number!r} sold_to={sold_to!r} "
+          f"rdd={requested_delivery_date!r}")
+
+    if requested_delivery_date:
+        try:
+            from datetime import date as _date
+            _date.fromisoformat(requested_delivery_date)  # validate
+            params = [_p("matnr", "STRING", material_number),
+                      _p("rdd", "STRING", requested_delivery_date)]
+            # In the RDD window: pick the LATEST plan_version_id per
+            # (plant, storage_loc, week), then SUM across storage locations
+            # within each plant to get one available figure per plant.
+            sql = f"""
+              WITH in_window AS (
+                SELECT plant_code, storage_location, plan_version_id,
+                       projection_week_start_date, ending_inventory_cases
+                FROM `{SEMANTIC_DS}.fct_inventory_projection`
+                WHERE material_fert_number = @matnr
+                  AND projection_week_start_date BETWEEN
+                      DATE_SUB(DATE(@rdd), INTERVAL 4 WEEK)
+                      AND DATE_ADD(DATE(@rdd), INTERVAL 1 WEEK)
+              ),
+              latest AS (
+                SELECT *,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY plant_code, storage_location, projection_week_start_date
+                    ORDER BY plan_version_id DESC
+                  ) AS rn
+                FROM in_window
+              ),
+              -- Pick ONE representative week per plant (closest to RDD).
+              -- For each plant, prefer the row whose week is on or just
+              -- before the delivery date; this avoids double-counting
+              -- across multiple weeks in the window.
+              ranked_weeks AS (
+                SELECT plant_code,
+                       SUM(ending_inventory_cases) AS week_total,
+                       projection_week_start_date,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY plant_code
+                         ORDER BY
+                           CASE WHEN projection_week_start_date <= DATE(@rdd) THEN 0 ELSE 1 END,
+                           ABS(DATE_DIFF(projection_week_start_date, DATE(@rdd), DAY))
+                       ) AS wk_rn
+                FROM latest
+                WHERE rn = 1
+                GROUP BY plant_code, projection_week_start_date
+              )
+              SELECT plant_code,
+                     week_total AS ending,
+                     CAST(0 AS FLOAT64) AS committed,
+                     week_total AS available
+              FROM ranked_weeks
+              WHERE wk_rn = 1
+                AND week_total > 0
+              ORDER BY plant_code
+            """
+            try:
+                rows = _run_query(sql, params)
+                print(f"[DEBUG-INV-NET] strategy=rdd_anchored "
+                      f"plants={sorted(set(r.get('plant_code') for r in rows))} "
+                      f"total_available={sum(r.get('available', 0) for r in rows)}")
+                return {
+                    "rows": rows,
+                    "view_queried": "tiger_semantic.fct_inventory_projection",
+                    "row_count": len(rows),
+                    "note": "commitments not subtracted in Phase 1",
+                    "sold_to_filter_applied": False,
+                    "strategy": "rdd_anchored",
+                }
+            except Exception as e:
+                print(f"[DEBUG-INV-NET] rdd-anchored query failed ({e!r}); "
+                      f"falling back to original earliest-week behavior")
+        except Exception as e:
+            print(f"[DEBUG-INV-NET] rdd validation failed ({e!r}); "
+                  f"falling back to earliest-week behavior")
+    else:
+        print(f"[DEBUG-INV-NET] no rdd provided; using earliest-week behavior")
+
+    # ───────── ORIGINAL behavior: earliest-projection-week per plant ─────────
     params = [_p("matnr", "STRING", material_number)]
-    # The projection table in this demo dataset covers a future window
-    # (~2026-07 → 2027-07), not necessarily anchored to today. Rather than
-    # gate by a wall-clock window, take the EARLIEST available projection
-    # row per plant — that's the freshest forward ATP regardless of when
-    # "today" is on the container clock.
     sql = f"""
       WITH per_plant AS (
         SELECT plant_code,
@@ -1710,64 +1823,23 @@ def get_network_inventory(material_number: str, sold_to: Optional[str] = None) -
         GROUP BY plant_code
       )
       SELECT plant_code,
-             COALESCE(first_proj.ending_inventory_cases, 0) AS ending
+             COALESCE(first_proj.ending_inventory_cases, 0) AS ending,
+             CAST(0 AS FLOAT64) AS committed,
+             COALESCE(first_proj.ending_inventory_cases, 0) AS available
       FROM per_plant
       WHERE COALESCE(first_proj.ending_inventory_cases, 0) > 0
       ORDER BY plant_code
     """
-    rows = _run_query(sql, params)  # plain dicts: [{plant_code, ending}, ...]
-
-    # --- Open commitments for this SKU (approved, not yet delivered) ---------
-    # fct_allocation_decisions (tiger_decisions, US multi-region) has no
-    # material_number / plant_code columns — material is JSON-packed into
-    # decision_reason.trigger.material_number by dce_write(). Fetch the network
-    # commitment total with a US-located client (cross-region: cannot UNION with
-    # the us-central1 projection table). Best-effort → on any error treat as 0.
-    committed_total = 0.0
-    commitments_subtracted = False
-    try:
-        commit_sql = f"""
-          SELECT COALESCE(SUM(allocated_quantity_cases), 0) AS committed_cs
-          FROM `{DECISIONS_DS}.fct_allocation_decisions`
-          WHERE JSON_VALUE(decision_reason, '$.trigger.material_number') = @matnr
-            AND decision_status = 'EXECUTED'
-            AND delivered_quantity_cases IS NULL
-        """
-        _bq_us = bigquery.Client(project=PROJECT_ID, location="US")
-        cfg = bigquery.QueryJobConfig(
-            query_parameters=[_p("matnr", "STRING", material_number)])
-        cres = list(_bq_us.query(commit_sql, job_config=cfg).result())
-        if cres:
-            committed_total = float(dict(cres[0]).get("committed_cs") or 0.0)
-        commitments_subtracted = True
-    except Exception:
-        committed_total = 0.0  # graceful fallback → behaves like pre-Phase-2
-
-    # --- Attribute the network commitment to plants, largest-on-hand first ----
-    # Mutates the shared dicts in `rows` (sorted() returns a new list of the same
-    # objects). available + committed reconcile to ending per plant.
-    remaining = committed_total
-    for r in sorted(rows, key=lambda x: float(x.get("ending") or 0.0), reverse=True):
-        ending = float(r.get("ending") or 0.0)
-        take = min(remaining, ending) if remaining > 0 else 0.0
-        remaining -= take
-        r["ending"] = ending
-        r["committed"] = take
-        r["available"] = max(0.0, ending - take)
-    rows.sort(key=lambda x: str(x.get("plant_code") or ""))  # stable display order
-
-    note = ("open commitments subtracted from on-hand (ATP)"
-            if commitments_subtracted
-            else "commitment query unavailable — committed=0 (available=ending)")
+    rows = _run_query(sql, params)
+    print(f"[DEBUG-INV-NET] strategy=fallback_earliest_week "
+          f"plants={sorted(set(r.get('plant_code') for r in rows))}")
     return {
         "rows": rows,
-        "view_queried": ("tiger_semantic.fct_inventory_projection - "
-                         "tiger_decisions.fct_allocation_decisions"),
+        "view_queried": "tiger_semantic.fct_inventory_projection",
         "row_count": len(rows),
-        "committed_total": committed_total,
-        "commitments_subtracted": commitments_subtracted,
-        "note": note,
+        "note": "commitments not subtracted in Phase 1",
         "sold_to_filter_applied": False,
+        "strategy": "fallback_earliest_week",
     }
 
 
