@@ -1654,32 +1654,43 @@ def dce_write(
 # penalty rate. Used by the LP optimizer in fulfillment_optimizer.py.
 # ===========================================================================
 def get_network_inventory(material_number: str, sold_to: Optional[str] = None) -> dict:
-    """Per-plant available finished-goods position across the network.
+    """Per-plant available-to-promise (ATP) finished-goods position network-wide.
 
-    For each plant carrying this FERT, returns the most recent forward
-    projection week's ending_inventory_cases (tiger_semantic.fct_inventory_
-    projection) as `available`.
+    For each plant carrying this FERT, reads the most recent forward projection
+    week's ending_inventory_cases (tiger_semantic.fct_inventory_projection) as
+    on-hand `ending`, then subtracts OPEN agentic commitments for the SKU
+    (approved-but-not-yet-delivered allocations from
+    tiger_decisions.fct_allocation_decisions) to produce `available` (true ATP).
 
-    Phase 1 limitation: this does NOT subtract open commitments from
-    tiger_decisions.fct_allocation_decisions yet. The decision log lives
-    in a separate dataset and the cross-dataset join needs a location
-    fix (BQ picks the wrong region when both are referenced). Until the
-    location handling is in, `committed` is reported as 0 and `available`
-    equals `ending`. This is safe for the demo (decision log is empty)
-    and gives the LP correctly-bounded plant capacities; once Phase 2
-    wires real commitments, only the `committed` and `available` columns
-    change — the caller surface is stable.
+    Commitment attribution: the allocation log carries no plant_code, so the
+    network commitment total is attributed to plants largest-on-hand-first. Bulk
+    stock sits in the one manufacturing plant per SKU (US0x, ~5,000 cs vs DCs in
+    the tens), which is the realistic swing supply commitments draw from.
+    `committed` + `available` always reconcile to `ending` per plant and network-wide.
+
+    Cross-region: fct_inventory_projection is in tiger_semantic (us-central1) and
+    fct_allocation_decisions is in tiger_decisions (US multi-region); they cannot
+    be joined in one query, so the commitment total is fetched with a US-located
+    client and merged in Python (same pattern as get_allocation_history). The
+    commitment query is best-effort — any failure degrades to committed=0 /
+    available=ending so the optimizer/snapshot never break.
+
+    ATP semantics: ALL open commitments for the SKU are subtracted (network-wide,
+    across every customer) — that is what is available to promise to a NEW order.
+    `sold_to` is accepted for signature stability but does NOT scope the subtraction.
 
     Args:
         material_number: FERT material number.
-        sold_to: accepted but unused in Phase 1 (commits are not subtracted).
+        sold_to: accepted but unused (ATP subtracts commitments across all customers).
 
     Returns:
         {
           "rows": [{plant_code, ending, committed, available}, ...],
-          "view_queried": "tiger_semantic.fct_inventory_projection",
+          "view_queried": "...projection - ...allocation_decisions",
           "row_count": int,
-          "note": "commitments not subtracted in Phase 1"
+          "committed_total": float,
+          "commitments_subtracted": bool,
+          "note": str,
         }
     """
     params = [_p("matnr", "STRING", material_number)]
@@ -1699,19 +1710,63 @@ def get_network_inventory(material_number: str, sold_to: Optional[str] = None) -
         GROUP BY plant_code
       )
       SELECT plant_code,
-             COALESCE(first_proj.ending_inventory_cases, 0) AS ending,
-             CAST(0 AS FLOAT64) AS committed,
-             COALESCE(first_proj.ending_inventory_cases, 0) AS available
+             COALESCE(first_proj.ending_inventory_cases, 0) AS ending
       FROM per_plant
       WHERE COALESCE(first_proj.ending_inventory_cases, 0) > 0
       ORDER BY plant_code
     """
-    rows = _run_query(sql, params)
+    rows = _run_query(sql, params)  # plain dicts: [{plant_code, ending}, ...]
+
+    # --- Open commitments for this SKU (approved, not yet delivered) ---------
+    # fct_allocation_decisions (tiger_decisions, US multi-region) has no
+    # material_number / plant_code columns — material is JSON-packed into
+    # decision_reason.trigger.material_number by dce_write(). Fetch the network
+    # commitment total with a US-located client (cross-region: cannot UNION with
+    # the us-central1 projection table). Best-effort → on any error treat as 0.
+    committed_total = 0.0
+    commitments_subtracted = False
+    try:
+        commit_sql = f"""
+          SELECT COALESCE(SUM(allocated_quantity_cases), 0) AS committed_cs
+          FROM `{DECISIONS_DS}.fct_allocation_decisions`
+          WHERE JSON_VALUE(decision_reason, '$.trigger.material_number') = @matnr
+            AND decision_status = 'EXECUTED'
+            AND delivered_quantity_cases IS NULL
+        """
+        _bq_us = bigquery.Client(project=PROJECT_ID, location="US")
+        cfg = bigquery.QueryJobConfig(
+            query_parameters=[_p("matnr", "STRING", material_number)])
+        cres = list(_bq_us.query(commit_sql, job_config=cfg).result())
+        if cres:
+            committed_total = float(dict(cres[0]).get("committed_cs") or 0.0)
+        commitments_subtracted = True
+    except Exception:
+        committed_total = 0.0  # graceful fallback → behaves like pre-Phase-2
+
+    # --- Attribute the network commitment to plants, largest-on-hand first ----
+    # Mutates the shared dicts in `rows` (sorted() returns a new list of the same
+    # objects). available + committed reconcile to ending per plant.
+    remaining = committed_total
+    for r in sorted(rows, key=lambda x: float(x.get("ending") or 0.0), reverse=True):
+        ending = float(r.get("ending") or 0.0)
+        take = min(remaining, ending) if remaining > 0 else 0.0
+        remaining -= take
+        r["ending"] = ending
+        r["committed"] = take
+        r["available"] = max(0.0, ending - take)
+    rows.sort(key=lambda x: str(x.get("plant_code") or ""))  # stable display order
+
+    note = ("open commitments subtracted from on-hand (ATP)"
+            if commitments_subtracted
+            else "commitment query unavailable — committed=0 (available=ending)")
     return {
         "rows": rows,
-        "view_queried": "tiger_semantic.fct_inventory_projection",
+        "view_queried": ("tiger_semantic.fct_inventory_projection - "
+                         "tiger_decisions.fct_allocation_decisions"),
         "row_count": len(rows),
-        "note": "commitments not subtracted in Phase 1",
+        "committed_total": committed_total,
+        "commitments_subtracted": commitments_subtracted,
+        "note": note,
         "sold_to_filter_applied": False,
     }
 

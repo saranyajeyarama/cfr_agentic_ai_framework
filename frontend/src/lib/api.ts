@@ -29,6 +29,7 @@ import type {
   Order, BackendPayload, TriageResponse,
   ChatMessage, ChatResponse,
   SimulateRequest, SimulateResponse,
+  FulfillmentRecommendRequest, FulfillmentRecommendResponse,
   SimulatorIncident,
   DataHealthResponse, DashboardData,
   ExecutionTelemetryEntry,
@@ -227,6 +228,17 @@ export async function simulateFulfillment(
     method: 'POST',
     body: req,
   });
+}
+
+// ─── /fulfillment/recommend (agentic recommendation over the LP scenarios) ────
+export async function recommendFulfillment(
+  req: FulfillmentRecommendRequest,
+  force = false,
+): Promise<FulfillmentRecommendResponse> {
+  return request<FulfillmentRecommendResponse>(
+    `/fulfillment/recommend${force ? '?force=true' : ''}`,
+    { method: 'POST', body: req },
+  );
 }
 
 // ─── /chat ───────────────────────────────────────────────────────────────────

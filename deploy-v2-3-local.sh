@@ -41,7 +41,7 @@ FRONTEND_SERVICE="${FRONTEND_SERVICE:-cfr-ui-v2-3}"
 
 # Backend deploy is opt-in. Set DEPLOY_BACKEND=1 to rebuild + redeploy it
 # (picks up backend source changes, e.g. agent_tools.py / _v23_adapter.py fixes).
-DEPLOY_BACKEND="${DEPLOY_BACKEND:-0}"
+DEPLOY_BACKEND="${DEPLOY_BACKEND:-1}"
 AI_PROVIDER="${AI_PROVIDER:-gemini}"
 AGENT_CONCURRENCY="${AGENT_CONCURRENCY:-1}"
 TOOL_ROW_CAP="${TOOL_ROW_CAP:-50}"

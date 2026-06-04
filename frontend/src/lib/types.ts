@@ -351,6 +351,8 @@ export interface FulfillmentScenarioWire {
   netImpact: number;
   savingsVsDefault: number;
   isRecommended: boolean;
+  lpPreferred?: boolean;
+  plantsOpened?: number;
   rationale?: string;
   transitHours?: number;
   carrierName?: string;
@@ -360,6 +362,31 @@ export interface FulfillmentScenarioWire {
 export interface SimulateResponse {
   scenarios: FulfillmentScenarioWire[];
   meta?: Record<string, unknown>;
+}
+
+// ─── /fulfillment/recommend (agentic recommendation) ─────────────────────────
+export interface FulfillmentRecommendRequest {
+  incident_id: string;
+  sold_to?: string;
+  material_number?: string;
+  ordered_quantity_cases?: number;
+  scenarios: FulfillmentScenarioWire[];
+  context?: Record<string, unknown>;
+}
+
+export interface FulfillmentRecommendation {
+  recommended_scenario_id: string;
+  rationale: string;
+  confidence: number;
+  key_considerations: string[];
+  recommendation_source: 'agent' | 'rule';
+}
+
+export interface FulfillmentRecommendResponse {
+  incident_id: string;
+  recommendation: FulfillmentRecommendation;
+  cached: boolean;
+  cached_at?: string | null;
 }
 
 // ─── /fulfillment/incidents ──────────────────────────────────────────────────

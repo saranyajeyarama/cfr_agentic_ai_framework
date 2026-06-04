@@ -5,7 +5,8 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { cn } from '../../lib/utils';
-import { simulateFulfillment } from '../../lib/api';
+import { simulateFulfillment, recommendFulfillment } from '../../lib/api';
+import type { FulfillmentRecommendation } from '../../lib/types';
 import {
   type FulfillmentIncident,
   type FulfillmentScenario,
@@ -85,6 +86,14 @@ export function FulfillmentSimulator({
     error?: string;
   } | null>(null);
 
+  // Agentic recommendation (on-demand, per incident). The LLM (or rule
+  // fallback) picks the scenario + writes the rationale.
+  const [recMap, setRecMap] = useState<Record<string, {
+    status: 'loading' | 'done' | 'error';
+    rec?: FulfillmentRecommendation;
+    error?: string;
+  }>>({});
+
   useEffect(() => {
     if (!activeIncidentId && INCIDENTS.length > 0) setActiveIncidentId(INCIDENTS[0].id);
   }, [INCIDENTS, activeIncidentId]);
@@ -120,7 +129,16 @@ export function FulfillmentSimulator({
   }, [baseEntry?.status, scenarios.length, incident?.id, usingReSim]);
 
   const selectedScenario = scenarios.find((s) => s.id === selectedScenarioId);
-  const recommended = scenarios.find((s) => s.isRecommended) ?? scenarios[0];
+  // Agentic verdict for this incident (if "Evaluate with AI" was run).
+  const recEntry = incident ? recMap[incident.id] : undefined;
+  const agentRec = recEntry?.status === 'done' ? recEntry.rec : undefined;
+  // Resolve the recommended scenario: agent verdict first, then the
+  // optimizer's lpPreferred / isRecommended, then the default (scenarios[0]).
+  const recommended =
+    (agentRec && scenarios.find((s) => s.id === agentRec.recommended_scenario_id)) ??
+    scenarios.find((s) => s.isRecommended) ??
+    scenarios.find((s) => s.lpPreferred) ??
+    scenarios[0];
 
   const orderedQty = incident?.orderedQty ?? 0;
   const inventoryByPlant = (meta.inventory_by_plant as Record<string, PlantInv> | undefined) ?? {};
@@ -149,6 +167,12 @@ export function FulfillmentSimulator({
   const handleApplyConstraints = async () => {
     if (!incident || !incident.soldTo || !incident.materialNumber || !incident.orderedQty) return;
     const blocked = parseBlockedPlants(constraintText, knownPlants);
+    // The candidate set changes → any prior agent verdict is stale.
+    setRecMap((prev) => {
+      const next = { ...prev };
+      delete next[incident.id];
+      return next;
+    });
     setReSim({ incidentId: incident.id, status: 'loading', blocked });
     try {
       const body = await simulateFulfillment({
@@ -178,6 +202,51 @@ export function FulfillmentSimulator({
 
   const handleUseRecommendation = () => {
     if (recommended) setSelectedScenarioId(recommended.id);
+  };
+
+  // Agentic recommendation — on-demand. Sends the already-computed scenarios +
+  // risk/penalty/tier context to the agent (rule fallback when Vertex is down).
+  const runRecommend = async (force = false) => {
+    if (!incident || scenarios.length === 0) return;
+    const id = incident.id;
+    setRecMap((prev) => ({ ...prev, [id]: { status: 'loading' } }));
+    try {
+      const res = await recommendFulfillment(
+        {
+          incident_id: id,
+          sold_to: incident.soldTo ?? '',
+          material_number: incident.materialNumber ?? '',
+          ordered_quantity_cases: incident.orderedQty ?? 0,
+          scenarios: scenarios as unknown as never,
+          context: {
+            penalty_per_case: penaltyPerCase,
+            single_source_possible: (meta as Record<string, unknown>).single_source_possible,
+            plants_opened: (meta as Record<string, unknown>).plants_opened,
+            customer: incident.customer,
+            priority_tier: incident.otifProgram,
+            otifTarget: incident.otifTarget,
+            otifFailRate: incident.otifFailRate,
+            recentFails: incident.recentFails,
+            totalDeliveries: incident.totalDeliveries,
+            maxDaysLate: incident.maxDaysLate,
+            avgChargebackUsd: incident.avgChargebackUsd,
+            totalChargebackUsd: incident.totalChargebackUsd,
+            chargebackCount: incident.chargebackCount,
+            mabd: incident.mabd,
+            mabdEnforcement: incident.mabdEnforcement,
+            otifAggressive: incident.otifAggressive,
+          },
+        },
+        force,
+      );
+      setRecMap((prev) => ({ ...prev, [id]: { status: 'done', rec: res.recommendation } }));
+      setSelectedScenarioId(res.recommendation.recommended_scenario_id);
+    } catch (e) {
+      setRecMap((prev) => ({
+        ...prev,
+        [id]: { status: 'error', error: e instanceof Error ? e.message : 'Recommendation failed' },
+      }));
+    }
   };
 
   const handleExecute = () => {
@@ -499,13 +568,56 @@ export function FulfillmentSimulator({
           {/* 5 — AI Rationale + Execution Steps */}
           {selectedScenario && (
             <div className="grid grid-cols-2 gap-5">
-              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
-                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">
-                  AI Rationale — {selectedScenario.name}
-                </h4>
-                <p className="text-sm text-slate-700 leading-relaxed">
-                  {selectedScenario.rationale || 'No rationale returned by the optimizer for this scenario.'}
-                </p>
+              <div className={cn(
+                'bg-white border rounded-xl p-5 shadow-sm',
+                agentRec ? 'border-[#DB033B]/40' : 'border-slate-200',
+              )}>
+                <div className="flex items-center justify-between mb-3">
+                  <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest">
+                    AI Rationale{agentRec ? '' : ` — ${selectedScenario.name}`}
+                  </h4>
+                  {agentRec && (
+                    <span className={cn(
+                      'text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full border',
+                      agentRec.recommendation_source === 'agent'
+                        ? 'bg-[#DB033B]/10 text-[#DB033B] border-[#DB033B]/30'
+                        : 'bg-slate-100 text-slate-600 border-slate-200',
+                    )}>
+                      {agentRec.recommendation_source === 'agent' ? 'Agentic' : 'Rule-based'}
+                      {' · '}{Math.round((agentRec.confidence || 0) * 100)}%
+                    </span>
+                  )}
+                </div>
+                {recEntry?.status === 'loading' ? (
+                  <div className="flex items-center gap-2 text-sm text-slate-500">
+                    <Loader2 className="w-4 h-4 animate-spin" /> Agent evaluating the scenarios…
+                  </div>
+                ) : agentRec ? (
+                  <>
+                    <p className="text-sm text-slate-700 leading-relaxed">{agentRec.rationale}</p>
+                    {agentRec.key_considerations.length > 0 && (
+                      <ul className="mt-3 space-y-1.5">
+                        {agentRec.key_considerations.map((k, i) => (
+                          <li key={i} className="flex gap-2 text-xs text-slate-600">
+                            <span className="text-[#DB033B] flex-shrink-0">•</span>{k}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <p className="text-sm text-slate-700 leading-relaxed">
+                      {selectedScenario.rationale || 'No rationale returned by the optimizer for this scenario.'}
+                    </p>
+                    {recEntry?.status === 'error' && (
+                      <p className="mt-2 text-xs text-amber-600">Agent unavailable — showing the optimizer rationale.</p>
+                    )}
+                    <p className="mt-3 text-[11px] text-slate-400">
+                      Click <span className="font-semibold">Evaluate with AI</span> for an agent recommendation that weighs single-source vs split, OTIF risk, penalty and customer tier.
+                    </p>
+                  </>
+                )}
               </div>
               <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
                 <h4 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">Execution Steps</h4>
@@ -547,12 +659,23 @@ export function FulfillmentSimulator({
                   Execute: {selectedScenario.name}
                 </button>
                 <button
-                  onClick={handleUseRecommendation}
-                  disabled={!recommended || selectedScenarioId === recommended.id}
+                  onClick={() => runRecommend(Boolean(agentRec))}
+                  disabled={recEntry?.status === 'loading' || scenarios.length === 0}
+                  title="Ask the agent to weigh the scenarios and recommend one"
                   className="px-5 border-2 border-[#DB033B] text-[#DB033B] font-bold rounded-lg text-sm hover:bg-[#DB033B]/5 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
                 >
-                  <Sparkles className="w-4 h-4" /> Use AI Recommendation
+                  {recEntry?.status === 'loading'
+                    ? <><Loader2 className="w-4 h-4 animate-spin" /> Evaluating…</>
+                    : <><Sparkles className="w-4 h-4" /> {agentRec ? 'Re-evaluate with AI' : 'Evaluate with AI'}</>}
                 </button>
+                {agentRec && selectedScenarioId !== recommended?.id && (
+                  <button
+                    onClick={handleUseRecommendation}
+                    className="px-4 border-2 border-emerald-500 text-emerald-700 font-bold rounded-lg text-sm hover:bg-emerald-50 transition-colors flex items-center gap-2"
+                  >
+                    <CheckCircle2 className="w-4 h-4" /> Use AI pick
+                  </button>
+                )}
               </div>
             </div>
           )}

@@ -395,6 +395,12 @@ class FulfillmentScenario(BaseModel):
     netImpact: float
     savingsVsDefault: float = 0
     isRecommended: bool = False
+    # The optimizer's own cost-based preference (savings > 0 after the
+    # per-shipment fixed cost). The agentic recommendation (POST
+    # /fulfillment/recommend) overrides `isRecommended`; `lpPreferred`
+    # preserves the optimizer's view for the rule fallback.
+    lpPreferred: bool = False
+    plantsOpened: int = 0
     rationale: Optional[str] = None
     # Delivery-enriched fields (from dim_plant + fct_shipments + dim_carrier).
     transitHours: Optional[float] = None
@@ -418,16 +424,55 @@ class FulfillmentSimulateMeta(BaseModel):
     no_alternate_reason: Optional[str] = None
     freight_costs_used: dict[str, float] = Field(default_factory=dict)
     penalty_per_case: float = 0
+    per_shipment_fixed_usd: float = 0
+    single_source_possible: bool = False
+    plants_opened: Optional[int] = None
     ordered_qty: float = 0
     origin_plant: Optional[str] = None
     customer_region: Optional[str] = None
     inventory_by_plant: dict[str, dict[str, float]] = Field(default_factory=dict)
+    # Commitment-aware ATP context (open allocations subtracted from on-hand).
+    committed_total: float = 0
+    commitments_subtracted: bool = False
+    inventory_note: Optional[str] = None
     is_demo_seed: bool = False
 
 
 class FulfillmentSimulateResponse(BaseModel):
     scenarios: list[FulfillmentScenario]
     meta: FulfillmentSimulateMeta
+
+
+# ---------------------------------------------------------------------------
+# Agentic fulfillment recommendation — POST /fulfillment/recommend
+# An LLM reasons over the LP candidate scenarios + risk/penalty/tier context
+# and picks the scenario + rationale. Deterministic rule fallback when Vertex
+# AI is unavailable.
+# ---------------------------------------------------------------------------
+class FulfillmentRecommendRequest(BaseModel):
+    incident_id: str
+    sold_to: str = ""
+    material_number: str = ""
+    ordered_quantity_cases: float = 0
+    # The already-computed scenarios + context, round-tripped from /simulate so
+    # the endpoint does not re-run BigQuery or the LP.
+    scenarios: list[FulfillmentScenario] = Field(default_factory=list)
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class FulfillmentRecommendation(BaseModel):
+    recommended_scenario_id: str
+    rationale: str = ""
+    confidence: float = 0.0
+    key_considerations: list[str] = Field(default_factory=list)
+    recommendation_source: Literal["agent", "rule"] = "rule"
+
+
+class FulfillmentRecommendResponse(BaseModel):
+    incident_id: str
+    recommendation: FulfillmentRecommendation
+    cached: bool = False
+    cached_at: Optional[str] = None
 
 
 class FulfillmentIncidentScenario(FulfillmentScenario):

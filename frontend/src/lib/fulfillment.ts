@@ -43,6 +43,8 @@ export type FulfillmentScenario = {
   netImpact: number;
   savingsVsDefault: number;
   isRecommended: boolean;
+  lpPreferred?: boolean;
+  plantsOpened?: number;
   rationale?: string;
   // Delivery-enriched fields (from dim_plant + fct_shipments + dim_carrier).
   transitHours?: number;

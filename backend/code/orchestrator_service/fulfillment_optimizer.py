@@ -52,6 +52,17 @@ def _load_freight_config() -> dict[str, Any]:
 
 _FREIGHT_CONFIG = _load_freight_config()
 
+# Per-shipment fixed cost (K): the operational cost of opening one plant /
+# shipment. The MILP only opens an extra plant when its freight saving exceeds
+# K — this is what stops trivial micro-splits (splitting 4 ways to save $41).
+# Defaults to 0.0 when the config key is absent → behaves like pure freight
+# minimization (the pre-MILP behavior), so this is a safe no-op default.
+_FALLBACK_PER_SHIPMENT_USD = 0.0
+_PER_SHIPMENT_FIXED = float(
+    _FREIGHT_CONFIG.get("_per_shipment_fixed_usd", _FALLBACK_PER_SHIPMENT_USD))
+# Optional hard cap on plants per order (0 / missing → unlimited).
+_MAX_PLANTS = int(_FREIGHT_CONFIG.get("_max_plants", 0)) or None
+
 # Map US state abbreviations (from dim_customer.customer_region_state) to the
 # region keys used in freight_costs.json.
 _STATE_TO_REGION: dict[str, str] = {
@@ -117,11 +128,20 @@ def _solve_lp(
     penalty_per_case: float,
     blocked_plants: Iterable[str] = (),
     fix_zero: str | None = None,
+    per_shipment_fixed: float = 0.0,
+    max_plants: int | None = None,
 ) -> dict[str, Any]:
-    """Solve the LP and return {status, shipped: {plant: qty}, shortfall,
-    freight_cost, penalty_cost, total_cost}. `fix_zero` (if provided)
-    forces x[fix_zero] = 0 — used to obtain a next-best alternate when
-    the unconstrained optimum is the origin plant itself."""
+    """Solve the (MI)LP and return {status, shipped: {plant: qty}, shortfall,
+    freight_cost, penalty_cost, fixed_cost, plants_opened, total_cost}.
+
+    `fix_zero` (if provided) forces x[fix_zero] = 0 — used to obtain a
+    next-best alternate when the unconstrained optimum is the origin plant.
+
+    `per_shipment_fixed` (K) is a fixed cost per opened plant. When K > 0 the
+    model becomes a MILP (binary y[p] = "plant opened") and the objective adds
+    K·Σy[p], so an extra plant is only opened when its freight saving exceeds
+    K. This prevents trivial micro-splits. K = 0 reproduces the pure-LP
+    behavior (may micro-split). `max_plants` optionally caps Σy[p]."""
     blocked = set(blocked_plants or ())
     if fix_zero:
         blocked = blocked | {fix_zero}
@@ -132,25 +152,44 @@ def _solve_lp(
     x = {p: pulp.LpVariable(f"x_{p}", lowBound=0) for p in plants}
     s = pulp.LpVariable("shortfall", lowBound=0)
 
+    use_milp = per_shipment_fixed and per_shipment_fixed > 0
+    # Binary "plant opened" indicators — only needed when K > 0 or a max-plants
+    # cap is set. Keeping them out of the pure-LP path preserves old behavior.
+    y = ({p: pulp.LpVariable(f"y_{p}", cat="Binary") for p in plants}
+         if (use_milp or max_plants) else {})
+
     # Demand satisfaction (with slack)
     prob += pulp.lpSum(x.values()) + s == float(ordered_qty), "demand"
 
-    # Per-plant capacity
+    # Per-plant capacity. With binaries, link x[p] to y[p] via a tight big-M
+    # (min of plant availability and the order size) so the LP relaxation stays
+    # strong and CBC solves fast.
     for p in plants:
-        prob += x[p] <= float(available_by_plant[p]), f"cap_{p}"
-        if p in blocked:
-            prob += x[p] == 0, f"blk_{p}"
+        if y:
+            big_m = min(float(available_by_plant[p]), float(ordered_qty))
+            prob += x[p] <= big_m * y[p], f"link_{p}"
+            if p in blocked:
+                prob += x[p] == 0, f"blk_x_{p}"
+                prob += y[p] == 0, f"blk_y_{p}"
+        else:
+            prob += x[p] <= float(available_by_plant[p]), f"cap_{p}"
+            if p in blocked:
+                prob += x[p] == 0, f"blk_{p}"
 
-    # Objective
+    if y and max_plants:
+        prob += pulp.lpSum(y.values()) <= int(max_plants), "max_plants"
+
+    # Objective: freight + OTIF penalty (+ per-shipment fixed cost when MILP)
     prob += (
         pulp.lpSum(freight_by_plant.get(p, _FALLBACK_USD_PER_CASE) * x[p] for p in plants)
         + float(penalty_per_case) * s
+        + (float(per_shipment_fixed) * pulp.lpSum(y.values()) if y else 0)
     )
 
     solver = pulp.PULP_CBC_CMD(msg=False)
     prob.solve(solver)
 
-    log.debug("LP status=%s ordered_qty=%s", pulp.LpStatus[prob.status], ordered_qty)
+    log.debug("LP status=%s ordered_qty=%s milp=%s", pulp.LpStatus[prob.status], ordered_qty, bool(y))
     if pulp.LpStatus[prob.status] != "Optimal":
         log.warning("LP non-optimal status=%s ordered_qty=%s",
                     pulp.LpStatus[prob.status], ordered_qty)
@@ -159,22 +198,29 @@ def _solve_lp(
     if status != "Optimal":
         return {"status": status, "shipped": {}, "shortfall": float(ordered_qty),
                 "freight_cost": 0.0, "penalty_cost": float(ordered_qty) * float(penalty_per_case),
+                "fixed_cost": 0.0, "plants_opened": [],
                 "total_cost": float(ordered_qty) * float(penalty_per_case)}
 
-    shipped = {p: round(float(x[p].value() or 0), 2) for p in plants if (x[p].value() or 0) > 1e-6}
+    # Drop plants the MILP "opened" but shipped ≈0 through (binary rounding).
+    shipped = {p: round(float(x[p].value() or 0), 2)
+               for p in plants if (x[p].value() or 0) > 1e-6}
     shortfall = round(float(s.value() or 0), 2)
+    plants_opened = sorted(shipped.keys())
     freight_cost = round(
         sum(freight_by_plant.get(p, _FALLBACK_USD_PER_CASE) * qty for p, qty in shipped.items()),
         2,
     )
     penalty_cost = round(shortfall * float(penalty_per_case), 2)
+    fixed_cost = round(float(per_shipment_fixed) * len(plants_opened), 2) if use_milp else 0.0
     return {
         "status": status,
         "shipped": shipped,
         "shortfall": shortfall,
         "freight_cost": freight_cost,
         "penalty_cost": penalty_cost,
-        "total_cost": round(freight_cost + penalty_cost, 2),
+        "fixed_cost": fixed_cost,
+        "plants_opened": plants_opened,
+        "total_cost": round(freight_cost + penalty_cost + fixed_cost, 2),
     }
 
 
@@ -268,9 +314,11 @@ def _scenario_default(
         "netImpact": net_impact,
         "savingsVsDefault": 0,
         "isRecommended": False,
+        "lpPreferred": False,
+        "plantsOpened": 1 if shipped > 0 else 0,
         "rationale": (
             f"Ship from origin {origin_label}. "
-            f"{'Order fully covered.' if shortfall == 0 else f'Origin can only cover {int(shipped)} of {int(ordered_qty)} cases; the remaining {int(shortfall)} incur an OTIF penalty.'}"
+            f"{'Single-source: origin covers the full order.' if shortfall == 0 else f'Origin can only cover {int(shipped)} of {int(ordered_qty)} cases; the remaining {int(shortfall)} incur an OTIF penalty.'}"
             + (f" Est. transit: ~{int(transit_hours)}h via {carrier}." if transit_hours and carrier else "")
         ),
         "transitHours": round(transit_hours, 1) if transit_hours else None,
@@ -289,11 +337,15 @@ def _scenario_optimal(
     blocked_plants: Iterable[str] = (),
     default_net_impact: float = 0.0,
     plant_meta: dict[str, dict[str, Any]] | None = None,
+    per_shipment_fixed: float = 0.0,
+    max_plants: int | None = None,
 ) -> dict[str, Any] | None:
-    """Scenario B: LP-optimal route. May split across plants. If the
-    unconstrained LP picks origin only (Scenario B would equal A), re-solve
-    with x[origin] = 0 to surface a meaningful next-best alternate.
-    Returns None if no alternate is feasible."""
+    """Scenario B: (MI)LP-optimal route. May split across plants — but with
+    `per_shipment_fixed` (K) > 0 the MILP only opens an extra plant when its
+    freight saving exceeds K, so trivial micro-splits are suppressed. If the
+    optimum routes everything through origin (Scenario B would equal A),
+    re-solve with x[origin] = 0 to surface a meaningful "origin-unavailable"
+    contingency. Returns None if no alternate is feasible."""
     pm = plant_meta or {}
     sol = _solve_lp(
         ordered_qty=ordered_qty,
@@ -301,8 +353,12 @@ def _scenario_optimal(
         freight_by_plant=freight_by_plant,
         penalty_per_case=penalty_per_case,
         blocked_plants=blocked_plants,
+        per_shipment_fixed=per_shipment_fixed,
+        max_plants=max_plants,
     )
-    # If LP's optimum routes everything through origin, force an alternate.
+    # If the optimum routes everything through origin, force an alternate
+    # (the "what if origin is unavailable" contingency).
+    is_contingency = False
     only_origin = (set(sol["shipped"]) == {origin_plant}) or not sol["shipped"]
     if only_origin:
         if not (origin_plant and origin_plant in available_by_plant):
@@ -314,10 +370,13 @@ def _scenario_optimal(
             penalty_per_case=penalty_per_case,
             blocked_plants=blocked_plants,
             fix_zero=origin_plant,
+            per_shipment_fixed=per_shipment_fixed,
+            max_plants=max_plants,
         )
         if alt["status"] != "Optimal" or not alt["shipped"]:
             return None
         sol = alt
+        is_contingency = True
 
     if sol["status"] != "Optimal" or not sol["shipped"]:
         return None
@@ -357,8 +416,19 @@ def _scenario_optimal(
     freight = sol["freight_cost"]
     fine = sol["penalty_cost"]
     net_impact = -round(freight + fine, 2)
-    savings = round(net_impact - default_net_impact, 2)
-    is_recommended = savings > 0
+    # Savings on TOTAL economic cost, charging the marginal per-shipment fixed
+    # cost for plants opened beyond the first (the default ships from 1 plant,
+    # so only extra plants add friction). A split is "preferred" only when its
+    # freight saving beats that friction — i.e. not a trivial micro-split.
+    n_opened = len(plants_used)
+    marginal_fixed = round(float(per_shipment_fixed) * max(0, n_opened - 1), 2)
+    default_total = -default_net_impact          # default_freight + default_fine
+    optimal_total = freight + fine + marginal_fixed
+    savings = round(default_total - optimal_total, 2)
+    # The optimizer's own cost-based preference. A forced "origin-unavailable"
+    # contingency is never the preferred answer.
+    lp_preferred = (savings > 0) and not is_contingency
+    is_recommended = lp_preferred
     if savings < 0:
         savings = 0
 
@@ -399,6 +469,8 @@ def _scenario_optimal(
         "netImpact": net_impact,
         "savingsVsDefault": savings,
         "isRecommended": is_recommended,
+        "lpPreferred": lp_preferred,
+        "plantsOpened": n_opened,
         "rationale": rationale,
         "transitHours": round(transit_hours, 1) if transit_hours else None,
         "carrierName": carrier,
@@ -459,6 +531,8 @@ def simulate(
         blocked_plants=blocked_plants,
         default_net_impact=default["netImpact"],
         plant_meta=pm,
+        per_shipment_fixed=_PER_SHIPMENT_FIXED,
+        max_plants=_MAX_PLANTS,
     )
 
     scenarios = [default]
@@ -471,10 +545,16 @@ def simulate(
             "OTIF penalty cost — origin plant remains optimal."
         )
 
+    # Can a single plant cover the whole order? (drives single-source preference
+    # + feeds the agentic recommendation prompt)
+    single_source_possible = any(
+        float(v or 0) >= float(ordered_qty) for v in available_by_plant.values()
+    )
+
     elapsed_ms = int((time.time() - t0) * 1000)
     _elapsed_ms = int((time.monotonic() - _t0_sim) * 1000)
-    log.info("LP solve complete elapsed_ms=%d scenarios=%d no_alternate=%s",
-             _elapsed_ms, len(scenarios), bool(no_alternate_reason))
+    log.info("LP solve complete elapsed_ms=%d scenarios=%d no_alternate=%s K=%s",
+             _elapsed_ms, len(scenarios), bool(no_alternate_reason), _PER_SHIPMENT_FIXED)
     return {
         "scenarios": scenarios,
         "meta": {
@@ -483,6 +563,9 @@ def simulate(
             "no_alternate_reason": no_alternate_reason,
             "freight_costs_used": freight_by_plant,
             "penalty_per_case": float(penalty_per_case),
+            "per_shipment_fixed_usd": _PER_SHIPMENT_FIXED,
+            "single_source_possible": single_source_possible,
+            "plants_opened": (optimal or {}).get("plantsOpened") if optimal else 1,
             "ordered_qty": float(ordered_qty),
             "origin_plant": origin_plant,
             "customer_region": customer_region,

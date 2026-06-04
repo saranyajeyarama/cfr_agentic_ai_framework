@@ -53,13 +53,15 @@ from agent_tools import (
     get_data_health,
 )
 from firestore_client import create_session, get_session
-from orchestrator import run_session, approve_session, reject_session
+from orchestrator import run_session, approve_session, reject_session, _extract_json
 from schemas import (
     StartSessionRequest, StartSessionResponse,
     ApprovalRequest, RejectionRequest, DecisionResponse,
     ChatRequest, ChatResponse,
     FulfillmentSimulateRequest, FulfillmentSimulateResponse,
     FulfillmentIncidentsResponse,
+    FulfillmentRecommendRequest, FulfillmentRecommendation,
+    FulfillmentRecommendResponse,
     ExecutionTelemetryRequest, ExecutionTelemetryWriteResponse,
     ExecutionTelemetryListResponse,
 )
@@ -67,6 +69,7 @@ from fulfillment_optimizer import simulate as _simulate_fulfillment
 from _v23_adapter import (
     candidate_to_v23_order,
     decision_to_v23_synthesis,
+    _coerce_confidence,
 )
 
 
@@ -537,10 +540,257 @@ def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulate
 
     meta = dict(result.get("meta") or {})
     meta["inventory_by_plant"] = inventory_by_plant
+    # Surface commitment-aware ATP context (from get_network_inventory) so the
+    # UI / debuggers can see how much was reserved against on-hand for this SKU.
+    meta["committed_total"] = inv_resp.get("committed_total", 0.0)
+    meta["commitments_subtracted"] = inv_resp.get("commitments_subtracted", False)
+    meta["inventory_note"] = inv_resp.get("note")
     return FulfillmentSimulateResponse(
         scenarios=result.get("scenarios") or [],
         meta=meta,
     )
+
+
+# ---------------------------------------------------------------------------
+# Agentic fulfillment recommendation — POST /fulfillment/recommend
+# An LLM reasons over the LP candidate scenarios + risk/penalty/tier context
+# and picks the scenario + rationale. On-demand (button-triggered), cached per
+# (incident_id, scenarios_hash). Deterministic rule fallback when Vertex AI is
+# unavailable (currently 403 SERVICE_DISABLED) — never raises to the client.
+# ---------------------------------------------------------------------------
+import hashlib as _hashlib
+
+_FULFILLMENT_REC_TABLE = f"{PROJECT_ID}.tiger_decisions.fct_fulfillment_recommendation_cache"
+_fulfillment_rec_table_ready: bool = False
+_FULFILLMENT_REC_MEM_CACHE: dict[str, dict] = {}
+
+
+def _scenarios_hash(scenarios: list) -> str:
+    """Stable hash of the candidate set so a re-simulate (e.g. with
+    blocked_plants) that changes the scenarios is a cache MISS."""
+    parts = []
+    for s in scenarios or []:
+        d = s if isinstance(s, dict) else (s.model_dump() if hasattr(s, "model_dump") else {})
+        parts.append(f"{d.get('id')}:{d.get('freightCost')}:{d.get('fine')}:{d.get('savingsVsDefault')}")
+    return _hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
+def _ensure_fulfillment_rec_cache_table() -> None:
+    global _fulfillment_rec_table_ready
+    if _fulfillment_rec_table_ready:
+        return
+    try:
+        client = _bq_telemetry()
+        schema = [
+            bigquery.SchemaField("incident_id",             "STRING",    mode="REQUIRED"),
+            bigquery.SchemaField("sold_to",                 "STRING"),
+            bigquery.SchemaField("material_number",         "STRING"),
+            bigquery.SchemaField("ordered_quantity_cases",  "FLOAT64"),
+            bigquery.SchemaField("recommended_scenario_id", "STRING"),
+            bigquery.SchemaField("confidence",              "FLOAT64"),
+            bigquery.SchemaField("recommendation_source",   "STRING"),
+            bigquery.SchemaField("rationale",               "STRING"),
+            bigquery.SchemaField("key_considerations_json", "STRING"),
+            bigquery.SchemaField("scenarios_hash",          "STRING"),
+            bigquery.SchemaField("recommendation_json",     "STRING"),
+            bigquery.SchemaField("created_at",              "TIMESTAMP", mode="REQUIRED"),
+        ]
+        table = bigquery.Table(_FULFILLMENT_REC_TABLE, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY, field="created_at")
+        table.description = (
+            "Agentic Fulfillment Simulator recommendation cache. One row per "
+            "/fulfillment/recommend run; the latest row per (incident_id, "
+            "scenarios_hash) is replayed so re-evaluating an incident returns "
+            "the stored verdict without re-calling the LLM. A re-simulate that "
+            "changes the candidate scenarios produces a new hash → cache MISS.")
+        client.create_table(table, exists_ok=True)
+        _fulfillment_rec_table_ready = True
+        log.info("Fulfillment recommendation cache table ready: %s", _FULFILLMENT_REC_TABLE)
+    except Exception as exc:
+        log.warning("Fulfillment rec cache table ensure failed: %s", exc)
+
+
+def _read_fulfillment_rec_cache(incident_id: str, scenarios_hash: str) -> dict | None:
+    mem_key = f"{incident_id}|{scenarios_hash}"
+    mem = _FULFILLMENT_REC_MEM_CACHE.get(mem_key)
+    if mem:
+        return mem
+    _ensure_fulfillment_rec_cache_table()
+    try:
+        client = _bq_telemetry()
+        rows = list(client.query(
+            f"""
+            SELECT recommendation_json, CAST(created_at AS STRING) AS created_at
+            FROM `{_FULFILLMENT_REC_TABLE}`
+            WHERE incident_id = @id AND scenarios_hash = @h
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("id", "STRING", incident_id),
+                bigquery.ScalarQueryParameter("h", "STRING", scenarios_hash)]),
+        ).result())
+    except Exception as exc:
+        log.warning("Fulfillment rec cache read failed for %s: %s", incident_id, exc)
+        return None
+    if not rows:
+        return None
+    r = dict(rows[0])
+    try:
+        rec = _json.loads(r.get("recommendation_json") or "{}")
+    except Exception:
+        return None
+    entry = {"recommendation": rec, "cached_at": r.get("created_at")}
+    _FULFILLMENT_REC_MEM_CACHE[mem_key] = entry
+    return entry
+
+
+def _write_fulfillment_rec_cache(req: FulfillmentRecommendRequest, scenarios_hash: str,
+                                 rec: dict) -> None:
+    now = datetime.now(timezone.utc)
+    mem_key = f"{req.incident_id}|{scenarios_hash}"
+    _FULFILLMENT_REC_MEM_CACHE[mem_key] = {"recommendation": rec, "cached_at": now.isoformat()}
+    _ensure_fulfillment_rec_cache_table()
+    try:
+        row = {
+            "incident_id":             req.incident_id,
+            "sold_to":                 req.sold_to,
+            "material_number":         req.material_number,
+            "ordered_quantity_cases":  req.ordered_quantity_cases,
+            "recommended_scenario_id": rec.get("recommended_scenario_id"),
+            "confidence":              rec.get("confidence"),
+            "recommendation_source":   rec.get("recommendation_source"),
+            "rationale":               rec.get("rationale"),
+            "key_considerations_json": _json.dumps(rec.get("key_considerations") or []),
+            "scenarios_hash":          scenarios_hash,
+            "recommendation_json":     _json.dumps(rec),
+            "created_at":              now.isoformat(),
+        }
+        errors = _bq_telemetry().insert_rows_json(_FULFILLMENT_REC_TABLE, [row])
+        if errors:
+            log.error("Fulfillment rec cache insert errors: %s", errors)
+    except Exception as exc:
+        log.warning("Fulfillment rec cache write failed for %s: %s", req.incident_id, exc)
+
+
+def _rule_recommendation(req: FulfillmentRecommendRequest) -> dict:
+    """Deterministic fallback when the LLM is unavailable. Picks the
+    optimizer-preferred scenario, else the best savings, else the default."""
+    scenarios = [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+                 for s in (req.scenarios or [])]
+    if not scenarios:
+        return {"recommended_scenario_id": "scenario-a-default", "rationale":
+                "No scenarios available to evaluate.", "confidence": 0.3,
+                "key_considerations": [], "recommendation_source": "rule"}
+    chosen = next((s for s in scenarios if s.get("lpPreferred")), None)
+    if chosen is None:
+        viable = [s for s in scenarios if (s.get("savingsVsDefault") or 0) > 0]
+        chosen = max(viable, key=lambda s: s.get("savingsVsDefault") or 0) if viable else None
+    if chosen is None:
+        chosen = next((s for s in scenarios if s.get("id") == "scenario-a-default"), scenarios[0])
+
+    ctx = req.context or {}
+    single = ctx.get("single_source_possible")
+    n_open = chosen.get("plantsOpened")
+    considerations = []
+    if single and (n_open == 1 or chosen.get("id") == "scenario-a-default"):
+        considerations.append("A single plant covers the full order — single-sourcing avoids split-shipment handling.")
+    if (chosen.get("savingsVsDefault") or 0) > 0:
+        considerations.append(f"Chosen plan saves ${int(chosen['savingsVsDefault']):,} vs the default route after shipment friction.")
+    if ctx.get("penalty_per_case"):
+        considerations.append(f"OTIF penalty is ${ctx.get('penalty_per_case')}/case — fulfilling on time avoids it.")
+    if chosen.get("fine"):
+        considerations.append(f"This plan still carries a ${int(chosen['fine']):,} OTIF penalty on the shortfall.")
+    return {
+        "recommended_scenario_id": chosen.get("id", "scenario-a-default"),
+        "rationale": chosen.get("rationale") or "Selected on lowest total cost (freight + penalty + shipment friction).",
+        "confidence": 0.5,
+        "key_considerations": considerations or ["Rule-based selection on lowest total economic cost."],
+        "recommendation_source": "rule",
+    }
+
+
+_FULFILLMENT_REC_SYSTEM_PROMPT = (
+    "You are a senior fulfillment planner for Tiger Foods Customer Supply Operations. "
+    "Given an at-risk order and a small set of candidate fulfillment scenarios from the "
+    "optimizer, choose the single best scenario and justify it. Weigh: prefer SINGLE-SOURCING "
+    "unless a split saves materially more than its operational friction (each extra plant/shipment "
+    "is real handling cost); the OTIF penalty per case (high penalty -> avoid any shortfall); the "
+    "customer's priority tier and MABD enforcement; recent OTIF failures and chargeback exposure; "
+    "the number of plants opened; and arrival/transit risk. "
+    "Return ONLY a single valid JSON object (no prose, no markdown fences) with EXACTLY these keys: "
+    '{"recommended_scenario_id": <one of the provided scenario ids>, '
+    '"rationale": <2-3 sentence plain-English justification>, '
+    '"confidence": <number 0..1>, '
+    '"key_considerations": <array of 2-4 short strings>}.'
+)
+
+
+@app.post("/fulfillment/recommend", response_model=FulfillmentRecommendResponse)
+async def fulfillment_recommend(
+    req: FulfillmentRecommendRequest, force: bool = False,
+) -> FulfillmentRecommendResponse:
+    """Agentic recommendation over the (already-computed) LP scenarios. Cached
+    per (incident_id, scenarios_hash). Falls back to a deterministic rule when
+    Vertex AI is unavailable so the feature works regardless of the 403 state."""
+    valid_ids = {(s.id if hasattr(s, "id") else s.get("id")) for s in (req.scenarios or [])}
+    s_hash = _scenarios_hash(req.scenarios)
+
+    # 1) Cache hit → replay.
+    if not force:
+        cached = _read_fulfillment_rec_cache(req.incident_id, s_hash)
+        if cached:
+            return FulfillmentRecommendResponse(
+                incident_id=req.incident_id,
+                recommendation=FulfillmentRecommendation(**cached["recommendation"]),
+                cached=True, cached_at=cached.get("cached_at"))
+
+    rec_dict: dict | None = None
+    # 2) Try the LLM.
+    try:
+        import vertexai
+        from vertexai.generative_models import GenerativeModel
+        vertexai.init(project=PROJECT_ID, location=REGION)
+        model = GenerativeModel(model_name="gemini-2.5-flash",
+                                system_instruction=_FULFILLMENT_REC_SYSTEM_PROMPT)
+        user_payload = {
+            "order": {
+                "incident_id": req.incident_id,
+                "sold_to": req.sold_to,
+                "ordered_quantity_cases": req.ordered_quantity_cases,
+            },
+            "context": req.context,
+            "scenarios": [
+                (s.model_dump() if hasattr(s, "model_dump") else dict(s))
+                for s in (req.scenarios or [])
+            ],
+        }
+        resp = await asyncio.to_thread(model.generate_content, _json.dumps(user_payload))
+        parsed = _extract_json(getattr(resp, "text", "") or "")
+        if parsed and parsed.get("recommended_scenario_id") in valid_ids:
+            rec_dict = {
+                "recommended_scenario_id": parsed["recommended_scenario_id"],
+                "rationale": str(parsed.get("rationale") or "")[:1200],
+                "confidence": _coerce_confidence(parsed.get("confidence")),
+                "key_considerations": [str(x) for x in (parsed.get("key_considerations") or [])][:6],
+                "recommendation_source": "agent",
+            }
+        else:
+            log.warning("Fulfillment agent returned unusable JSON (id not in %s) — rule fallback", valid_ids)
+    except Exception as exc:
+        log.warning("Fulfillment agent LLM call failed (%s) — rule fallback", type(exc).__name__)
+
+    # 3) Deterministic fallback.
+    if rec_dict is None:
+        rec_dict = _rule_recommendation(req)
+
+    # 4) Persist + return.
+    _write_fulfillment_rec_cache(req, s_hash, rec_dict)
+    return FulfillmentRecommendResponse(
+        incident_id=req.incident_id,
+        recommendation=FulfillmentRecommendation(**rec_dict),
+        cached=False)
 
 
 # ---------------------------------------------------------------------------
