@@ -121,6 +121,23 @@ export function FulfillmentSimulator({
   const isLoadingScenarios = baseEntry?.status === 'loading';
   const scenarioError = baseEntry?.status === 'error' ? baseEntry.error : undefined;
 
+  // BUG-FIX-PHASE2: engine badge + agent decision summary derived from meta.
+  // Computed outside the JSX (safer than IIFE inline). Falls back gracefully
+  // when fields are absent (e.g. LP path doesn't emit decision_summary).
+  const engineId =
+    typeof meta.engine === 'string' ? (meta.engine as string) : undefined;
+  const engineNote =
+    typeof meta.engine_note === 'string' ? (meta.engine_note as string) : undefined;
+  const isAgentEngine = engineId === 'agent';
+  const agentDecisionSummary =
+    typeof meta.agent_decision_summary === 'string'
+      ? (meta.agent_decision_summary as string)
+      : undefined;
+  const agentConfidence =
+    typeof meta.agent_confidence === 'number'
+      ? (meta.agent_confidence as number)
+      : undefined;
+
   // Default scenario selection: recommended, else first.
   useEffect(() => {
     if (scenarios.length === 0) { setSelectedScenarioId(''); return; }
@@ -175,6 +192,10 @@ export function FulfillmentSimulator({
     });
     setReSim({ incidentId: incident.id, status: 'loading', blocked });
     try {
+      // BUG-FIX-PHASE2 / Step 6: pass the raw constraint text as
+      // user_constraints so the Fulfillment Agent can read it for SOFT
+      // preferences (e.g. "prefer DC02") in addition to the hard plant
+      // blocks parsed by parseBlockedPlants. LP path ignores this.
       const body = await simulateFulfillment({
         sold_to: incident.soldTo,
         material_number: incident.materialNumber,
@@ -182,7 +203,8 @@ export function FulfillmentSimulator({
         requested_delivery_date: incident.mabd ?? null,
         origin_plant: incident.originPlant ?? null,
         blocked_plants: blocked,
-      });
+        user_constraints: constraintText.trim() || null,
+      } as any);
       setReSim({
         incidentId: incident.id,
         status: 'done',
@@ -486,7 +508,23 @@ export function FulfillmentSimulator({
           {/* 4 — Scenario columns */}
           <div>
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Agent Resolution Strategies</h3>
+              <div className="flex items-center gap-3">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Agent Resolution Strategies</h3>
+                {/* BUG-FIX-PHASE2: engine badge (Agent vs LP) — simple conditional render, no IIFE */}
+                {engineId && (
+                  <span
+                    title={engineNote || engineId}
+                    className={cn(
+                      'text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded border',
+                      isAgentEngine
+                        ? 'bg-violet-100 text-violet-800 border-violet-200'
+                        : 'bg-sky-100 text-sky-800 border-sky-200',
+                    )}
+                  >
+                    {isAgentEngine ? '🤖 Agent' : '📐 LP (Deterministic)'}
+                  </span>
+                )}
+              </div>
               {isLoadingScenarios && (
                 <span className="text-[11px] text-slate-500 flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" /> Running optimizer…</span>
               )}
@@ -494,6 +532,23 @@ export function FulfillmentSimulator({
 
             {scenarioError && (
               <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg p-3 mb-3">Optimizer error: {scenarioError}</div>
+            )}
+
+            {/* BUG-FIX-PHASE2: agent decision summary banner (only when agent ran) */}
+            {isAgentEngine && agentDecisionSummary && (
+              <div className="text-xs bg-violet-50 border border-violet-200 rounded-lg p-3 mb-3 text-violet-900">
+                <div className="flex items-baseline gap-2">
+                  <span className="font-bold uppercase tracking-widest text-[10px] text-violet-700">
+                    Agent decision
+                  </span>
+                  {agentConfidence != null && (
+                    <span className="text-[10px] text-violet-700">
+                      confidence {Math.round(agentConfidence * 100)}%
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1 leading-relaxed">{agentDecisionSummary}</div>
+              </div>
             )}
 
             {scenarios.length > 0 && (
@@ -610,6 +665,24 @@ export function FulfillmentSimulator({
                     <p className="text-sm text-slate-700 leading-relaxed">
                       {selectedScenario.rationale || 'No rationale returned by the optimizer for this scenario.'}
                     </p>
+                    {/* BUG-FIX-PHASE2 / Step A: per-scenario tradeoffs bullets.
+                        Only renders when the agent path produced this scenario
+                        (LP path doesn't emit tradeoffs, so .length is 0 → hidden). */}
+                    {selectedScenario.tradeoffs && selectedScenario.tradeoffs.length > 0 && (
+                      <div className="mt-4">
+                        <h5 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest mb-2">
+                          Trade-offs considered
+                        </h5>
+                        <ul className="space-y-1.5">
+                          {selectedScenario.tradeoffs.map((t, i) => (
+                            <li key={i} className="flex gap-2 text-xs text-slate-600">
+                              <span className="text-slate-400 flex-shrink-0">•</span>
+                              <span className="leading-relaxed">{t}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
                     {recEntry?.status === 'error' && (
                       <p className="mt-2 text-xs text-amber-600">Agent unavailable — showing the optimizer rationale.</p>
                     )}

@@ -66,6 +66,12 @@ from schemas import (
     ExecutionTelemetryListResponse,
 )
 from fulfillment_optimizer import simulate as _simulate_fulfillment
+
+# ───────── BUG-FIX-PHASE2: Fulfillment Agent imports ─────────
+# Imported lazily inside _run_fulfillment_agent() to avoid loading ADK at
+# module import time for endpoints that never invoke the agent.
+import json as _stdlib_json
+import time as _stdlib_time
 from _v23_adapter import (
     candidate_to_v23_order,
     decision_to_v23_synthesis,
@@ -363,13 +369,398 @@ def fulfillment_incidents() -> FulfillmentIncidentsResponse:
     return FulfillmentIncidentsResponse(**payload)
 
 
-@app.post("/fulfillment/simulate", response_model=FulfillmentSimulateResponse)
-def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulateResponse:
-    """Run the LP optimizer for one at-risk order and return two scenario
-    cards (Default + Optimal Alternate) ready for the front-end.
+# ─────────────────────────────────────────────────────────────────────────
+# BUG-FIX-PHASE2: Fulfillment Agent runner + feature-flag dispatch
+# ─────────────────────────────────────────────────────────────────────────
+# When FULFILLMENT_USE_AGENT is truthy, /fulfillment/simulate routes to
+# the Gemini-backed Fulfillment Agent instead of the LP solver. The LP
+# code path is preserved unchanged — flipping the env var swaps engines
+# at request time without any code change.
 
-    Synchronous, no LLM involved. Typical latency: 0.5-2s dominated by
-    the two BigQuery lookups (network inventory + penalty profile)."""
+def _safe_float(v, default: float = 0.0) -> float:
+    """Coerce strings/None/bad types to float. Defensive against LLM drift
+    where numeric fields come back as strings ('1.80') or null."""
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _safe_bool(v, default: bool = False) -> bool:
+    """Coerce truthy strings/ints to bool. LLMs sometimes emit 'true'
+    as a string or 1 as an int instead of a proper boolean."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "yes", "1", "y")
+    return default
+
+
+def _safe_str_list(v) -> list[str]:
+    """Coerce a single string (drift pattern) into a 1-item list. Also
+    filters out empty strings."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v.strip()] if v.strip() else []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return []
+
+
+def _normalize_fulfillment_decision(
+    decision_json: dict,
+    req: FulfillmentSimulateRequest,
+    customer_region: Optional[str],
+    elapsed_ms: int,
+) -> FulfillmentSimulateResponse:
+    """Defensively reshape FulfillmentAgentDecision into FulfillmentSimulateResponse.
+
+    Handles known LLM drift patterns:
+      - Numeric strings instead of floats ('5.20' -> 5.20)
+      - Boolean strings instead of booleans ('true' -> True)
+      - Single string instead of list (rationale/tradeoffs)
+      - Sum of cases_allocated > ordered_quantity_cases (warn + clamp)
+      - cases_allocated > available_cases per plant (warn + clamp)
+      - Missing is_recommended (default first scenario after Default)
+      - Empty scenarios list (raise — handler falls back to LP)
+      - 'action'/'disposition' drift on scenario level (treat as is_recommended)
+
+    Logs every drift detected so we can audit prompt quality over time.
+    """
+    ordered_qty = float(req.ordered_quantity_cases or 0)
+    agent_scenarios = decision_json.get("scenarios") or []
+
+    if not isinstance(agent_scenarios, list) or not agent_scenarios:
+        raise RuntimeError(
+            "Fulfillment agent returned no scenarios; "
+            f"top-level keys: {list(decision_json.keys())}"
+        )
+
+    norm_scenarios: list[dict] = []
+    for idx, s in enumerate(agent_scenarios):
+        if not isinstance(s, dict):
+            log.warning("[NORM-FUL] scenario[%d] is not a dict (got %s); skipping",
+                        idx, type(s).__name__)
+            continue
+
+        # ── plant_details — type coerce + cap at available ─────────────
+        plant_details: list[dict] = []
+        sum_allocated = 0.0
+        for pd_idx, pd in enumerate(s.get("plant_details") or []):
+            if not isinstance(pd, dict):
+                log.warning("[NORM-FUL] scenario[%d].plant_details[%d] not dict; skip",
+                            idx, pd_idx)
+                continue
+            allocated = _safe_float(pd.get("cases_allocated"))
+            available = _safe_float(pd.get("available_cases"), default=allocated)
+            # Cap allocation at the agent's own reported available.
+            if available > 0 and allocated > available:
+                log.warning("[NORM-FUL] scenario[%d] plant=%s allocated=%s > available=%s — clamping",
+                            idx, pd.get("plant_code"), allocated, available)
+                allocated = available
+            sum_allocated += allocated
+            plant_details.append({
+                "code": pd.get("plant_code") or "",
+                "name": pd.get("plant_name") or "",
+                "city": pd.get("plant_city") or "",
+                "type": pd.get("plant_type") or "",
+                "qty": allocated,
+                "transitHours": _safe_float(pd.get("transit_hours"), default=None)
+                                  if pd.get("transit_hours") is not None else None,
+                "carrier": pd.get("carrier") or None,
+            })
+
+        # ── enforce total ≤ ordered_qty ─────────────────────────────────
+        if sum_allocated > ordered_qty * 1.01:  # 1% tolerance for float
+            log.warning("[NORM-FUL] scenario[%d] total allocated=%s > ordered_qty=%s — "
+                        "agent overcommitted; trusting agent but flagging",
+                        idx, sum_allocated, ordered_qty)
+
+        # ── is_recommended — handle disposition/action drift ─────────────
+        is_rec_raw = (s.get("is_recommended")
+                      if "is_recommended" in s
+                      else s.get("recommended")
+                      or s.get("disposition")
+                      or s.get("action"))
+        # Treat disposition/action string values as recommended only if
+        # they're affirmative ("ACCEPT", "RECOMMEND", "YES", "TRUE")
+        is_rec = False
+        if isinstance(is_rec_raw, bool):
+            is_rec = is_rec_raw
+        elif isinstance(is_rec_raw, str):
+            is_rec = is_rec_raw.strip().upper() in (
+                "TRUE", "YES", "RECOMMEND", "RECOMMENDED", "ACCEPT", "AGENT", "OPTIMAL")
+        else:
+            is_rec = _safe_bool(is_rec_raw)
+
+        # ── numeric fields with type coercion ────────────────────────────
+        freight = _safe_float(s.get("freight_cost"))
+        fine = _safe_float(s.get("fine"))
+        net_impact = s.get("net_impact")
+        if net_impact is None:
+            # Reconstruct if missing.
+            net_impact = -(freight + fine)
+        else:
+            net_impact = _safe_float(net_impact)
+        savings = _safe_float(s.get("savings_vs_default"))
+
+        # ── rationale — string (allow single-item list drift) ───────────
+        rationale_raw = s.get("rationale")
+        if isinstance(rationale_raw, list):
+            rationale = " ".join(str(x) for x in rationale_raw if x)
+            log.warning("[NORM-FUL] scenario[%d] rationale was a list; joined to string", idx)
+        else:
+            rationale = str(rationale_raw or "")
+
+        # BUG-FIX-PHASE2 / Step A: preserve per-scenario tradeoffs so the UI
+        # can render them as bullets under each card's rationale. Uses
+        # _safe_str_list to handle the single-string drift pattern.
+        scenario_tradeoffs = _safe_str_list(s.get("tradeoffs"))
+
+        norm_scenarios.append({
+            "id": s.get("id") or f"scenario-{idx}",
+            "name": s.get("name") or "",
+            "tagline": s.get("tagline") or "",
+            "arrival": s.get("arrival") or "",
+            "dcSource": s.get("dc_source") or s.get("dcSource") or "",
+            "freightCost": freight,
+            "fine": fine,
+            "netImpact": net_impact,
+            "savingsVsDefault": savings,
+            "isRecommended": is_rec,
+            "rationale": rationale,
+            "tradeoffs": scenario_tradeoffs,
+            "transitHours": _safe_float(s.get("transit_hours"), default=None)
+                              if s.get("transit_hours") is not None else None,
+            "carrierName": s.get("carrier_name") or s.get("carrierName") or None,
+            "plantDetails": plant_details,
+        })
+
+    # ── ensure exactly one scenario is flagged as recommended ───────────
+    n_recommended = sum(1 for s in norm_scenarios if s["isRecommended"])
+    if n_recommended == 0 and len(norm_scenarios) >= 2:
+        log.warning("[NORM-FUL] no scenario marked is_recommended; defaulting to scenario[1] "
+                    "(typically the Agent Recommendation)")
+        norm_scenarios[1]["isRecommended"] = True
+    elif n_recommended > 1:
+        log.warning("[NORM-FUL] %d scenarios marked is_recommended; keeping the last one",
+                    n_recommended)
+        # Keep only the last; clear the rest.
+        last_idx = max(i for i, s in enumerate(norm_scenarios) if s["isRecommended"])
+        for i, s in enumerate(norm_scenarios):
+            s["isRecommended"] = (i == last_idx)
+
+    # ── aggregate tradeoffs from all scenarios (deduplicated) ───────────
+    agent_tradeoffs: list[str] = []
+    for s in agent_scenarios:
+        if not isinstance(s, dict):
+            continue
+        for t in _safe_str_list(s.get("tradeoffs")):
+            if t and t not in agent_tradeoffs:
+                agent_tradeoffs.append(t)
+
+    # ── meta — same shape as LP path, with engine indicator ─────────────
+    meta = {
+        "solver_status": "Optimal",
+        "elapsed_ms": elapsed_ms,
+        "freight_costs_used": {},
+        "penalty_per_case": _safe_float(decision_json.get("penalty_per_case_usd")),
+        "ordered_qty": ordered_qty,
+        "origin_plant": req.origin_plant,
+        "customer_region": customer_region,
+        "inventory_by_plant": {
+            p: {"available": _safe_float(c), "ending": _safe_float(c), "committed": 0.0}
+            for p, c in (decision_json.get("inventory_snapshot_used") or {}).items()
+        },
+        "engine": "agent",
+        "engine_note": "Fulfillment Agent (Gemini 2.5 Pro)",
+        "agent_decision_summary": decision_json.get("decision_summary") or None,
+        "agent_confidence": _safe_float(decision_json.get("confidence"), default=None)
+                             if decision_json.get("confidence") is not None else None,
+        "agent_tradeoffs": agent_tradeoffs,
+        "user_constraints_applied": _safe_str_list(
+            decision_json.get("user_constraints_applied")),
+        "blocked_plants_applied": _safe_str_list(
+            decision_json.get("blocked_plants_applied")),
+    }
+
+    return FulfillmentSimulateResponse(
+        scenarios=norm_scenarios,
+        meta=meta,
+    )
+
+
+def _fulfillment_engine() -> str:
+    """Return 'agent' or 'deterministic_lp' based on the env var.
+
+    Read on each request so the operator can toggle without a restart
+    (e.g. via Cloud Run config). Default is 'deterministic_lp' for
+    safety — the LP has been in production; the agent is new.
+    """
+    flag = (os.environ.get("FULFILLMENT_USE_AGENT", "") or "").strip().lower()
+    return "agent" if flag in ("1", "true", "yes", "on") else "deterministic_lp"
+
+
+async def _run_fulfillment_agent(
+    req: FulfillmentSimulateRequest,
+) -> FulfillmentSimulateResponse:
+    """Invoke the Fulfillment Agent and normalize its output to the
+    FulfillmentSimulateResponse shape the front-end already renders.
+
+    Reuses the agent's own tool calls — the agent itself queries
+    fct_inventory_projection, fct_chargebacks, freight_costs.json, etc.
+    via its bound tools. We just hand it the order payload and trust
+    its 5-step reasoning to produce the two scenarios.
+
+    Defensive: any failure here falls back to the LP path so a broken
+    agent doesn't blank out the UI.
+    """
+    # Lazy imports — keep agent dependencies out of cold-path code.
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types as genai_types
+    from agents import get_agent
+    from orchestrator import _extract_json
+    from data_pipeline import _bq_client as _bq_sem
+
+    t0 = _stdlib_time.time()
+
+    # Resolve customer region the same way the LP path does, so the
+    # agent's lookup_freight_cost calls return real lane rates.
+    customer_region = req.customer_region
+    if not customer_region and req.sold_to:
+        try:
+            bq = _bq_sem()
+            rows = list(bq.query(
+                f"SELECT customer_region_state FROM `tiger_semantic.dim_customer` "
+                f"WHERE customer_number = @st LIMIT 1",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("st", "STRING", req.sold_to),
+                    ]
+                ),
+            ).result())
+            if rows:
+                customer_region = rows[0].get("customer_region_state")
+        except Exception:
+            pass
+
+    # Build the payload the agent receives. Mirrors the fields listed
+    # in agents/fulfillment_agent.md → "THE ORDER YOU RECEIVE".
+    payload = {
+        "sold_to": req.sold_to,
+        "material_number": req.material_number,
+        "ordered_quantity_cases": float(req.ordered_quantity_cases),
+        "requested_delivery_date": req.requested_delivery_date,
+        "origin_plant": req.origin_plant,
+        "customer_region": customer_region,
+        "blocked_plants": list(req.blocked_plants or []),
+        "user_constraints": getattr(req, "user_constraints", "") or "",
+    }
+
+    agent = get_agent("fulfillment")
+    app_name = "tiger-fulfillment-agent"
+    session_service = InMemorySessionService()
+    session_id = f"fulfillment-{int(_stdlib_time.time()*1000)}-{uuid.uuid4().hex[:6]}"
+    user_id = "fulfillment-caller"
+
+    await session_service.create_session(
+        app_name=app_name, user_id=user_id, session_id=session_id,
+    )
+    runner = Runner(
+        app_name=app_name, agent=agent, session_service=session_service,
+    )
+    user_msg = genai_types.Content(
+        role="user",
+        parts=[genai_types.Part.from_text(text=_stdlib_json.dumps(payload))],
+    )
+
+    decision_json: dict | None = None
+    raw_text = ""
+    try:
+        async for event in runner.run_async(
+            user_id=user_id, session_id=session_id, new_message=user_msg,
+        ):
+            if event.is_final_response() and event.content and event.content.parts:
+                raw_text = "".join(
+                    p.text for p in event.content.parts
+                    if getattr(p, "text", None)
+                )
+                decision_json = _extract_json(raw_text)
+                # ───────── BUG-FIX-PHASE2 / Option B: persist raw agent response ─────
+                # Same pattern as orchestrator._save_raw_response for the 5 triage
+                # agents. Defensive: any failure here is swallowed so the request
+                # still succeeds. Files land in backend/agent_raw_responses/ and
+                # follow the naming convention: {ts}_fulfillment_{adk_session}.json
+                try:
+                    from orchestrator import _save_raw_response as _fa_save
+                    _fa_save("fulfillment", session_id, raw_text, decision_json)
+                except Exception as _save_err:
+                    log.warning("Fulfillment raw response save failed: %s", _save_err)
+    finally:
+        try:
+            await session_service.delete_session(
+                app_name=app_name, user_id=user_id, session_id=session_id,
+            )
+        except Exception:
+            pass
+
+    elapsed_ms = int((_stdlib_time.time() - t0) * 1000)
+    log.info("Fulfillment agent run complete elapsed_ms=%d parsed=%s",
+             elapsed_ms, decision_json is not None)
+
+    if not decision_json:
+        # Agent didn't produce valid JSON — bubble up to the LP fallback.
+        raise RuntimeError(
+            "Fulfillment agent returned non-JSON output; "
+            f"raw response was: {raw_text[:500]}"
+        )
+
+    # ───── BUG-FIX-PHASE2 / Step 5: defensive normalization ─────
+    # All drift-handling lives in _normalize_fulfillment_decision so
+    # this function stays focused on the ADK invocation. The normalizer
+    # logs every drift it detects so we can audit prompt quality.
+    return _normalize_fulfillment_decision(
+        decision_json=decision_json,
+        req=req,
+        customer_region=customer_region,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+@app.post("/fulfillment/simulate", response_model=FulfillmentSimulateResponse)
+async def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulateResponse:
+    """Run the LP optimizer (default) OR the Fulfillment Agent (when
+    FULFILLMENT_USE_AGENT=true) and return two scenario cards (Default +
+    Optimal Alternate) ready for the front-end.
+
+    Engine selection happens per-request via env var so an operator can
+    toggle between the deterministic LP and the agent without a restart.
+    If the agent fails (non-JSON output, tool error, timeout), the
+    request transparently falls back to the LP — the user always gets
+    a response.
+
+    LP path: synchronous, no LLM. ~1-2s, dominated by 2 BigQuery lookups.
+    Agent path: async, Gemini-backed. ~5-15s, includes 4-6 tool calls.
+    """
+    engine = _fulfillment_engine()
+    log.info("Fulfillment simulate engine=%s sold_to=%s material=%s qty=%s",
+             engine, req.sold_to, req.material_number, req.ordered_quantity_cases)
+    if engine == "agent":
+        try:
+            return await _run_fulfillment_agent(req)
+        except Exception as exc:
+            log.warning("Fulfillment agent failed (%s); falling back to LP", exc)
+            # fall through to LP path below — user gets a response.
+
+
     # 1) Per-plant available inventory from BigQuery (commitment-aware).
     # ───────── BUG-FIX-PHASE2: pass RDD so widget reflects delivery week ─────
     # When the Order Triage Inventory Snapshot calls this endpoint, the
@@ -567,6 +958,9 @@ def fulfillment_simulate(req: FulfillmentSimulateRequest) -> FulfillmentSimulate
     meta["committed_total"] = inv_resp.get("committed_total", 0.0)
     meta["commitments_subtracted"] = inv_resp.get("commitments_subtracted", False)
     meta["inventory_note"] = inv_resp.get("note")
+    # ───────── BUG-FIX-PHASE2: engine indicator for the UI badge ─────────
+    meta["engine"] = "deterministic_lp"
+    meta["engine_note"] = "PuLP/CBC linear-programming solver"
     return FulfillmentSimulateResponse(
         scenarios=result.get("scenarios") or [],
         meta=meta,

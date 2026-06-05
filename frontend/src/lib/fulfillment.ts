@@ -46,6 +46,11 @@ export type FulfillmentScenario = {
   lpPreferred?: boolean;
   plantsOpened?: number;
   rationale?: string;
+  // BUG-FIX-PHASE2 / Step A: per-scenario tradeoffs from the Fulfillment Agent.
+  // List of short strings (each one a discrete trade-off the agent considered).
+  // Empty / undefined when the LP path produced the scenario (LP doesn't emit
+  // tradeoffs), so the UI must render conditionally.
+  tradeoffs?: string[];
   // Delivery-enriched fields (from dim_plant + fct_shipments + dim_carrier).
   transitHours?: number;
   carrierName?: string;
@@ -139,9 +144,17 @@ export type IncidentsState = {
 const INCIDENTS_INITIAL: IncidentsState = { incidents: [], status: 'idle' };
 
 export function useFulfillmentIncidentsStore() {
-  const [state, setState] = useState<IncidentsState>(() =>
-    readJSON<IncidentsState>(INCIDENTS_KEY, INCIDENTS_INITIAL),
-  );
+  // BUG-FIX: if the previous session crashed mid-fetch, sessionStorage may
+  // hold a stuck `status: 'loading'` state. Rehydrating that would short-
+  // circuit `load()` forever (it returns early when status is 'loading').
+  // Reset to INITIAL in that case so the next mount can refetch cleanly.
+  // Also guard against null / malformed values from sessionStorage.
+  const [state, setState] = useState<IncidentsState>(() => {
+    const persisted = readJSON<IncidentsState>(INCIDENTS_KEY, INCIDENTS_INITIAL);
+    if (!persisted || typeof persisted !== 'object') return INCIDENTS_INITIAL;
+    if ((persisted as IncidentsState).status === 'loading') return INCIDENTS_INITIAL;
+    return persisted as IncidentsState;
+  });
 
   useEffect(() => writeJSON(INCIDENTS_KEY, state), [state]);
 
@@ -200,10 +213,19 @@ export function useFulfillmentScenariosStore(): [
  * Imperative trigger — fires POST /api/fulfillment/simulate and writes
  * the result into the scenarios store keyed by incidentId. Returns the
  * resulting entry so the caller can await + render.
+ *
+ * BUG-FIX-PHASE2 / Step 6: accepts optional planner-supplied constraints
+ * (hard `blocked_plants` and soft free-text `user_constraints`) that
+ * the Fulfillment Agent will honor on re-simulate. Both are optional —
+ * existing callers that don't pass them get the old behavior.
  */
 export async function runFulfillmentSimulate(
   incident: FulfillmentIncident,
   setMap: Dispatch<SetStateAction<ScenarioMap>>,
+  options?: {
+    blocked_plants?: string[];
+    user_constraints?: string;
+  },
 ): Promise<void> {
   if (!incident.soldTo || !incident.materialNumber || !incident.orderedQty) {
     setMap(prev => ({
@@ -223,7 +245,9 @@ export async function runFulfillmentSimulate(
       ordered_quantity_cases: incident.orderedQty,
       requested_delivery_date: incident.mabd ?? null,
       origin_plant: incident.originPlant ?? null,
-    });
+      blocked_plants: options?.blocked_plants ?? [],
+      user_constraints: options?.user_constraints ?? null,
+    } as any);
     setMap(prev => ({
       ...prev,
       [incident.id]: {
