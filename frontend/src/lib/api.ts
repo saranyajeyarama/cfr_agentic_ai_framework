@@ -316,6 +316,71 @@ export async function fetchTelemetry(limit = 20): Promise<ExecutionTelemetryEntr
   }
 }
 
+// ─── /decision-log (durable audit trail, paginated) ──────────────────────────
+
+export type DecisionLogRow = {
+  id: string;
+  timestamp: string;
+  poNumber: string;
+  customer: string;
+  material: string;
+  action: string;            // ACCEPT / REJECT / PARTIAL / DEFER (agent recommendation)
+  agentRecommendation: string;
+  userDecision: string;
+  fulfillQty: number;
+  fillRatePct: number;
+  userId: string;
+  rationale: string;
+  sessionId: string;
+  orchestratorVersion: string;
+  overrideReason: string | null;
+  outcome: string;
+  aligned: boolean;
+  financialImpact: number;
+  wentWrong: boolean;
+  _session?: boolean;        // appended optimistically this session (not yet round-tripped from BQ)
+};
+
+export type DecisionLogResponse = {
+  total_count: number;
+  filtered_count: number;
+  decisions: DecisionLogRow[];
+};
+
+/** Durable audit trail. Throws (BackendError/NetworkError) on failure so the
+ *  Decision Log can fall back to its in-memory current-session view. */
+export async function fetchDecisionLog(limit = 200, offset = 0): Promise<DecisionLogResponse> {
+  return request<DecisionLogResponse>(`/decision-log?limit=${limit}&offset=${offset}`);
+}
+
+// ── In-memory current-session decisions (instant UX feedback + 5xx fallback) ──
+const SESSION_DECISIONS_KEY = 'tiger:decisionlog:session:v1';
+
+export function readSessionDecisions(): DecisionLogRow[] {
+  try {
+    const raw = sessionStorage.getItem(SESSION_DECISIONS_KEY);
+    return raw ? (JSON.parse(raw) as DecisionLogRow[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Record a just-made decision so the Decision Log can show it immediately and
+ *  survive a backend outage. Deduped by id / sessionId. */
+export function appendSessionDecision(row: DecisionLogRow): void {
+  try {
+    const existing = readSessionDecisions().filter(
+      r => r.id !== row.id && (!row.sessionId || r.sessionId !== row.sessionId),
+    );
+    sessionStorage.setItem(
+      SESSION_DECISIONS_KEY,
+      JSON.stringify([{ ...row, _session: true }, ...existing].slice(0, 100)),
+    );
+  } catch {
+    /* ignore quota / serialization errors */
+  }
+}
+
 // =============================================================================
 // LEGACY FUNCTIONS — kept for backwards compatibility with existing tabs.
 // New code should prefer the spec names above.

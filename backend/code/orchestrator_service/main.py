@@ -195,6 +195,9 @@ def _ensure_triage_cache_table() -> None:
             bigquery.SchemaField("synthesis_json",          "STRING"),
             bigquery.SchemaField("raw_decision_json",       "STRING"),
             bigquery.SchemaField("created_at",              "TIMESTAMP", mode="REQUIRED"),
+            # Wall-clock time the 5-agent run took — drives the Watchtower
+            # "AI Resolution" KPI (avg minutes). Nullable for legacy rows.
+            bigquery.SchemaField("duration_ms",             "FLOAT64"),
         ]
         table = bigquery.Table(_TRIAGE_CACHE_TABLE, schema=schema)
         table.time_partitioning = bigquery.TimePartitioning(
@@ -206,6 +209,15 @@ def _ensure_triage_cache_table() -> None:
             "5-agent flow. Written by POST /v23/triage, read on cache-hit + "
             "by GET /v23/triage/{order_id}/cached.")
         client.create_table(table, exists_ok=True)
+        # Idempotent: ensure duration_ms exists on a table created before this
+        # column was added (BQ supports ADD COLUMN IF NOT EXISTS). Best-effort.
+        try:
+            client.query(
+                f"ALTER TABLE `{_TRIAGE_CACHE_TABLE}` "
+                f"ADD COLUMN IF NOT EXISTS duration_ms FLOAT64"
+            ).result()
+        except Exception as exc:
+            log.warning("Triage cache duration_ms ALTER skipped: %s", exc)
         _triage_cache_table_ready = True
         log.info("Triage cache table ready: %s", _TRIAGE_CACHE_TABLE)
     except Exception as exc:
@@ -257,7 +269,8 @@ def _read_triage_cache(order_id: str) -> dict | None:
 
 
 def _write_triage_cache(order_id: str, backend: dict, session_id: str,
-                        synthesis: dict, raw_decision: dict) -> None:
+                        synthesis: dict, raw_decision: dict,
+                        duration_ms: float | None = None) -> None:
     """Persist a triage result to the in-process cache (L1) + BigQuery (L2)."""
     now = datetime.now(timezone.utc)
     _TRIAGE_MEM_CACHE[order_id] = {
@@ -282,6 +295,7 @@ def _write_triage_cache(order_id: str, backend: dict, session_id: str,
             "synthesis_json":          _json.dumps(synthesis),
             "raw_decision_json":       _json.dumps(raw_decision, default=str),
             "created_at":              now.isoformat(),
+            "duration_ms":             duration_ms,
         }
         errors = _bq_telemetry().insert_rows_json(_TRIAGE_CACHE_TABLE, [row])
         if errors:
@@ -976,7 +990,9 @@ async def v23_triage(order_id: str, backend: dict, force: bool = False) -> dict:
         trigger_payload={**order_event.to_dict(),
                          "trigger_source": "v23_payload"},
     )
+    _run_t0 = datetime.now(timezone.utc)
     await _run_session_tracked(session_id, "manual", order_event)
+    _run_duration_ms = (datetime.now(timezone.utc) - _run_t0).total_seconds() * 1000.0
     sess = get_session(session_id)
     if not sess:
         raise HTTPException(
@@ -992,7 +1008,8 @@ async def v23_triage(order_id: str, backend: dict, force: bool = False) -> dict:
 
     synthesis = decision_to_v23_synthesis(decision)
     # Persist so re-evaluating this order replays the stored result.
-    _write_triage_cache(order_id, backend, session_id, synthesis, decision)
+    _write_triage_cache(order_id, backend, session_id, synthesis, decision,
+                        duration_ms=_run_duration_ms)
 
     return {
         "order_id": order_id,
@@ -1261,6 +1278,29 @@ def read_telemetry(limit: int = 20) -> ExecutionTelemetryListResponse:
             "outcome":             r.get("outcome_note") or "",
         })
     return ExecutionTelemetryListResponse(entries=entries, total=len(entries))
+
+
+# ---------------------------------------------------------------------------
+# Decision Log — durable, paginated audit trail
+# ---------------------------------------------------------------------------
+@app.get("/decision-log")
+def decision_log(limit: int = 200, offset: int = 0) -> dict:
+    """Paginated audit trail of agentic decisions (newest first), read from
+    tiger_decisions.fct_allocation_decisions.
+
+    Returns { total_count, filtered_count, decisions[] }. Each decision row
+    carries the full audit surface — action (agent recommendation), fulfill
+    qty, fill_rate_pct, user_id, rationale, rejection_reason, session_id,
+    orchestrator_version, alignment, outcome, and OTIF penalty exposure.
+    On a hard failure returns 500 so the UI can fall back to its in-memory
+    current-session view.
+    """
+    from data_pipeline import fetch_decision_log_page
+    try:
+        return fetch_decision_log_page(limit=limit, offset=offset)
+    except Exception as exc:
+        log.error("decision-log fetch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Decision log unavailable")
 
 
 # ---------------------------------------------------------------------------

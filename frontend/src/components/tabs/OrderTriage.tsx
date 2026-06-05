@@ -32,7 +32,7 @@ import {
 import { Pill, Blinker } from '../primitives';
 import {
   fetchOrders, triageOrder, getTriageCached, approveSession, rejectSession, simulateFulfillment,
-  invalidateDashboard,
+  invalidateDashboard, appendSessionDecision,
   AbortError, ValidationError, BackendError, NetworkError,
 } from '../../lib/api';
 import type { Order, TriageResponse, AgentKey, SimulateResponse } from '../../lib/types';
@@ -983,6 +983,30 @@ export function OrderTriage({
     if (!result || !selectedOrder) return;
     setDecisionByOrder(prev => ({ ...prev, [selectedOrder.id]: 'approved' }));
     setPhase('decided');
+    // Optimistic append so the decision shows in the Decision Log immediately
+    // (and survives a backend outage). BQ reconciles on the next fetch.
+    const recA = result.synthesis?.rec;
+    appendSessionDecision({
+      id: result.session_id || selectedOrder.id,
+      timestamp: new Date().toISOString(),
+      poNumber: selectedOrder.po || selectedOrder.id,
+      customer: selectedOrder.customer,
+      material: selectedOrder.sku,
+      action: recA?.action || '',
+      agentRecommendation: recA?.action || '',
+      userDecision: 'approved',
+      fulfillQty: recA?.qty ?? selectedOrder.qty ?? 0,
+      fillRatePct: recA?.fill_pct ?? 0,
+      userId: USER_ID,
+      rationale: recA?.outcome || '',
+      sessionId: result.session_id || '',
+      orchestratorVersion: '',
+      overrideReason: null,
+      outcome: 'Submitted — pending fulfillment',
+      aligned: true,
+      financialImpact: 0,
+      wentWrong: false,
+    });
     try {
       await approveSession(result.session_id, USER_ID);
     } catch (e) {
@@ -1001,6 +1025,28 @@ export function OrderTriage({
     setRejectModalOpen(false);
     setDecisionByOrder(prev => ({ ...prev, [selectedOrder.id]: 'rejected' }));
     setPhase('decided');
+    const recR = result.synthesis?.rec;
+    appendSessionDecision({
+      id: result.session_id || selectedOrder.id,
+      timestamp: new Date().toISOString(),
+      poNumber: selectedOrder.po || selectedOrder.id,
+      customer: selectedOrder.customer,
+      material: selectedOrder.sku,
+      action: recR?.action || '',
+      agentRecommendation: recR?.action || '',
+      userDecision: 'rejected',
+      fulfillQty: 0,
+      fillRatePct: 0,
+      userId: USER_ID,
+      rationale: recR?.outcome || '',
+      sessionId: result.session_id || '',
+      orchestratorVersion: '',
+      overrideReason: reason,
+      outcome: 'Rejected by user',
+      aligned: false,
+      financialImpact: 0,
+      wentWrong: false,
+    });
     try {
       await rejectSession(result.session_id, USER_ID, reason);
     } catch (e) {

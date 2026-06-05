@@ -31,7 +31,8 @@ export function TopBar({ data, isLive }: { data: DashboardData; isLive: boolean 
     { label: 'Network CFR',         value: fmtPct(gk.networkCFR),                          color: C.green    },
     { label: 'Fines at Risk 7D',    value: fmtUsdK(gk.otifFinesAtRisk7Day),                color: C.red      },
     { label: 'Rev Preserved MTD',   value: fmtUsdK(gk.revenuePreservedMTD),                color: C.charcoal },
-    { label: 'Agent Accept Rate',   value: fmtPct(gk.agentRecommendationAcceptanceRate),   color: C.blue     },
+    // acceptance is a 0–1 fraction (Watchtower also ×100); CFR above is already a percent.
+    { label: 'Agent Accept Rate',   value: fmtPct((gk.agentRecommendationAcceptanceRate as number) * 100), color: C.blue },
   ];
 
   return (

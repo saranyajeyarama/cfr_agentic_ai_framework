@@ -153,16 +153,133 @@ def _fetch_global_kpis(client: bigquery.Client) -> dict:
           AND delivery_date_promised <= {anchor_expr}
     """), "cnt", 0)
 
+    # --- Agentic decision KPIs (tiger_decisions, US multi-region) -------------
+    # fct_allocation_decisions + fct_user_execution_telemetry live in the US
+    # multi-region and are written in real time, so they anchor to CURRENT_DATE()
+    # (not the historical OTIF max-date) and need a US-located client (the main
+    # `client` here is us-central1). Best-effort: any failure degrades to 0 —
+    # identical to the prior hardcoded behaviour on a fresh/empty deploy.
+    decisions_logged_mtd = 0
+    acceptance_rate = 0.0
+    try:
+        _cu = bigquery.Client(project=PROJECT_ID, location="US")
+        # Decisions captured this calendar month.
+        d_rows = list(_cu.query(f"""
+            SELECT COUNT(*) AS n
+            FROM `{PROJECT_ID}.tiger_decisions.fct_allocation_decisions`
+            WHERE decision_date >= DATE_TRUNC(CURRENT_DATE(), MONTH)
+        """).result())
+        decisions_logged_mtd = _safe_int(d_rows[0].get("n")) if d_rows else 0
+        # Agent-recommendation acceptance: telemetry has no `aligned` column, so
+        # derive it — the human is "aligned" when their approve/reject matches
+        # whether the agent recommended a positive (ACCEPT/PARTIAL) action.
+        a_rows = list(_cu.query(f"""
+            SELECT
+              COUNTIF(
+                (LOWER(user_decision) IN ('approved','accept','accepted'))
+                = (UPPER(agent_recommendation) IN ('ACCEPT','PARTIAL','PARTIAL_FULFILL'))
+              ) AS aligned,
+              COUNT(*) AS total
+            FROM `{PROJECT_ID}.tiger_decisions.fct_user_execution_telemetry`
+            WHERE user_decision IS NOT NULL
+        """).result())
+        if a_rows:
+            total = _safe_int(a_rows[0].get("total"))
+            aligned = _safe_int(a_rows[0].get("aligned"))
+            acceptance_rate = round(aligned / total, 3) if total else 0.0
+    except Exception as exc:
+        log.warning("Agentic decision KPIs query failed: %s", exc)
+
+    # --- Headline metric cards (OTIF score, fill rate, open orders, triage) ---
+    # OTIF score + fill rate over the trailing 90d vs the prior 90d (for deltas),
+    # in one pass over fct_otif. Targets below are business config, not metrics.
+    otif_score = round(_safe_float(cfr), 1)   # CFR already computed above
+    otif_delta_pp = 0.0
+    fill_rate = 0.0
+    fill_delta_pp = 0.0
+    of_rows = _run(client, f"""
+        SELECT
+          ROUND(SAFE_DIVIDE(COUNTIF(otif_flag='Y' AND win=0), NULLIF(COUNTIF(win=0),0))*100, 1) AS otif_cur,
+          ROUND(SAFE_DIVIDE(COUNTIF(otif_flag='Y' AND win=1), NULLIF(COUNTIF(win=1),0))*100, 1) AS otif_prev,
+          ROUND(SAFE_DIVIDE(SUM(IF(win=0, delivered_quantity_cases, 0)),
+                            NULLIF(SUM(IF(win=0, ordered_quantity_cases, 0)),0))*100, 1) AS fill_cur,
+          ROUND(SAFE_DIVIDE(SUM(IF(win=1, delivered_quantity_cases, 0)),
+                            NULLIF(SUM(IF(win=1, ordered_quantity_cases, 0)),0))*100, 1) AS fill_prev
+        FROM (
+          SELECT otif_flag, delivered_quantity_cases, ordered_quantity_cases,
+            CASE
+              WHEN delivery_date_promised >= DATE_SUB({anchor_expr}, INTERVAL 90 DAY) THEN 0
+              WHEN delivery_date_promised >= DATE_SUB({anchor_expr}, INTERVAL 180 DAY) THEN 1
+            END AS win
+          FROM `{SEMANTIC_DS}.fct_otif`
+          WHERE delivery_date_promised <= {anchor_expr}
+        )
+        WHERE win IS NOT NULL
+    """)
+    if of_rows:
+        r0 = of_rows[0]
+        otif_score = _safe_float(r0.get("otif_cur"), otif_score)
+        fill_rate = _safe_float(r0.get("fill_cur"))
+        otif_delta_pp = round(otif_score - _safe_float(r0.get("otif_prev")), 1)
+        fill_delta_pp = round(fill_rate - _safe_float(r0.get("fill_prev")), 1)
+
+    # Open orders: un-rejected sales orders still to be delivered (>= today).
+    open_orders = _safe_int(_scalar(_run(client, f"""
+        SELECT COUNT(*) AS n
+        FROM `{SEMANTIC_DS}.fct_sales_orders`
+        WHERE rejection_reason IS NULL
+          AND requested_delivery_date >= CURRENT_DATE()
+    """), "n", 0))
+
+    # Orders in triage: the canonical Order-Triage candidate queue size.
+    orders_in_triage = 0
+    try:
+        from agent_tools import get_demo_scenario_candidates
+        orders_in_triage = _safe_int(
+            get_demo_scenario_candidates(limit=500).get("row_count", 0))
+    except Exception as exc:
+        log.warning("ordersInTriage count failed: %s", exc)
+
+    # AI Resolution: average agent triage run time (minutes), from the durations
+    # measured + stored in the triage cache. NULL until triages run post-deploy
+    # (no historical timing exists); the card shows "—" until populated.
+    ai_resolution_min = None
+    try:
+        _cu2 = bigquery.Client(project=PROJECT_ID, location="US")
+        ar = list(_cu2.query(f"""
+            SELECT ROUND(AVG(duration_ms) / 60000.0, 1) AS mins
+            FROM `{PROJECT_ID}.tiger_decisions.fct_triage_cache`
+            WHERE duration_ms IS NOT NULL
+        """).result())
+        if ar and ar[0].get("mins") is not None:
+            ai_resolution_min = _safe_float(ar[0].get("mins"))
+    except Exception as exc:
+        log.warning("aiResolutionMinutes query failed: %s", exc)
+
     return {
         "networkCFR":                        round(_safe_float(cfr), 1),
         "networkCFRTarget":                  98.0,
         "otifFinesAtRisk7Day":               _safe_int(fines_7d),
         "revenuePreservedMTD":               _safe_int(rev_preserved),
+        # No demurrage/detention source exists in the warehouse — intentionally
+        # left at 0 (not fabricated) and not shown in the Watchtower ribbon.
         "demurrageAvoidedWTD":               0,
         "casesAtRiskThisWeek":               _safe_int(cases_at_risk),
         "activeAlerts":                      _safe_int(active_alerts),
-        "decisionsLoggedMTD":                0,
-        "agentRecommendationAcceptanceRate": 0.0,
+        "decisionsLoggedMTD":                decisions_logged_mtd,
+        "agentRecommendationAcceptanceRate": acceptance_rate,
+        # Headline metric cards (real data; targets are business config).
+        "otifScore":                         otif_score,
+        "otifScoreDeltaPp":                  otif_delta_pp,
+        "otifScoreTarget":                   95.0,
+        "fillRate":                          fill_rate,
+        "fillRateDeltaPp":                   fill_delta_pp,
+        "fillRateTarget":                    98.0,
+        "finesAtRiskTarget":                 250000,
+        "openOrders":                        open_orders,
+        "ordersInTriage":                    orders_in_triage,
+        "aiResolutionMinutes":               ai_resolution_min,
+        "aiResolutionTargetMin":             10,
     }
 
 
@@ -1027,41 +1144,192 @@ def _fetch_safety_stock(client: bigquery.Client) -> list[dict]:
 # Decision Log  (reads tiger_decisions.fct_allocation_decisions when present)
 # -----------------------------------------------------------------------------
 
+# Shared decision-log column projection + filter (dashboard view + /decision-log
+# endpoint use the same audit-row shape).
+_DECISION_SELECT = """
+    decision_id,
+    decision_date,
+    sold_to,
+    decision_status,
+    decision_approved_by,
+    ordered_quantity_cases   AS ordered,
+    allocated_quantity_cases AS allocated,
+    shortfall_quantity_cases AS shortfall,
+    fill_rate_pct            AS fill_rate,
+    JSON_VALUE(decision_reason, '$.agent_recommendation')        AS agent_rec,
+    JSON_VALUE(decision_reason, '$.user_decision')               AS user_decision,
+    JSON_VALUE(decision_reason, '$.decision_aligned_with_agent') AS aligned,
+    JSON_VALUE(decision_reason, '$.rejection_reason')            AS override_reason,
+    JSON_VALUE(decision_reason, '$.rationale')                   AS rationale,
+    JSON_VALUE(decision_reason, '$.session_id')                  AS session_id,
+    JSON_VALUE(decision_reason, '$.orchestrator_version')        AS orchestrator_version,
+    JSON_VALUE(decision_reason, '$.trigger.sales_order_number')  AS order_no,
+    JSON_VALUE(decision_reason, '$.trigger.customer_name')       AS customer_name,
+    JSON_VALUE(decision_reason, '$.trigger.material_number')     AS material
+"""
+# Exclude PLACEHOLDER test rows from the audit view.
+_DECISION_WHERE = ("COALESCE(JSON_VALUE(decision_reason, '$.trigger.customer_name'), '') "
+                   "NOT LIKE 'PLACEHOLDER%'")
+
+
+# Process-level cache of per-customer OTIF penalty rate ($/case). The decision
+# log references only a handful of customers; caching across requests keeps the
+# audit endpoint fast (no per-row chargeback queries on every load).
+_PENALTY_RATE_CACHE: dict[str, float] = {}
+
+
+def _penalty_rates(sold_tos: list) -> dict:
+    """Return {sold_to: penalty_per_case_usd} for the given customers.
+
+    Queries fct_chargebacks + fct_otif (us-central1) in ONE batched query for any
+    customers not yet cached. Formula matches get_customer_penalty_profile
+    (avg_chargeback × n / total_late_qty over 180d; $25 fallback)."""
+    want = sorted({s for s in sold_tos if s and s not in _PENALTY_RATE_CACHE})
+    if want:
+        try:
+            cc = _bq_client()
+            rows = _run(cc, f"""
+              WITH cb AS (
+                SELECT sold_to, AVG(NULLIF(chargeback_amount_usd, 0)) AS avg_amt, COUNT(*) AS n
+                FROM `{SEMANTIC_DS}.fct_chargebacks`
+                WHERE sold_to IN UNNEST(@solds)
+                  AND chargeback_assessed_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)
+                  AND COALESCE(chargeback_status, '') <> 'WRITTEN_OFF'
+                GROUP BY sold_to
+              ),
+              lu AS (
+                SELECT sold_to,
+                       SUM(GREATEST(ordered_quantity_cases - COALESCE(delivered_quantity_cases, 0), 0)) AS late_qty
+                FROM `{SEMANTIC_DS}.fct_otif`
+                WHERE sold_to IN UNNEST(@solds) AND otif_flag = 'N'
+                  AND delivery_date_promised >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)
+                GROUP BY sold_to
+              )
+              SELECT cb.sold_to AS sold_to, cb.avg_amt AS avg_amt, cb.n AS n, lu.late_qty AS late_qty
+              FROM cb LEFT JOIN lu USING (sold_to)
+            """, [bigquery.ArrayQueryParameter("solds", "STRING", want)])
+            for r in rows:
+                avg_amt = r.get("avg_amt")
+                n = int(r.get("n") or 0)
+                late = float(r.get("late_qty") or 0)
+                per = (float(avg_amt) * n / late) if (avg_amt and n > 0 and late > 0) else 0.0
+                _PENALTY_RATE_CACHE[r.get("sold_to")] = round(per, 2) if per > 0 else 25.0
+        except Exception as exc:
+            log.warning("batch penalty query failed: %s", exc)
+        for s in want:                       # customers with no chargebacks → fallback
+            _PENALTY_RATE_CACHE.setdefault(s, 25.0)
+    return {s: _PENALTY_RATE_CACHE.get(s, 25.0) for s in sold_tos if s}
+
+
+def _decision_row(r: dict, penalty_fn) -> dict:
+    """Build one enriched Decision Log audit row from a raw
+    fct_allocation_decisions row. Surfaces every audit field the UI shows."""
+    d = r.get("decision_date")
+    ts = d.isoformat() if isinstance(d, (date, datetime)) else str(d or "")
+    sold_to = r.get("sold_to") or ""
+    ordered = _safe_float(r.get("ordered"))
+    alloc = _safe_float(r.get("allocated"))
+    short = _safe_float(r.get("shortfall"))
+    fill = _safe_float(r.get("fill_rate"))
+    status = (r.get("decision_status") or "").upper()
+    user_dec = (r.get("user_decision") or "").lower()
+
+    # Real alignment from the DCE record; fall back to "user approved" for
+    # legacy rows missing the flag (matches how dce_write set it).
+    aligned_raw = (r.get("aligned") or "").strip().lower()
+    if aligned_raw in ("true", "false"):
+        aligned = aligned_raw == "true"
+    else:
+        aligned = user_dec in ("approved", "accept", "accepted")
+
+    # Outcome derived from real fill / shortfall / status.
+    if fill >= 100 or (ordered > 0 and alloc >= ordered):
+        outcome = "Fulfilled · CFR 100%"
+    elif alloc <= 0 and short > 0:
+        outcome = f"Not allocated · {int(short):,} cs short"
+    elif 0 < fill < 100:
+        outcome = f"Partial · {fill:.0f}% · {int(short):,} cs short"
+    else:
+        outcome = status.title() or "—"
+
+    # Financial = OTIF penalty exposure (shortfall × per-customer rate).
+    penalty = penalty_fn(sold_to) if short > 0 else 0.0
+    financial = -round(short * penalty) if short > 0 else 0
+
+    return {
+        "id":                  r.get("decision_id", ""),
+        "timestamp":           ts,
+        "poNumber":            r.get("order_no") or "",
+        "customer":            r.get("customer_name") or sold_to,
+        "material":            r.get("material") or "",
+        # `action` = the agent's recommendation (ACCEPT/REJECT/PARTIAL/DEFER).
+        "action":              r.get("agent_rec") or "",
+        "agentRecommendation": r.get("agent_rec") or "",
+        "userDecision":        user_dec,
+        "fulfillQty":          alloc,
+        "fillRatePct":         round(fill, 1),
+        "userId":              r.get("decision_approved_by") or "",
+        "rationale":           r.get("rationale") or "",
+        "sessionId":           r.get("session_id") or "",
+        "orchestratorVersion": r.get("orchestrator_version") or "",
+        "overrideReason":      r.get("override_reason"),
+        "outcome":             outcome,
+        "aligned":             aligned,
+        "financialImpact":     financial,
+        "wentWrong":           (not aligned) and short > 0,
+    }
+
+
 def _fetch_decision_log(client: bigquery.Client) -> list[dict]:
-    """Recent agentic decisions from the DCE table. Returns [] if the
-    tiger_decisions dataset/table does not exist yet (fresh deploy)."""
-    # tiger_decisions lives in the US multi-region (created there by default);
-    # use its own client so we don't get a cross-location 404.
+    """Latest 20 agentic decisions for the dashboard's `decisionCaptureLog`.
+
+    Source: tiger_decisions.fct_allocation_decisions (US multi-region — its own
+    client avoids a cross-location 404). PLACEHOLDER test rows are filtered out.
+    """
     dclient = _bq_decisions()
     decisions_ds = f"{PROJECT_ID}.tiger_decisions"
     rows = _run(dclient, f"""
-        SELECT
-            decision_id,
-            decision_date,
-            sold_to,
-            decision_status,
-            JSON_VALUE(decision_reason, '$.agent_recommendation') AS agent_rec,
-            JSON_VALUE(decision_reason, '$.user_decision')        AS user_decision,
-            JSON_VALUE(decision_reason, '$.rejection_reason')     AS override_reason
+        SELECT {_DECISION_SELECT}
         FROM `{decisions_ds}.fct_allocation_decisions`
+        WHERE {_DECISION_WHERE}
         ORDER BY decision_date DESC
-        LIMIT 10
+        LIMIT 20
     """)
-    log: list[dict] = []
-    for r in rows:
-        d = r.get("decision_date")
-        ts = d.isoformat() if isinstance(d, (date, datetime)) else str(d or "")
-        log.append({
-            "id":                  r.get("decision_id", ""),
-            "timestamp":           ts,
-            "poNumber":            "",
-            "customer":            r.get("sold_to", ""),
-            "agentRecommendation": r.get("agent_rec") or "",
-            "userDecision":        (r.get("user_decision") or "").lower(),
-            "overrideReason":      r.get("override_reason"),
-            "outcome":             (r.get("decision_status") or "").lower(),
-        })
-    return log
+    rates = _penalty_rates([r.get("sold_to") for r in rows])
+    return [_decision_row(r, lambda st: rates.get(st, 25.0)) for r in rows]
+
+
+def fetch_decision_log_page(limit: int = 200, offset: int = 0) -> dict:
+    """Paginated audit trail for GET /decision-log.
+
+    Returns {total_count, filtered_count, decisions[]}. total_count is the full
+    row count (for pagination); filtered_count is rows on this page. Newest first.
+    """
+    limit = max(1, min(int(limit or 200), 1000))
+    offset = max(0, int(offset or 0))
+    dclient = _bq_decisions()
+    decisions_ds = f"{PROJECT_ID}.tiger_decisions"
+    # One query: page rows + full filtered count via COUNT(*) OVER() (window runs
+    # over all WHERE-matching rows, before LIMIT) — avoids a second COUNT query.
+    rows = _run(dclient, f"""
+        SELECT {_DECISION_SELECT},
+               COUNT(*) OVER() AS total_rows
+        FROM `{decisions_ds}.fct_allocation_decisions`
+        WHERE {_DECISION_WHERE}
+        ORDER BY decision_date DESC
+        LIMIT @limit OFFSET @offset
+    """, [
+        bigquery.ScalarQueryParameter("limit", "INT64", limit),
+        bigquery.ScalarQueryParameter("offset", "INT64", offset),
+    ])
+    total = _safe_int(rows[0].get("total_rows")) if rows else 0
+    rates = _penalty_rates([r.get("sold_to") for r in rows])
+    decisions = [_decision_row(r, lambda st: rates.get(st, 25.0)) for r in rows]
+    return {
+        "total_count":    total,
+        "filtered_count": len(decisions),
+        "decisions":      decisions,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

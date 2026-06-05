@@ -19,6 +19,19 @@ export function Watchtower() {
 
   const { alerts, networkNodes, globalKPIs } = data;
 
+  // Headline metric cards (below the ribbon). All real BigQuery KPIs; targets
+  // are business config. AI Resolution is null until triages run post-deploy.
+  const k = globalKPIs as Record<string, number | null>;
+  const fmtPp = (v: number) => `${v > 0 ? '+' : ''}${v.toFixed(1)} pp`;
+  const metricCards: { label: string; value: string; delta?: string; deltaUp?: boolean; target?: string }[] = [
+    { label: 'OTIF Score', value: `${(k.otifScore ?? 0).toFixed(1)}%`, delta: k.otifScoreDeltaPp != null ? fmtPp(k.otifScoreDeltaPp) : undefined, deltaUp: (k.otifScoreDeltaPp ?? 0) >= 0, target: `Target: ${(k.otifScoreTarget ?? 95).toFixed(1)}%` },
+    { label: 'Fill Rate', value: `${(k.fillRate ?? 0).toFixed(1)}%`, delta: k.fillRateDeltaPp != null ? fmtPp(k.fillRateDeltaPp) : undefined, deltaUp: (k.fillRateDeltaPp ?? 0) >= 0, target: `Target: ${(k.fillRateTarget ?? 98).toFixed(1)}%` },
+    { label: 'Fines at Risk', value: `$${Math.round((k.otifFinesAtRisk7Day ?? 0) / 1000)}K`, target: `Target: <$${Math.round((k.finesAtRiskTarget ?? 250000) / 1000)}K` },
+    { label: 'Open Orders', value: (k.openOrders ?? 0).toLocaleString(), target: 'Target: --' },
+    { label: 'Orders in Triage', value: (k.ordersInTriage ?? 0).toLocaleString(), target: 'Target: --' },
+    { label: 'AI Resolution', value: k.aiResolutionMinutes != null ? `${k.aiResolutionMinutes} min` : '—', target: `Target: <${k.aiResolutionTargetMin ?? 10} min` },
+  ];
+
   const getNodeCoords = (id: string) => {
     const n = networkNodes.find(n => n.id === id);
     return n ? [n.lng, n.lat] as [number, number] : [0, 0] as [number, number];
@@ -48,6 +61,38 @@ export function Watchtower() {
 
 
       <div className="flex-1 overflow-y-auto p-6 grid grid-cols-12 gap-6 bg-slate-50">
+        {/* Impact Ribbon — full width */}
+        <div className="col-span-12 bg-slate-800 rounded-xl p-4 flex justify-between items-center text-white shadow-sm">
+          <div className="flex flex-col items-center flex-1">
+            <span className="text-2xl font-bold font-mono">${(globalKPIs.otifFinesAtRisk7Day ?? 0).toLocaleString()}</span>
+            <span className="text-[10px] text-slate-400 uppercase tracking-widest mt-1">OTIF Fines at Risk (7d)</span>
+          </div>
+          <div className="w-px h-10 bg-slate-700"></div>
+          <div className="flex flex-col items-center flex-1">
+            <span className="text-2xl font-bold font-mono">{globalKPIs.casesAtRiskThisWeek.toLocaleString()}</span>
+            <span className="text-[10px] text-slate-400 uppercase tracking-widest mt-1">Cases At Risk This Week</span>
+          </div>
+          <div className="w-px h-10 bg-slate-700"></div>
+          <div className="flex flex-col items-center flex-1">
+            <span className="text-2xl font-bold font-mono">{(globalKPIs.agentRecommendationAcceptanceRate * 100).toFixed(0)}%</span>
+            <span className="text-[10px] text-slate-400 uppercase tracking-widest mt-1">Agent Acceptance Rate</span>
+          </div>
+        </div>
+
+        {/* Headline metric cards — full width */}
+        <div className="col-span-12 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+          {metricCards.map((c) => (
+            <div key={c.label} className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+              <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">{c.label}</div>
+              <div className="text-2xl font-bold font-mono text-slate-800 mt-1">{c.value}</div>
+              {c.delta && (
+                <div className={`text-[11px] font-bold mt-0.5 ${c.deltaUp ? 'text-emerald-600' : 'text-[#DB033B]'}`}>{c.delta}</div>
+              )}
+              {c.target && <div className="text-[10px] text-slate-400 mt-0.5">{c.target}</div>}
+            </div>
+          ))}
+        </div>
+
         {/* Component 1: The Agent Inbox (Action Queue) */}
         <div className="col-span-4 flex flex-col gap-4">
           <div className="flex items-center justify-between">
@@ -73,24 +118,6 @@ export function Watchtower() {
 
         {/* Component 2: Network Constraint Topology */}
         <div className="col-span-8 flex flex-col gap-4">
-          {/* Impact Ribbon */}
-          <div className="bg-slate-800 rounded-xl p-4 flex justify-between items-center text-white shadow-sm">
-            <div className="flex flex-col items-center flex-1">
-              <span className="text-2xl font-bold font-mono">${globalKPIs.demurrageAvoidedWTD.toLocaleString()}</span>
-              <span className="text-[10px] text-slate-400 uppercase tracking-widest mt-1">Demurrage Avoided This Week</span>
-            </div>
-            <div className="w-px h-10 bg-slate-700"></div>
-            <div className="flex flex-col items-center flex-1">
-              <span className="text-2xl font-bold font-mono">{globalKPIs.casesAtRiskThisWeek.toLocaleString()}</span>
-              <span className="text-[10px] text-slate-400 uppercase tracking-widest mt-1">Cases At Risk This Week</span>
-            </div>
-            <div className="w-px h-10 bg-slate-700"></div>
-            <div className="flex flex-col items-center flex-1">
-              <span className="text-2xl font-bold font-mono">{(globalKPIs.agentRecommendationAcceptanceRate * 100).toFixed(0)}%</span>
-              <span className="text-[10px] text-slate-400 uppercase tracking-widest mt-1">Agent Acceptance Rate</span>
-            </div>
-          </div>
-
           <h2 className="text-xs font-bold text-slate-500 uppercase tracking-widest">Network Topology Map</h2>
           <div className="flex-1 bg-slate-100 border border-slate-200 rounded-xl relative overflow-hidden">
             
