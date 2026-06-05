@@ -279,7 +279,9 @@ export async function rejectSession(
 ): Promise<void> {
   await request<unknown>(
     `/sessions/${encodeURIComponent(sessionId)}/reject`,
-    { method: 'POST', body: { user_id: userId, reason }, noContent: true },
+    // Backend RejectionRequest requires `rejection_reason` (not `reason`); the
+    // order is identified by session_id in the URL, so no order info is needed.
+    { method: 'POST', body: { user_id: userId, rejection_reason: reason }, noContent: true },
   );
 }
 
