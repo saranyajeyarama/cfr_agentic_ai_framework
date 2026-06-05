@@ -1698,14 +1698,9 @@ def get_network_inventory(
     RDD is given (preserves Fulfillment Simulator semantics).
 
     Phase 1 limitation: this does NOT subtract open commitments from
-    tiger_decisions.fct_allocation_decisions yet. The decision log lives
-    in a separate dataset and the cross-dataset join needs a location
-    fix (BQ picks the wrong region when both are referenced). Until the
-    location handling is in, `committed` is reported as 0 and `available`
-    equals `ending`. This is safe for the demo (decision log is empty)
-    and gives the LP correctly-bounded plant capacities; once Phase 2
-    wires real commitments, only the `committed` and `available` columns
-    change — the caller surface is stable.
+    tiger_decisions.fct_allocation_decisions yet. Until the cross-dataset
+    region issue is fixed, `committed` is reported as 0 and `available`
+    equals `ending`.
 
     Args:
         material_number: FERT material number.
@@ -1713,7 +1708,7 @@ def get_network_inventory(
         requested_delivery_date: optional ISO date 'YYYY-MM-DD'. When
             provided, the projection window is anchored on this date as
             [delivery - 4 weeks, delivery + 1 week] and only the LATEST
-            plan_version_id per (plant, storage_loc, week) is summed —
+            plan_version_id per (plant, storage_loc, week) is used —
             so the Order Triage Inventory Snapshot widget reflects the
             true RDD-window inventory using the current forecast.
             When omitted, falls back to "earliest-projection-week per
@@ -1727,6 +1722,7 @@ def get_network_inventory(
           "row_count": int,
           "note": "commitments not subtracted in Phase 1",
           "sold_to_filter_applied": False,
+          "strategy": "rdd_anchored" | "fallback_earliest_week",
         }
     """
     # ───────── BUG-FIX-PHASE2: RDD-anchored + plan_version filter ─────────
@@ -1741,8 +1737,9 @@ def get_network_inventory(
             params = [_p("matnr", "STRING", material_number),
                       _p("rdd", "STRING", requested_delivery_date)]
             # In the RDD window: pick the LATEST plan_version_id per
-            # (plant, storage_loc, week), then SUM across storage locations
-            # within each plant to get one available figure per plant.
+            # (plant, storage_loc, week), then choose the week closest
+            # to RDD (preferring on-or-before) to avoid double-counting
+            # across multiple weeks in the window.
             sql = f"""
               WITH in_window AS (
                 SELECT plant_code, storage_location, plan_version_id,
@@ -1761,10 +1758,6 @@ def get_network_inventory(
                   ) AS rn
                 FROM in_window
               ),
-              -- Pick ONE representative week per plant (closest to RDD).
-              -- For each plant, prefer the row whose week is on or just
-              -- before the delivery date; this avoids double-counting
-              -- across multiple weeks in the window.
               ranked_weeks AS (
                 SELECT plant_code,
                        SUM(ending_inventory_cases) AS week_total,
@@ -1810,7 +1803,7 @@ def get_network_inventory(
     else:
         print(f"[DEBUG-INV-NET] no rdd provided; using earliest-week behavior")
 
-    # ───────── ORIGINAL behavior: earliest-projection-week per plant ─────────
+    # ───────── ORIGINAL behavior: earliest-projection-week per plant ─────
     params = [_p("matnr", "STRING", material_number)]
     sql = f"""
       WITH per_plant AS (
@@ -2020,6 +2013,62 @@ RETAIL_INTELLIGENCE_TOOLS = [
     _T(get_customer_compliance_rules),
 ]
 
+
+# ───────── BUG-FIX-PHASE2 / Fulfillment Agent ─────────
+# Wrapper that exposes the freight-cost lookup (currently a private fn in
+# fulfillment_optimizer.py) as an ADK-callable tool. Returns a dict (the
+# tool-result shape agents expect) instead of a raw float, and surfaces
+# the source config path for traceability.
+def lookup_freight_cost(
+    origin_plant: str,
+    customer_region: Optional[str] = None,
+) -> dict:
+    """Per-plant per-region freight cost in USD per case.
+
+    Reads config/freight_costs.json (loaded once at import time) and
+    falls through: plant→region rate → plant default → global default.
+    Used by the Fulfillment Agent in Step 3 of its 5-step routing logic.
+
+    Args:
+        origin_plant: candidate origin plant code (e.g., 'US02', 'DC03').
+        customer_region: customer region key or US state abbreviation.
+
+    Returns:
+        {
+          "origin_plant": ...,
+          "customer_region": ...,
+          "usd_per_case": float,
+          "view_queried": "config/freight_costs.json",
+        }
+    """
+    from fulfillment_optimizer import lookup_freight_cost as _lp_lookup
+    cost = _lp_lookup(origin_plant, customer_region)
+    return {
+        "origin_plant": origin_plant,
+        "customer_region": customer_region,
+        "usd_per_case": float(cost),
+        "view_queried": "config/freight_costs.json",
+    }
+
+
+# Tools available to the Fulfillment Agent. Mirrors the 5-step business
+# logic in agents/fulfillment_agent.md:
+#   Step 1 supply    — get_network_inventory
+#   Step 2 transport — get_lane_transit_profile, get_carrier_otp
+#   Step 3 cost      — lookup_freight_cost
+#   Step 4 fine      — get_customer_penalty_profile
+#   Step 5 combine   — (the agent's own reasoning; no tool)
+# Plus get_customer_compliance_rules for MABD / tier context.
+FULFILLMENT_TOOLS = [
+    _T(get_network_inventory),
+    _T(get_customer_penalty_profile),
+    _T(get_lane_transit_profile),
+    _T(get_carrier_otp),
+    _T(lookup_freight_cost),
+    _T(get_customer_compliance_rules),
+]
+
+
 # Registry — every callable tool by name (excludes dce_write by design).
 ALL_TOOLS = {
     "get_open_sales_orders":        get_open_sales_orders,
@@ -2041,10 +2090,11 @@ ALL_TOOLS = {
     "get_promotional_context":      get_promotional_context,
     "get_forecast_accuracy":        get_forecast_accuracy,
     "get_allocation_history":       get_allocation_history,
-    # Fulfillment Simulator (Phase 1) — used by fulfillment_optimizer.py.
-    # Not bound to any agent yet; future agents can register them via _T().
+    # Fulfillment Simulator (Phase 1) — used by fulfillment_optimizer.py
+    # and by the Phase 2 Fulfillment Agent (FULFILLMENT_TOOLS).
     "get_network_inventory":        get_network_inventory,
     "get_customer_penalty_profile": get_customer_penalty_profile,
+    "lookup_freight_cost":          lookup_freight_cost,
 }
 
 

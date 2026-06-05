@@ -45,6 +45,12 @@ services:
       # Tool result row cap. ADK keeps every tool response in session
       # memory; capping keeps the per-agent footprint bounded.
       TOOL_ROW_CAP: "50"
+      # Fulfillment Simulator engine selector:
+      #   "true"  → Gemini-backed Fulfillment Agent (5-step routing logic)
+      #   unset / "false" → deterministic LP optimizer (PuLP/CBC)
+      # Toggle without rebuild — restart is enough. The legacy LP path is
+      # kept dormant either way, so this is a one-line revert if needed.
+      FULFILLMENT_USE_AGENT: "true"
     # Memory budget. Docker Desktop on WSL2 by default lets containers
     # use most of the VM's RAM; under cumulative agent load that has
     # OOM-killed this container. 4 GiB is generous for the agent flow

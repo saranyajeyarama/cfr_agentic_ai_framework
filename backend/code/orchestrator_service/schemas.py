@@ -416,6 +416,11 @@ class FulfillmentSimulateRequest(BaseModel):
     origin_plant: Optional[str] = None
     customer_region: Optional[str] = None
     blocked_plants: list[str] = Field(default_factory=list)
+    # BUG-FIX-PHASE2 / Step 6: free-text soft constraints the planner can
+    # add via the UI (e.g., "DC04 closed today" or "prefer DC02"). The
+    # Fulfillment Agent reads this as SOFT guidance; hard blocks belong in
+    # blocked_plants. LP path ignores this field.
+    user_constraints: Optional[str] = None
 
 
 class FulfillmentSimulateMeta(BaseModel):
@@ -436,11 +441,113 @@ class FulfillmentSimulateMeta(BaseModel):
     commitments_subtracted: bool = False
     inventory_note: Optional[str] = None
     is_demo_seed: bool = False
+    # ───────── BUG-FIX-PHASE2: which engine produced this response ─────────
+    # "deterministic_lp" — the original PuLP/CBC LP solver
+    # "agent"            — the Phase 2 Fulfillment Agent (Gemini-backed)
+    # Frontend reads this to show an "Engine: AGENT | LP" badge on the
+    # scenario cards so the planner knows what produced the recommendation.
+    engine: Literal["deterministic_lp", "agent"] = "deterministic_lp"
+    engine_note: Optional[str] = None
+    agent_decision_summary: Optional[str] = None
+    agent_confidence: Optional[float] = None
+    agent_tradeoffs: list[str] = Field(default_factory=list)
+    user_constraints_applied: list[str] = Field(default_factory=list)
+    blocked_plants_applied: list[str] = Field(default_factory=list)
 
 
 class FulfillmentSimulateResponse(BaseModel):
     scenarios: list[FulfillmentScenario]
     meta: FulfillmentSimulateMeta
+
+
+# ───────── BUG-FIX-PHASE2 / Fulfillment Agent — output schema ─────────
+# These models define the shape the new Fulfillment Agent will emit. They
+# mirror the existing FulfillmentScenario fields so the frontend can render
+# either output (LP or agent) with minimal divergence, while adding the
+# rationale-rich fields the business team requested (natural-language
+# explanation, trade-offs list, user-constraint echo).
+#
+# The legacy LP code path (fulfillment_optimizer.simulate) and its output
+# types (FulfillmentScenario, FulfillmentSimulateResponse) are NOT removed
+# — they stay dormant behind a feature flag so rollback to LP is a single
+# env-var flip.
+# ----------------------------------------------------------------------
+class PlantAllocation(BaseModel):
+    """Per-plant breakdown showing what the agent decided to ship."""
+    plant_code: str
+    plant_name: Optional[str] = None
+    plant_city: Optional[str] = None
+    plant_type: Optional[str] = None   # "Manufacturing" | "Distribution Center"
+    cases_allocated: float = 0.0
+    available_cases: float = 0.0
+    freight_cost_per_case_usd: float = 0.0
+    transit_hours: Optional[float] = None
+    carrier: Optional[str] = None
+
+
+class FulfillmentAgentScenario(BaseModel):
+    """One scenario card produced by the Fulfillment Agent.
+
+    Shape mirrors FulfillmentScenario above so the frontend can render
+    LP and agent output through the same component, with additive fields
+    (rationale, tradeoffs, plant_details) for the richer agent reasoning.
+    """
+    id: str                                  # e.g. "scenario-a-default"
+    name: str
+    tagline: str = ""
+    arrival: str = ""
+    dc_source: str = ""                      # rollup label, e.g. "US02 + DC03"
+
+    freight_cost: float = 0.0
+    fine: float = 0.0
+    net_impact: float = 0.0                  # -(freight + fine)
+    savings_vs_default: float = 0.0
+    is_recommended: bool = False
+
+    # The agent's natural-language reasoning — the headline value-add.
+    rationale: str = ""                      # full paragraph
+    tradeoffs: list[str] = Field(default_factory=list)
+
+    # Per-plant breakdown (mirrors LP's plantDetails).
+    plant_details: list[PlantAllocation] = Field(default_factory=list)
+    transit_hours: Optional[float] = None
+    carrier_name: Optional[str] = None
+
+
+class FulfillmentAgentDecision(BaseModel):
+    """The full envelope returned by the Fulfillment Agent.
+
+    The endpoint normalizes this to the existing FulfillmentSimulateResponse
+    shape so the frontend remains the same. The extra fields (rationale,
+    tradeoffs, user_constraints_applied) are surfaced into the per-scenario
+    rationale block on the cards.
+    """
+    agent: Literal["fulfillment"] = "fulfillment"
+    session_id: Optional[str] = None
+
+    # Order echo so the frontend / debug tools have full context.
+    order_summary: dict[str, Any] = Field(default_factory=dict)
+    # Expected keys: sold_to, material_number, ordered_quantity_cases,
+    # requested_delivery_date, origin_plant, customer_region.
+
+    # The two scenarios (Default Route + Agent Recommendation).
+    scenarios: list[FulfillmentAgentScenario] = Field(default_factory=list)
+
+    # What the agent considered as constraints — echoed so the UI can
+    # confirm to the user that their input was applied.
+    user_constraints_applied: list[str] = Field(default_factory=list)
+    blocked_plants_applied: list[str] = Field(default_factory=list)
+
+    # Top-level reasoning summary (drives a "Why this recommendation?" line
+    # above the cards, separate from each scenario's rationale).
+    decision_summary: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # Defensive captures — what data the agent reasoned over. Useful for
+    # debugging and for the future commitment-subtraction layer to verify
+    # which inventory numbers were used.
+    inventory_snapshot_used: dict[str, Any] = Field(default_factory=dict)
+    penalty_per_case_usd: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,7 @@ from agent_tools import (
     DEMAND_PLANNING_TOOLS,
     TRANSPORTATION_TOOLS,
     RETAIL_INTELLIGENCE_TOOLS,
+    FULFILLMENT_TOOLS,
 )
 
 import logging
@@ -173,6 +174,27 @@ def make_retail_intelligence() -> LlmAgent:
     )
 
 
+# ───────── BUG-FIX-PHASE2 / Fulfillment Agent ─────────
+# Independent of the 5-agent Order Triage flow. Invoked by the
+# /fulfillment/simulate endpoint when FULFILLMENT_USE_AGENT=true, replacing
+# the LP code path. Returns FulfillmentAgentDecision per agents/fulfillment_agent.md.
+def make_fulfillment_agent() -> LlmAgent:
+    return LlmAgent(
+        name="fulfillment",
+        model=Gemini(model="gemini-2.5-pro"),
+        generate_content_config=_cfg(0.1),
+        description=(
+            "Fulfillment routing optimizer for already-approved at-risk "
+            "orders. Walks the 5-step business sequence (supply check, "
+            "transport check, freight cost, fine amount, combine + "
+            "minimize) and emits two scenarios with rationale: Default "
+            "Route and Agent Recommendation."
+        ),
+        instruction=_load_prompt("fulfillment_agent") + _JSON_DISCIPLINE,
+        tools=FULFILLMENT_TOOLS,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Singleton accessors
 # ---------------------------------------------------------------------------
@@ -184,6 +206,7 @@ _FACTORIES = {
     "demand_planning":     make_demand_planning,
     "transportation":      make_transportation,
     "retail_intelligence": make_retail_intelligence,
+    "fulfillment":         make_fulfillment_agent,
 }
 
 
