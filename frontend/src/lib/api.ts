@@ -383,6 +383,49 @@ export function appendSessionDecision(row: DecisionLogRow): void {
   }
 }
 
+// ─── /root-cause + /safety-stock (dedicated tab endpoints) ───────────────────
+// Split out of /dashboard-data so the Root Cause Hub and Safety Stock Optimizer
+// each fetch only their own section. Throw on failure → tab shows its error state.
+
+export async function fetchRootCause(): Promise<DashboardData['rootCauseSummary']> {
+  return request<DashboardData['rootCauseSummary']>('/root-cause');
+}
+
+export async function fetchSafetyStock(): Promise<{ recommendations: unknown[] }> {
+  return request<{ recommendations: unknown[] }>('/safety-stock');
+}
+
+// ─── /data-dictionary (live schema dictionary from INFORMATION_SCHEMA) ────────
+
+export type DataDictColumn = {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+  ordinal: number;
+  classification: string;                 // derived: key | measure | date | dimension
+  description: string | null;             // not in BQ → null (UI shows '—')
+  sourceTable: string | null;
+  sourceField: string | null;
+  infoObject: string | null;
+};
+
+export type DataDictView = {
+  name: string;
+  columnCount: number;
+  grainHint: string;
+  columns: DataDictColumn[];
+};
+
+export type DataDictionaryResponse = {
+  totalViews: number;
+  totalColumns: number;
+  views: DataDictView[];
+};
+
+export async function fetchDataDictionary(): Promise<DataDictionaryResponse> {
+  return request<DataDictionaryResponse>('/data-dictionary');
+}
+
 // =============================================================================
 // LEGACY FUNCTIONS — kept for backwards compatibility with existing tabs.
 // New code should prefer the spec names above.

@@ -1,9 +1,9 @@
 import { BarChart2, Mail, MessageSquare, Send, ArrowLeft, Loader2 } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis, LabelList } from 'recharts';
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 
 import type { DashboardData } from '../../types/dashboard';
-import { useDashboardData } from '../../lib/hooks';
+import { fetchRootCause } from '../../lib/api';
 import { DashboardSkeleton, ErrorState } from '../primitives';
 
 type ViewLevel = 'L1' | 'L2_DEMAND' | 'L2_SUPPLY';
@@ -45,7 +45,8 @@ type ChartDataPoint = {
   isTotal?: boolean;
 };
 
-const BASELINE = 10000;
+// BASELINE (total ordered cases for the waterfall) is read from the live
+// /root-cause payload inside the component — no hardcoded value.
 
 const CustomTooltip = ({ active, payload, label }: any) => {
   if (active && payload && payload.length) {
@@ -67,7 +68,17 @@ const CustomTooltip = ({ active, payload, label }: any) => {
 };
 
 export function RootCauseHub() {
-  const { data, loading, err, reload } = useDashboardData();
+  const [rootCauseSummary, setRootCauseSummary] = useState<DashboardData['rootCauseSummary'] | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [err, setErr] = useState<string | null>(null);
+  const reload = useCallback(() => {
+    setLoading(true);
+    setErr(null);
+    fetchRootCause()
+      .then(s => { setRootCauseSummary(s); setLoading(false); })
+      .catch(e => { setErr(e instanceof Error ? e.message : 'Root cause data unavailable'); setLoading(false); });
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
   const [viewLevel, setViewLevel] = useState<ViewLevel>('L1');
   const [selectedDriverId, setSelectedDriverId] = useState<string>('');
   const [draftText, setDraftText] = useState<string>('');
@@ -113,33 +124,44 @@ Keep it under 200 words. Sign off as "Customer Supply Operations Team, Mars Pet 
   }, []);
 
   if (loading) return <DashboardSkeleton title="Loading Root Cause Hub…" />;
-  if (err || !data) return (
+  if (err || !rootCauseSummary || !rootCauseSummary.drivers) return (
     <ErrorState
       title="Could not load Root Cause Hub"
-      message={err || 'Dashboard data unavailable.'}
+      message={err || 'Root cause data unavailable.'}
       onRetry={reload}
     />
   );
 
-  const { rootCauseSummary } = data;
   const DRIVERS = buildDrivers(rootCauseSummary.drivers);
+  // Delivery-level CFR-cuts waterfall: baseline = OTIF lines due; the cuts are
+  // demand/supply OTIF failures, so On-Time ÷ baseline reconciles to the real
+  // CFR% headline (cuts are the actual ~CFR-gap fraction, hence visible — unlike
+  // case volume, where a few hundred missed cases vanish against total demand).
+  const rcs = rootCauseSummary as {
+    totalDeliveries?: number; demandDrivenFails?: number; supplyDrivenFails?: number;
+  };
+  const BASELINE = rcs.totalDeliveries || 0;
+  const demandFails = rcs.demandDrivenFails || 0;
+  const supplyFails = rcs.supplyDrivenFails || 0;
+  const onTime = Math.max(0, BASELINE - demandFails - supplyFails);
 
   const L1_DATA: ChartDataPoint[] = [
-    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', isTotal: true },
-    { name: 'Demand Gaps', transparentVal: BASELINE - rootCauseSummary.demandDrivenCases, visibleVal: rootCauseSummary.demandDrivenCases, displayVal: `-${rootCauseSummary.demandDrivenCases.toLocaleString()}`, fill: '#3b82f6', type: 'gap-demand' },
-    { name: 'Supply Gaps', transparentVal: BASELINE - rootCauseSummary.demandDrivenCases - rootCauseSummary.supplyDrivenCases, visibleVal: rootCauseSummary.supplyDrivenCases, displayVal: `-${rootCauseSummary.supplyDrivenCases.toLocaleString()}`, fill: '#eab308', type: 'gap-supply' },
-    { name: 'Actual Cases', transparentVal: 0, visibleVal: BASELINE - rootCauseSummary.totalCasesMissed, displayVal: (BASELINE - rootCauseSummary.totalCasesMissed).toLocaleString(), fill: '#475569', type: 'actual', isTotal: true },
+    { name: 'Deliveries Due', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', isTotal: true },
+    { name: 'Demand Failures', transparentVal: BASELINE - demandFails, visibleVal: demandFails, displayVal: `-${demandFails.toLocaleString()}`, fill: '#3b82f6', type: 'gap-demand' },
+    { name: 'Supply Failures', transparentVal: BASELINE - demandFails - supplyFails, visibleVal: supplyFails, displayVal: `-${supplyFails.toLocaleString()}`, fill: '#eab308', type: 'gap-supply' },
+    { name: 'On-Time (OTIF)', transparentVal: 0, visibleVal: onTime, displayVal: onTime.toLocaleString(), fill: '#475569', type: 'actual', isTotal: true },
   ];
 
   const L2_DEMAND_DATA: ChartDataPoint[] = [
-    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
+    { name: 'Deliveries Due', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
     ...rootCauseSummary.drivers.filter((d: any) => d.category === 'Demand').map((d: any, index: number, arr: any[]) => {
-      const prevMissed = arr.slice(0, index).reduce((sum: number, item: any) => sum + item.casesMissed, 0);
+      const prevFails = arr.slice(0, index).reduce((sum: number, item: any) => sum + (item.failCount || 0), 0);
+      const f = d.failCount || 0;
       return {
         name: d.name.length > 15 ? d.name.substring(0, 15) + '...' : d.name,
-        transparentVal: BASELINE - prevMissed - d.casesMissed,
-        visibleVal: d.casesMissed,
-        displayVal: `-${d.casesMissed.toLocaleString()}`,
+        transparentVal: BASELINE - prevFails - f,
+        visibleVal: f,
+        displayVal: `-${f.toLocaleString()}`,
         fill: index % 2 === 0 ? '#1d4ed8' : '#3b82f6',
         type: 'driver',
         id: d.id,
@@ -148,14 +170,15 @@ Keep it under 200 words. Sign off as "Customer Supply Operations Team, Mars Pet 
   ];
 
   const L2_SUPPLY_DATA: ChartDataPoint[] = [
-    { name: 'Target Cases', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
+    { name: 'Deliveries Due', transparentVal: 0, visibleVal: BASELINE, displayVal: BASELINE.toLocaleString(), fill: '#475569', type: 'target', disabled: true, isTotal: true },
     ...rootCauseSummary.drivers.filter((d: any) => d.category === 'Supply').map((d: any, index: number, arr: any[]) => {
-      const prevMissed = arr.slice(0, index).reduce((sum: number, item: any) => sum + item.casesMissed, 0);
+      const prevFails = arr.slice(0, index).reduce((sum: number, item: any) => sum + (item.failCount || 0), 0);
+      const f = d.failCount || 0;
       return {
         name: d.name.length > 15 ? d.name.substring(0, 15) + '...' : d.name,
-        transparentVal: BASELINE - prevMissed - d.casesMissed,
-        visibleVal: d.casesMissed,
-        displayVal: `-${d.casesMissed.toLocaleString()}`,
+        transparentVal: BASELINE - prevFails - f,
+        visibleVal: f,
+        displayVal: `-${f.toLocaleString()}`,
         fill: index % 2 === 0 ? '#b45309' : '#d97706',
         type: 'driver',
         id: d.id,
@@ -219,34 +242,34 @@ Keep it under 200 words. Sign off as "Customer Supply Operations Team, Mars Pet 
                    </button>
                  )}
                  <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest">
-                   {viewLevel === 'L1' ? 'L1: CFR Cuts Waterfall (Last 7 Days)' : 
+                   {viewLevel === 'L1' ? 'L1: CFR Cuts Waterfall (Last 28 Days)' :
                     viewLevel === 'L2_DEMAND' ? 'L2: Demand Gaps Breakdown' : 'L2: Supply & Execution Gaps Breakdown'}
                  </h3>
                </div>
-               <p className="text-sm font-bold text-slate-800 mt-2">Total CFR Cuts: {rootCauseSummary.totalCasesMissed.toLocaleString()} Cases (CFR {rootCauseSummary.cfRActual}% vs Target {rootCauseSummary.cfrTarget}%)</p>
+               <p className="text-sm font-bold text-slate-800 mt-2">Total CFR Cuts: {(demandFails + supplyFails).toLocaleString()} failed deliveries · {rootCauseSummary.totalCasesMissed.toLocaleString()} cases short (CFR {rootCauseSummary.cfRActual}% vs Target {rootCauseSummary.cfrTarget}%)</p>
              </div>
              {viewLevel === 'L1' && (
                <div className="flex gap-4">
                   <button onClick={() => handleBarClick({ type: 'gap-demand' })} className="text-right text-left cursor-pointer hover:bg-slate-50 p-2 -my-2 rounded-lg transition-colors border border-transparent hover:border-slate-200 group">
                     <div className="text-[10px] text-amber-700 uppercase font-bold tracking-widest bg-amber-100 px-2 py-0.5 rounded group-hover:bg-amber-200 transition-colors">Demand Gaps</div>
-                    <div className="text-amber-700 font-mono font-bold mt-1 shadow-sm">-{rootCauseSummary.demandDrivenCases.toLocaleString()} CS</div>
+                    <div className="text-amber-700 font-mono font-bold mt-1 shadow-sm">-{demandFails.toLocaleString()} fails</div>
                   </button>
                   <button onClick={() => handleBarClick({ type: 'gap-supply' })} className="text-right text-left cursor-pointer hover:bg-slate-50 p-2 -my-2 rounded-lg transition-colors border border-transparent hover:border-slate-200 group">
                     <div className="text-[10px] text-[#DB033B] uppercase font-bold tracking-widest bg-[#DB033B]/10 px-2 py-0.5 rounded group-hover:bg-[#DB033B]/20 transition-colors">Supply Gaps</div>
-                    <div className="text-[#DB033B] font-mono font-bold mt-1 shadow-sm">-{rootCauseSummary.supplyDrivenCases.toLocaleString()} CS</div>
+                    <div className="text-[#DB033B] font-mono font-bold mt-1 shadow-sm">-{supplyFails.toLocaleString()} fails</div>
                   </button>
                </div>
              )}
              {viewLevel === 'L2_DEMAND' && (
                <div className="text-right">
                  <div className="text-[10px] text-amber-700 uppercase font-bold tracking-widest bg-amber-100 px-2 py-0.5 rounded">Demand Total</div>
-                 <div className="text-amber-700 font-mono font-bold mt-1 shadow-sm">-{rootCauseSummary.demandDrivenCases.toLocaleString()} CS</div>
+                 <div className="text-amber-700 font-mono font-bold mt-1 shadow-sm">-{demandFails.toLocaleString()} fails</div>
                </div>
              )}
              {viewLevel === 'L2_SUPPLY' && (
                <div className="text-right">
                  <div className="text-[10px] text-[#DB033B] uppercase font-bold tracking-widest bg-[#DB033B]/10 px-2 py-0.5 rounded">Supply Total</div>
-                 <div className="text-[#DB033B] font-mono font-bold mt-1 shadow-sm">-{rootCauseSummary.supplyDrivenCases.toLocaleString()} CS</div>
+                 <div className="text-[#DB033B] font-mono font-bold mt-1 shadow-sm">-{supplyFails.toLocaleString()} fails</div>
                </div>
              )}
            </div>

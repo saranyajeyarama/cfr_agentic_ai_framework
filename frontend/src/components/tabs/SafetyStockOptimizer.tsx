@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Area, AreaChart, CartesianGrid, ComposedChart, Legend, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Package, ShieldCheck, AlertCircle, TrendingUp, TrendingDown, CheckCircle2, ChevronRight, Activity } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import { useDashboardData } from '../../lib/hooks';
+import { fetchSafetyStock } from '../../lib/api';
 import { DashboardSkeleton, ErrorState } from '../primitives';
 
 type Severity = 'critical' | 'warning' | 'neutral';
@@ -31,22 +31,33 @@ type SkuOptimization = {
 };
 
 export function SafetyStockOptimizer() {
-  const { data, loading, err, reload } = useDashboardData();
+  const [recommendations, setRecommendations] = useState<SkuOptimization[] | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [err, setErr] = useState<string | null>(null);
+  const reload = useCallback(() => {
+    setLoading(true);
+    setErr(null);
+    fetchSafetyStock()
+      .then(r => { setRecommendations((r.recommendations ?? []) as SkuOptimization[]); setLoading(false); })
+      .catch(e => { setErr(e instanceof Error ? e.message : 'Safety stock data unavailable'); setLoading(false); });
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
   const [selectedSkuId, setSelectedSkuId] = useState<string>('');
   const [showReasonCode, setShowReasonCode] = useState(false);
   const [reasonCode, setReasonCode] = useState("");
   const [showRationale, setShowRationale] = useState(false);
 
   if (loading) return <DashboardSkeleton title="Loading Safety Stock Optimizer…" />;
-  if (err || !data) return (
+  if (err || !recommendations || recommendations.length === 0) return (
     <ErrorState
       title="Could not load Safety Stock Optimizer"
-      message={err || 'Dashboard data unavailable.'}
+      message={err || 'No safety-stock recommendations available.'}
       onRetry={reload}
     />
   );
 
-  const SKU_DATA: SkuOptimization[] = data.safetyStockRecommendations as SkuOptimization[];
+  const SKU_DATA: SkuOptimization[] = recommendations;
   const activeSku = SKU_DATA.find(s => s.id === selectedSkuId) || SKU_DATA[0];
 
   const getSeverityIcon = (severity: Severity) => {

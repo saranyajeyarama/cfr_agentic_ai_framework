@@ -1698,6 +1698,50 @@ def decision_log(limit: int = 200, offset: int = 0) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Root Cause Hub + Safety Stock Optimizer — dedicated single-responsibility APIs
+# (split out of /dashboard-data so each tab fetches only what it needs)
+# ---------------------------------------------------------------------------
+@app.get("/root-cause")
+def root_cause() -> dict:
+    """CFR root-cause breakdown (drivers, demand-vs-supply cases missed) from
+    tiger_semantic.fct_otif. Backs the Root Cause Hub tab."""
+    from data_pipeline import fetch_root_cause
+    try:
+        return fetch_root_cause()
+    except Exception as exc:
+        log.error("root-cause fetch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Root cause data unavailable")
+
+
+@app.get("/safety-stock")
+def safety_stock() -> dict:
+    """Demand-driven safety-stock recommendations (z·σ·√LT vs the static target)
+    from tiger_semantic.fct_inventory_projection. Backs the Safety Stock
+    Optimizer tab. Returns { recommendations: [...] }."""
+    from data_pipeline import fetch_safety_stock
+    try:
+        return fetch_safety_stock()
+    except Exception as exc:
+        log.error("safety-stock fetch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Safety stock data unavailable")
+
+
+@app.get("/data-dictionary")
+def data_dictionary() -> dict:
+    """Live schema dictionary (views + columns + data types) read directly from
+    tiger_semantic.INFORMATION_SCHEMA.COLUMNS — no hardcoded schema. Returns
+    { totalViews, totalColumns, views: [{name, columnCount, grainHint, columns[]}] }.
+    Business/lineage fields (description, source_table, source_field, BW InfoObject)
+    are not present in BigQuery metadata → returned null (shown '—' in the UI)."""
+    from data_pipeline import fetch_data_dictionary
+    try:
+        return fetch_data_dictionary()
+    except Exception as exc:
+        log.error("data-dictionary fetch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Data dictionary unavailable")
+
+
+# ---------------------------------------------------------------------------
 # Phase 7 — Agent overview pages (Supply / Demand / Transport / Retail)
 # ---------------------------------------------------------------------------
 # Each route returns {data: <PORT_* shape>, meta: {...}}. See data_pipeline.py

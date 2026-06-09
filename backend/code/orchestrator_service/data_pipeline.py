@@ -962,40 +962,49 @@ def _fetch_root_cause_summary(client: bigquery.Client) -> dict:
         WITH anchor AS (SELECT MAX(delivery_date_promised) AS max_dt FROM `{SEMANTIC_DS}.fct_otif`)
         SELECT
             ROUND(SAFE_DIVIDE(COUNTIF(otif_flag = 'Y'), COUNT(*)) * 100, 1) AS cfr_actual,
-            COUNTIF(otif_flag = 'N')                                         AS cases_missed
+            COUNT(*)                                                         AS total_deliveries,
+            COUNTIF(otif_flag = 'N')                                         AS total_fails,
+            SUM(ordered_quantity_cases)                                     AS baseline_cases,
+            SUM(IF(otif_flag = 'N',
+                   GREATEST(ordered_quantity_cases - COALESCE(delivered_quantity_cases, 0), 0),
+                   0))                                                       AS cases_missed
         FROM `{SEMANTIC_DS}.fct_otif`, anchor
         WHERE delivery_date_promised >= DATE_SUB(anchor.max_dt, INTERVAL 28 DAY)
           AND delivery_date_promised <= anchor.max_dt
     """)
     stats = stats_rows[0] if stats_rows else {}
 
-    cfr_actual   = round(_safe_float(stats.get("cfr_actual", 0.0)), 1)
-    cases_missed = _safe_int(stats.get("cases_missed", 0))
+    cfr_actual    = round(_safe_float(stats.get("cfr_actual", 0.0)), 1)
+    total_deliv   = _safe_int(stats.get("total_deliveries", 0))  # OTIF lines due (CFR denominator)
+    baseline      = _safe_int(stats.get("baseline_cases", 0))    # total ordered cases (real)
+    cases_missed  = _safe_int(stats.get("cases_missed", 0))      # undelivered cases on OTIF fails
 
     # Root cause category breakdown
     driver_rows = _run(client, f"""
         WITH anchor AS (SELECT MAX(delivery_date_promised) AS max_dt FROM `{SEMANTIC_DS}.fct_otif`)
         SELECT
             otif_root_cause_category AS category,
-            COUNT(*) AS fail_count
+            COUNT(*) AS fail_count,
+            SUM(GREATEST(ordered_quantity_cases - COALESCE(delivered_quantity_cases, 0), 0)) AS cases_short
         FROM `{SEMANTIC_DS}.fct_otif`, anchor
         WHERE otif_flag = 'N'
           AND delivery_date_promised >= DATE_SUB(anchor.max_dt, INTERVAL 28 DAY)
           AND delivery_date_promised <= anchor.max_dt
           AND otif_root_cause_category IS NOT NULL
         GROUP BY otif_root_cause_category
-        ORDER BY fail_count DESC
+        ORDER BY cases_short DESC
         LIMIT 5
     """)
 
     cfr_target = 98.0
     cfr_gap    = round(max(0.0, cfr_target - cfr_actual), 1)
 
-    # Classify categories into Demand vs Supply and assign owners
+    # Classify each real root-cause category into Demand vs Supply and route it
+    # to the owning planning TEAM (real org functions — not fabricated individuals).
     _DEMAND_KEYWORDS = {"demand", "forecast", "order", "promo", "promotion", "anomaly", "phantom"}
     _OWNERS = {
-        "Demand": {"ownerCode": "SC", "ownerName": "Sarah Chen",  "ownerDept": "Demand Planning"},
-        "Supply": {"ownerCode": "JL", "ownerName": "James Lee",   "ownerDept": "Supply Planning"},
+        "Demand": {"ownerCode": "DP", "ownerName": "Demand Planning Team", "ownerDept": "Demand Planning"},
+        "Supply": {"ownerCode": "SP", "ownerName": "Supply Planning Team", "ownerDept": "Supply Planning"},
     }
 
     def _classify(cat: str) -> str:
@@ -1004,29 +1013,36 @@ def _fetch_root_cause_summary(client: bigquery.Client) -> dict:
 
     demand_missed = 0
     supply_missed = 0
+    demand_fails = 0
+    supply_fails = 0
     drivers = []
     for idx, r in enumerate(driver_rows, start=1):
         cat_raw    = r.get("category") or "Unknown"
         cat_type   = _classify(cat_raw)
-        fail_count = _safe_int(r.get("fail_count"))
+        short      = _safe_int(r.get("cases_short"))     # real undelivered cases
+        fails      = _safe_int(r.get("fail_count"))      # real # of OTIF failures
         owner      = _OWNERS[cat_type]
         if cat_type == "Demand":
-            demand_missed += fail_count
+            demand_missed += short
+            demand_fails += fails
         else:
-            supply_missed += fail_count
+            supply_missed += short
+            supply_fails += fails
         drivers.append({
             "id":          f"drv-{idx:03d}",
             "name":        cat_raw,
             "category":    cat_type,
-            "casesMissed": fail_count,
+            "casesMissed": short,
+            "failCount":   fails,
             "ownerCode":   owner["ownerCode"],
             "ownerName":   owner["ownerName"],
             "ownerDept":   owner["ownerDept"],
-            "description": f"{cat_raw} caused {fail_count} OTIF failures in the last 28 days.",
+            "description": (f"{cat_raw} drove {short:,} undelivered cases across "
+                           f"{fails} OTIF failures in the last 28 days."),
             "emailDraft":  "",
         })
 
-    # Use BQ-derived split if we have drivers, otherwise estimate
+    # Real BQ-derived demand/supply split (cases) from the categorized drivers.
     if demand_missed + supply_missed > 0:
         demand_driven = demand_missed
         supply_driven = supply_missed
@@ -1036,7 +1052,15 @@ def _fetch_root_cause_summary(client: bigquery.Client) -> dict:
 
     return {
         "weekEnding":        "",
-        "totalCasesMissed":  cases_missed,
+        # Delivery-level counts — drive the CFR-cuts waterfall (cuts reconcile to
+        # the real CFR%: on-time / total deliveries). Visible because the cut is
+        # the actual ~CFR-gap fraction, not a sliver of total case volume.
+        "totalDeliveries":   total_deliv,
+        "demandDrivenFails": demand_fails,
+        "supplyDrivenFails": supply_fails,
+        # Case-level volumes — for the supporting tiles / detail.
+        "baselineCases":     baseline,           # real total ordered cases
+        "totalCasesMissed":  cases_missed,       # real undelivered cases
         "cfRActual":         cfr_actual,
         "cfrTarget":         cfr_target,
         "cfRGap":            cfr_gap,
@@ -1051,90 +1075,141 @@ def _fetch_root_cause_summary(client: bigquery.Client) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_safety_stock(client: bigquery.Client) -> list[dict]:
-    # Net movement quantity per material as a proxy for current stock level
-    sku_rows = _run(client, f"""
-        SELECT
-            material_number,
-            MAX(material_description)   AS material_name,
-            SUM(movement_quantity)      AS net_movement,
-            ABS(SUM(movement_quantity)) AS abs_qty,
-            COUNT(DISTINCT posting_date) AS days_observed
-        FROM `{SEMANTIC_DS}.fct_inventory_movements`
-        WHERE document_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 56 DAY)
-        GROUP BY material_number
-        HAVING ABS(SUM(movement_quantity)) > 0
-        ORDER BY abs_qty DESC
+    """Demand-driven safety-stock review from REAL fct_inventory_projection data.
+
+    Compares each SKU's current static `safety_stock_target_cases` against a
+    statistically-derived dynamic target computed from the volatility of its real
+    weekly `shipments_demand_cases` (standard inventory-theory formula):
+
+        dynamic safety stock = z · σ · √LT
+
+    z, LT and the service band are configuration (not fabricated data); σ, μ and
+    the static target are all real per-SKU values from BigQuery. Picks the SKUs
+    with the highest demand variability (most worth optimizing). Returns [] if the
+    projection table is unavailable.
+    """
+    Z, Z_LO, Z_HI = 1.65, 1.28, 1.96       # 95% target; 90%–97.5% band
+    LT_WEEKS = 4                            # replenishment lead time (config)
+    SQRT_LT = LT_WEEKS ** 0.5
+
+    stats = _run(client, f"""
+        WITH pw AS (
+          SELECT material_fert_number AS m, projection_week_start_date AS wk,
+                 SUM(shipments_demand_cases)    AS demand,
+                 SUM(safety_stock_target_cases) AS ss
+          FROM `{SEMANTIC_DS}.fct_inventory_projection`
+          WHERE plan_version_id = (SELECT MAX(plan_version_id)
+                                   FROM `{SEMANTIC_DS}.fct_inventory_projection`)
+          GROUP BY m, wk
+        ),
+        s AS (
+          SELECT m, AVG(demand) AS mu, STDDEV(demand) AS sigma,
+                 AVG(ss) AS ss_static, COUNT(*) AS wks
+          FROM pw GROUP BY m
+          HAVING AVG(ss) > 0 AND STDDEV(demand) > 0 AND COUNT(*) >= 4
+        ),
+        px AS (
+          SELECT material_number, AVG(NULLIF(unit_price, 0)) AS unit_price
+          FROM `{SEMANTIC_DS}.fct_sales_orders` GROUP BY material_number
+        )
+        SELECT s.m AS matnr, s.mu, s.sigma, s.ss_static, s.wks,
+               COALESCE(dm.material_description, s.m) AS name,
+               COALESCE(px.unit_price, 50.0) AS unit_price
+        FROM s
+        LEFT JOIN `{SEMANTIC_DS}.dim_material` dm ON s.m = dm.material_number
+        LEFT JOIN px ON s.m = px.material_number
+        ORDER BY SAFE_DIVIDE(s.sigma, NULLIF(s.mu, 0)) DESC
         LIMIT 4
     """)
-
-    if not sku_rows:
+    if not stats:
         return []
 
+    mats = [r.get("matnr") for r in stats]
+    series = _run(client, f"""
+        WITH pw AS (
+          SELECT material_fert_number AS m, projection_week_start_date AS wk,
+                 SUM(shipments_demand_cases) AS demand
+          FROM `{SEMANTIC_DS}.fct_inventory_projection`
+          WHERE plan_version_id = (SELECT MAX(plan_version_id)
+                                   FROM `{SEMANTIC_DS}.fct_inventory_projection`)
+            AND material_fert_number IN UNNEST(@mats)
+          GROUP BY m, wk
+        )
+        SELECT m, wk, demand FROM (
+          SELECT m, wk, demand,
+                 ROW_NUMBER() OVER (PARTITION BY m ORDER BY wk ASC) AS rn
+          FROM pw
+        ) WHERE rn <= 8 ORDER BY m, wk
+    """, [bigquery.ArrayQueryParameter("mats", "STRING", mats)])
+    weeks_by_mat: dict[str, list] = {}
+    for r in series:
+        weeks_by_mat.setdefault(r.get("m"), []).append(_safe_float(r.get("demand")))
+
     recs: list[dict] = []
-    for idx, sku in enumerate(sku_rows, start=1):
-        matnr       = sku.get("material_number", "")
-        name        = sku.get("material_name", matnr)
-        abs_qty     = _safe_float(sku.get("abs_qty", 0))
-        net_qty     = _safe_float(sku.get("net_movement", 0))
+    for idx, s in enumerate(stats, start=1):
+        matnr = s.get("matnr", "")
+        name = s.get("name", matnr)
+        mu = _safe_float(s.get("mu"))
+        sigma = _safe_float(s.get("sigma"))
+        static = int(round(_safe_float(s.get("ss_static"))))
+        wks = _safe_int(s.get("wks"))
+        unit_price = _safe_float(s.get("unit_price"), 50.0)
 
-        # 8-week demand history from fct_sales_orders
-        chart_rows = _run(client, f"""
-            SELECT
-                FORMAT_DATE('%G-W%V', order_creation_date) AS iso_week,
-                SUM(ordered_quantity_sales_uom)             AS weekly_demand
-            FROM `{SEMANTIC_DS}.fct_sales_orders`
-            WHERE material_number = @matnr
-              AND order_creation_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 8 WEEK)
-            GROUP BY iso_week
-            ORDER BY iso_week ASC
-            LIMIT 8
-        """, [bigquery.ScalarQueryParameter("matnr", "STRING", matnr)])
+        dyn     = int(round(Z * sigma * SQRT_LT))
+        dyn_min = int(round(Z_LO * sigma * SQRT_LT))
+        dyn_max = int(round(Z_HI * sigma * SQRT_LT))
+        delta   = static - dyn                    # +ve = over-buffered
 
-        current_static      = int(abs_qty * 0.4)
-        recommended_dynamic = int(abs_qty * 0.6)
-
-        if net_qty < 0 and abs(net_qty) > abs_qty * 0.5:
-            severity   = "critical"
-            short_desc = "Stockout Risk — Increase Target"
-        elif net_qty > 0 and net_qty > abs_qty * 0.6:
-            severity   = "warning"
-            short_desc = "Overstocked — Reduce Target + Release Working Capital"
+        if static > dyn_max:
+            severity, short = "warning", "Overstocked — Reduce Target, Release Working Capital"
+        elif static < dyn_min:
+            severity, short = "critical", "Understocked — Increase Target to Cover Volatility"
         else:
-            severity   = "neutral"
-            short_desc = "Seasonal Adjustment Recommended"
+            severity, short = "neutral", "Well-Calibrated — Minor Tuning"
 
-        week_labels = [f"W{i+1}" for i in range(8)]
-        chart_data: list[dict] = []
-        for i in range(8):
-            demand = _safe_int(chart_rows[i].get("weekly_demand")) if i < len(chart_rows) else int(abs_qty * 0.15)
-            chart_data.append({
-                "week":         week_labels[i],
-                "actualDemand": demand,
-                "staticStock":  current_static,
-                "dynamicMin":   int(recommended_dynamic * 0.85),
-                "dynamicMax":   int(recommended_dynamic * 1.15),
+        if delta > 0:
+            impact = f"Release ~${int(round(delta * unit_price)):,} working capital"
+        elif delta < 0:
+            impact = f"~${int(round(-delta * unit_price)):,} stockout exposure"
+        else:
+            impact = "Balanced — no change"
+
+        demands = weeks_by_mat.get(matnr, [])
+        chart: list[dict] = []
+        for i in range(max(len(demands), 1)):
+            chart.append({
+                "week":         f"W{i + 1}",
+                "actualDemand": int(round(demands[i])) if i < len(demands) else int(round(mu)),
+                "staticStock":  static,
+                "dynamicMin":   dyn_min,
+                "dynamicMax":   dyn_max,
             })
+
+        conf = round(min(0.98, 0.80 + 0.0035 * wks), 2)   # more weeks of data → higher confidence
 
         recs.append({
             "id":                      f"sku-{idx:03d}",
             "skuCode":                 matnr,
             "skuName":                 name,
             "severity":                severity,
-            "shortDesc":               short_desc,
+            "shortDesc":               short,
             "detail":                  (
-                f"Supply Planning Agent detects variance on {name}. "
-                f"Net movement (56d): {int(net_qty):+,} units. "
-                f"AI recommends adjusting safety stock target."
+                f"Weekly demand μ={int(round(mu)):,} cs, σ={int(round(sigma)):,} cs over {wks} "
+                f"projection weeks. Static safety-stock target {static:,} cs vs a demand-driven "
+                f"dynamic buffer of {dyn:,} cs (95% service, {LT_WEEKS}-wk lead time)."
             ),
             "agents":                  ["Supply Planning Agent", "Demand Planning Agent"],
-            "currentStaticStock":      current_static,
-            "recommendedDynamicStock": recommended_dynamic,
-            "financialImpact":         "Pending agent analysis",
+            "currentStaticStock":      static,
+            "recommendedDynamicStock": dyn,
+            "financialImpact":         impact,
+            "confidenceScore":         conf,
             "rationale":               (
-                f"Current static target of {current_static:,} CS based on 56-day movement data. "
-                f"Dynamic recommendation of {recommended_dynamic:,} CS accounts for demand variability."
+                f"Dynamic safety stock = z·σ·√LT = {Z} × {int(round(sigma)):,} × √{LT_WEEKS} ≈ {dyn:,} cs "
+                f"(90–97.5% service band {dyn_min:,}–{dyn_max:,} cs), derived from real weekly demand "
+                f"volatility in fct_inventory_projection. The current static target of {static:,} cs sits "
+                f"{'above' if delta > 0 else 'below' if delta < 0 else 'within'} that band."
             ),
-            "weeklyChartData":         chart_data,
+            "weeklyChartData":         chart,
         })
 
     return recs
@@ -1329,6 +1404,150 @@ def fetch_decision_log_page(limit: int = 200, offset: int = 0) -> dict:
         "total_count":    total,
         "filtered_count": len(decisions),
         "decisions":      decisions,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dedicated single-responsibility entry points (own endpoints, not /dashboard-data)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_root_cause() -> dict:
+    """Public entry for GET /root-cause — the CFR root-cause breakdown.
+    Reuses the same builder the dashboard used; returns the summary dict."""
+    return _fetch_root_cause_summary(_bq_client())
+
+
+def fetch_safety_stock() -> dict:
+    """Public entry for GET /safety-stock — demand-driven safety-stock review.
+    Wraps the recommendations list in an object for a stable response shape."""
+    return {"recommendations": _fetch_safety_stock(_bq_client())}
+
+
+def _classify_column(name: str, dtype: str) -> str:
+    """Transparent derivation (NOT warehouse lineage) of a column's role from its
+    name + BigQuery type: key / measure / date / dimension."""
+    n = (name or "").lower()
+    if n == "id" or n.endswith(("_id", "_number", "_code", "_key")):
+        return "key"
+    dt = (dtype or "").upper()
+    if dt in ("INT64", "FLOAT64", "NUMERIC", "BIGNUMERIC"):
+        return "measure"
+    if dt in ("DATE", "DATETIME", "TIMESTAMP", "TIME"):
+        return "date"
+    return "dimension"
+
+
+def _parse_view_lineage(ddl: str) -> dict:
+    """Extract real SAP→semantic lineage from a view's own DDL.
+
+    The tiger_semantic views document lineage inline, e.g.
+        k.KUNNR AS customer_number,   -- BW: 0CUSTOMER. Source: KNA1.KUNNR
+        r.RSNUM AS reservation_number, -- BW: 0RSNUM
+    Returns {semantic_column_name: {sourceTable, sourceField, infoObject, description}}.
+    All values come from the real DDL (BigQuery) — nothing is fabricated.
+    """
+    import re
+    line_re = re.compile(r"^\s*(.+)\s+AS\s+(\w+)\s*,?\s*(?:--\s*(.*))?$", re.I)
+    from_re = re.compile(r"(?:FROM|JOIN)\s+`?([A-Za-z0-9_.\-]+)`?\s+(?:AS\s+)?(\w+)", re.I)
+    bw_re   = re.compile(r"BW:\s*([0-9A-Za-z_]+)", re.I)
+    src_re  = re.compile(r"Source:\s*([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)", re.I)
+    expr_re = re.compile(r"^(\w+)\.(\w+)$")
+    bare_re = re.compile(r"^\w+$")
+
+    alias_map: dict[str, str] = {}
+    for fm in from_re.finditer(ddl or ""):
+        alias_map[fm.group(2)] = fm.group(1).split(".")[-1].strip("`")
+
+    out: dict[str, dict] = {}
+    for line in (ddl or "").splitlines():
+        m = line_re.match(line)
+        if not m:
+            continue
+        expr, name, comment = m.group(1).strip(), m.group(2), (m.group(3) or "").strip()
+        info = stbl = sfld = desc = None
+        if comment:
+            b = bw_re.search(comment)
+            if b:
+                info = b.group(1)
+            s = src_re.search(comment)
+            if s:
+                stbl, sfld = s.group(1), s.group(2)
+            leftover = src_re.sub("", bw_re.sub("", comment))
+            leftover = re.sub(r"^\s*(BW:|Source:)\s*", "", leftover).strip(" .;,()")
+            if len(leftover) > 2:
+                desc = leftover
+        em = expr_re.match(expr)
+        if not sfld:
+            if em:
+                sfld = em.group(2)
+            elif bare_re.match(expr):
+                sfld = expr
+        if not stbl and em:
+            stbl = alias_map.get(em.group(1))
+        out[name] = {"sourceTable": stbl, "sourceField": sfld, "infoObject": info, "description": desc}
+    return out
+
+
+def fetch_data_dictionary() -> dict:
+    """Public entry for GET /data-dictionary — a LIVE schema dictionary.
+
+    Structure (views, columns, data types, nullability) is read from
+    tiger_semantic.INFORMATION_SCHEMA.COLUMNS. SAP→semantic LINEAGE (source table,
+    source field, BW InfoObject, and any inline description) is parsed from the
+    views' own DDL comments in INFORMATION_SCHEMA.VIEWS. `classification` and
+    `grainHint` are transparent derivations from name + type. Everything is real
+    BigQuery metadata — nothing hardcoded or fabricated; fields a view's DDL does
+    not document are returned null (the UI shows '—').
+    """
+    cc = _bq_client()
+    cols = _run(cc, """
+        SELECT table_name, column_name, data_type, is_nullable, ordinal_position
+        FROM tiger_semantic.INFORMATION_SCHEMA.COLUMNS
+        ORDER BY table_name, ordinal_position
+    """)
+    # Parse lineage from each view's DDL (best-effort; degrades to null per field).
+    lineage: dict[str, dict] = {}
+    try:
+        for vr in _run(cc, """
+            SELECT table_name, view_definition
+            FROM tiger_semantic.INFORMATION_SCHEMA.VIEWS
+        """):
+            lineage[vr.get("table_name") or ""] = _parse_view_lineage(vr.get("view_definition") or "")
+    except Exception as exc:
+        log.warning("data-dictionary lineage parse skipped: %s", exc)
+
+    views: dict[str, dict] = {}
+    for r in cols:
+        tname = r.get("table_name") or ""
+        if not tname:
+            continue
+        cname = r.get("column_name", "")
+        lin = lineage.get(tname, {}).get(cname, {})
+        v = views.setdefault(tname, {"name": tname, "columnCount": 0, "grainHint": "", "columns": []})
+        v["columns"].append({
+            "name":           cname,
+            "dataType":       r.get("data_type", ""),
+            "nullable":       (r.get("is_nullable", "YES") or "").upper() == "YES",
+            "ordinal":        _safe_int(r.get("ordinal_position")),
+            "classification": _classify_column(cname, r.get("data_type", "")),
+            # Real SAP→semantic lineage parsed from the view DDL (null if absent).
+            "description":    lin.get("description"),
+            "sourceTable":    lin.get("sourceTable"),
+            "sourceField":    lin.get("sourceField"),
+            "infoObject":     lin.get("infoObject"),
+        })
+        v["columnCount"] += 1
+
+    out: list[dict] = []
+    for v in sorted(views.values(), key=lambda x: x["name"]):
+        keys = [c["name"] for c in v["columns"] if c["classification"] == "key"]
+        v["grainHint"] = " + ".join(keys[:4]) if keys else "—"
+        out.append(v)
+
+    return {
+        "totalViews":   len(out),
+        "totalColumns": sum(v["columnCount"] for v in out),
+        "views":        out,
     }
 
 

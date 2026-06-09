@@ -26,11 +26,11 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 COPY code/orchestrator_service/requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip \
- && pip install -r /app/requirements.txt
+    && pip install -r /app/requirements.txt
 
 # Agent tools (the single tool layer — sits at /app so it imports flat)
 COPY code/agent_tools.py /app/agent_tools.py
@@ -58,7 +58,28 @@ ENV FREIGHT_COSTS_PATH=/app/config/freight_costs.json
 # Agent system prompts (loaded by name at agent init)
 COPY agents/ /app/agents/
 
-ENV PROMPTS_DIR=/app/agents
+# ── Runtime configuration ────────────────────────────────────────────────────
+# Defaults mirror docker-compose.yml so the image runs correctly standalone
+# (plain `docker run` / Cloud Run). docker-compose — or `gcloud run deploy
+# --set-env-vars` — overrides any of these at runtime with identical or
+# environment-specific values.
+ENV PROMPTS_DIR=/app/agents \
+    PROJECT_ID=resilience-riskradar \
+    GOOGLE_CLOUD_PROJECT=resilience-riskradar \
+    GOOGLE_CLOUD_LOCATION=us-central1 \
+    REGION=us-central1 \
+    AI_PROVIDER=gemini \
+    GOOGLE_GENAI_USE_VERTEXAI=1 \
+    OTEL_SDK_DISABLED=true \
+    AGENT_CONCURRENCY=1 \
+    TOOL_ROW_CAP=50 \
+    FULFILLMENT_USE_AGENT=true
+
+# NOTE: GOOGLE_APPLICATION_CREDENTIALS is intentionally NOT baked in. Locally,
+# docker-compose mounts a key and points this at /secrets/sa-key.json; on Cloud
+# Run the attached service account is used automatically via Application Default
+# Credentials. Hard-coding a key path here would break ADC where no such file
+# exists.
 
 EXPOSE 8080
 
