@@ -15,7 +15,6 @@ import { useState } from 'react';
 import {
   LayoutDashboard, Inbox, GitMerge, FileSearch, ShieldCheck,
   Home, Clock, ChevronLeft, ChevronRight, Activity, BookOpen,
-  BarChart2, TrendingUp, Truck, ShoppingCart,
   type LucideIcon,
 } from 'lucide-react';
 import { C } from '../../lib/constants';
@@ -42,14 +41,6 @@ const NAV_ITEMS: NavItem[] = [
 const INFO_ITEMS: { id: ScreenId; label: string; Icon: LucideIcon }[] = [
   { id: 'datahealth', label: 'Data Health',     Icon: Activity },
   { id: 'dictionary', label: 'Data Dictionary', Icon: BookOpen },
-];
-
-// Agent overview pages restored in Phase 7 — backed by GET /agents/{name}.
-const AGENT_ITEMS: { id: ScreenId; label: string; Icon: LucideIcon; color: string }[] = [
-  { id: 'agent-supply',    label: 'Supply Planning',     Icon: BarChart2,    color: C.blue   },
-  { id: 'agent-demand',    label: 'Demand Planning',     Icon: TrendingUp,   color: C.orange },
-  { id: 'agent-transport', label: 'Transportation',      Icon: Truck,        color: C.teal   },
-  { id: 'agent-retail',    label: 'Retail Intelligence', Icon: ShoppingCart, color: C.purple },
 ];
 
 // ─── Main component ──────────────────────────────────────────────────────────
@@ -130,35 +121,6 @@ export function Sidebar({
                   padding: '1px 6px', fontSize: 10, fontWeight: 700,
                 }}>{badge}</span>
               )}
-            </button>
-          );
-        })}
-
-        {/* Agent Views section — Phase 7 (live backend at /agents/{name}). */}
-        <div style={{
-          display: col ? 'none' : 'block', margin: '8px 12px 2px',
-          borderTop: `1px solid ${C.border}`, paddingTop: 6,
-          fontSize: 9, color: C.muted,
-          textTransform: 'uppercase', letterSpacing: '0.1em', fontWeight: 600,
-        }}>Agent Views</div>
-        {AGENT_ITEMS.map(({ id, label, Icon, color }) => {
-          const active = screen === id;
-          return (
-            <button key={id} onClick={() => setScreen(id)} style={{
-              display: 'flex', alignItems: 'center', gap: col ? 0 : 9, width: '100%',
-              padding: col ? '9px 0' : '7px 16px', border: 'none', cursor: 'pointer',
-              fontFamily: 'inherit', textAlign: 'left',
-              justifyContent: col ? 'center' : 'flex-start',
-              background: active ? `${color}12` : 'transparent',
-              borderRight: active ? `3px solid ${color}` : '3px solid transparent',
-              color: active ? color : C.muted,
-              fontSize: 12, fontWeight: active ? 600 : 500,
-            }}>
-              <Icon size={15}
-                color={active ? color : C.muted}
-                strokeWidth={active ? 2.5 : 1.8}
-                style={{ flexShrink: 0 }} />
-              {!col && <span>{label}</span>}
             </button>
           );
         })}

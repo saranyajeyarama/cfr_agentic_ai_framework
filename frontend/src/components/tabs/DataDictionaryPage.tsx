@@ -13,7 +13,6 @@
 import { useEffect, useState } from 'react';
 import { Search, Database, ChevronRight, ChevronDown, Loader2 } from 'lucide-react';
 import { C, MONO } from '../../lib/constants';
-import { DICT_SECTIONS } from '../../lib/dictionaryData';
 import { fetchDataDictionary, type DataDictionaryResponse, type DataDictColumn } from '../../lib/api';
 
 const SECTION_COLORS: Record<string, string> = {
@@ -56,7 +55,8 @@ export function DataDictionaryPage() {
 
   const q = query.toLowerCase().trim();
 
-  // ── Glossary filter (unchanged) ────────────────────────────────────────────
+  // ── Glossary (curated terms now SERVED by GET /data-dictionary, not bundled) ─
+  const DICT_SECTIONS = schema?.glossary ?? [];
   const filteredSections = DICT_SECTIONS
     .map(s => ({ ...s, terms: s.terms.filter(t => !q || t.term.toLowerCase().includes(q) || (t.full || '').toLowerCase().includes(q) || t.def.toLowerCase().includes(q)) }))
     .filter(s => s.terms.length > 0 && (activeSection === 'All' || s.section === activeSection));

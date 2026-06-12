@@ -3,7 +3,6 @@ import {
   LayoutDashboard, Inbox, GitMerge, FileSearch,
   PanelLeftClose, PanelLeftOpen, ShieldCheck,
   Clock, Home, Activity, BookOpen,
-  BarChart2, TrendingUp, Truck, ShoppingCart,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
@@ -34,14 +33,6 @@ const ANALYTICS_TABS: TabDef[] = [
   { id: 'decisions',  label: 'Decision Log',   icon: Clock    },
   { id: 'datahealth', label: 'Data Health',    icon: Activity },
   { id: 'dictionary', label: 'Data Dictionary', icon: BookOpen },
-];
-
-// Agent overview pages — backed by GET /agents/{name} (Phase 7).
-const AGENT_TABS: TabDef[] = [
-  { id: 'agent-supply',    label: 'Supply Planning',     icon: BarChart2    },
-  { id: 'agent-demand',    label: 'Demand Planning',     icon: TrendingUp   },
-  { id: 'agent-transport', label: 'Transportation',      icon: Truck        },
-  { id: 'agent-retail',    label: 'Retail Intelligence', icon: ShoppingCart },
 ];
 
 // ─── Main component ───────────────────────────────────────────────────────────
@@ -121,11 +112,6 @@ export function SidebarNav({ activeTab, setActiveTab }: SidebarNavProps) {
       <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden py-2">
         <div className="flex flex-col gap-0.5 w-full">
           {renderTabs(MAIN_TABS)}
-        </div>
-
-        {sectionDivider('Agent Views')}
-        <div className="flex flex-col gap-0.5 w-full">
-          {renderTabs(AGENT_TABS)}
         </div>
 
         {sectionDivider('Analytics')}

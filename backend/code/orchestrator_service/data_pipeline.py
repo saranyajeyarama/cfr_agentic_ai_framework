@@ -1488,6 +1488,90 @@ def _parse_view_lineage(ddl: str) -> dict:
     return out
 
 
+# Curated SAP→BW lineage used ONLY as a fallback when a view's DDL does not
+# document a standard identifier. These are SAP-standard objects (KNA1.KUNNR =
+# 0CUSTOMER, etc.) — not fabricated; applied on exact column-name match only.
+_SAP_LINEAGE = {
+    "customer_number": ("KNA1", "KUNNR", "0CUSTOMER"),
+    "sold_to":         ("KNA1", "KUNNR", "0CUSTOMER"),
+    "sold_to_party":   ("KNA1", "KUNNR", "0CUSTOMER"),
+    "ship_to":         ("KNA1", "KUNNR", "0SHIP_TO"),
+    "customer_name":   ("KNA1", "NAME1", "0CUSTOMER_TEXT"),
+    "material_number": ("MARA", "MATNR", "0MATERIAL"),
+    "material":        ("MARA", "MATNR", "0MATERIAL"),
+    "sku":             ("MARA", "MATNR", "0MATERIAL"),
+    "material_description": ("MAKT", "MAKTX", "0MATERIAL_TEXT"),
+    "plant":           ("T001W", "WERKS", "0PLANT"),
+    "plant_code":      ("T001W", "WERKS", "0PLANT"),
+    "plant_name":      ("T001W", "NAME1", "0PLANT_TEXT"),
+    "storage_location": ("MARD", "LGORT", "0STOR_LOC"),
+    "batch":           ("MCHB", "CHARG", "0BATCH"),
+    "batch_number":    ("MCHB", "CHARG", "0BATCH"),
+    "sales_order_number": ("VBAK", "VBELN", "0DOC_NUMBER"),
+    "sales_document":  ("VBAK", "VBELN", "0DOC_NUMBER"),
+    "sales_order_item": ("VBAP", "POSNR", "0S_ORD_ITEM"),
+    "delivery_number": ("LIKP", "VBELN", "0DELIVERY"),
+    "shipment_number": ("VTTK", "TKNUM", "0SHIPMENT"),
+    "purchase_order_number": ("EKKO", "EBELN", "0PO_NUMBER"),
+    "vendor":          ("LFA1", "LIFNR", "0VENDOR"),
+    "vendor_number":   ("LFA1", "LIFNR", "0VENDOR"),
+    "company_code":    ("T001", "BUKRS", "0COMP_CODE"),
+    "sales_org":       ("TVKO", "VKORG", "0SALESORG"),
+    "sales_organization": ("TVKO", "VKORG", "0SALESORG"),
+    "distribution_channel": ("TVTW", "VTWEG", "0DISTR_CHAN"),
+    "division":        ("TSPA", "SPART", "0DIVISION"),
+    "currency":        ("TCURC", "WAERS", "0CURRENCY"),
+    "unit_of_measure": ("T006", "MEINS", "0UNIT"),
+    "uom":             ("T006", "MEINS", "0UNIT"),
+    "requested_delivery_date": ("VBAK", "VDATU", "0REQ_DLV_DATE"),
+}
+
+_DESC_ABBREV = {
+    "qty": "quantity", "pct": "percent", "otif": "OTIF", "cfr": "CFR",
+    "dc": "DC", "mat": "material", "cust": "customer", "no": "number",
+    "num": "number", "ts": "timestamp", "id": "ID", "sku": "SKU",
+    "eta": "ETA", "etd": "ETD", "lt": "lead-time", "ss": "safety-stock",
+    "fg": "finished-goods", "po": "purchase-order", "so": "sales-order",
+    "usd": "USD", "avg": "average", "amt": "amount", "desc": "description",
+    "mabd": "must-arrive-by-date", "atp": "available-to-promise",
+    "wk": "week", "mtd": "month-to-date", "ytd": "year-to-date", "uom": "unit-of-measure",
+}
+
+
+def _humanize(name: str) -> str:
+    parts = [_DESC_ABBREV.get(t.lower(), t) for t in (name or "").split("_") if t]
+    s = " ".join(parts).strip()
+    return (s[:1].upper() + s[1:]) if s else (name or "")
+
+
+def _derive_description(name: str, cls: str, dtype: str, nullable: bool) -> str:
+    """Readable description humanized from the column name + role. Used only when
+    the view DDL carries no description — clearly a derivation, not warehouse text."""
+    role = {"key": "key identifier", "measure": "numeric measure",
+            "date": "date / time field", "dimension": "descriptive attribute"}.get(cls, "attribute")
+    return f"{_humanize(name)} — {role} ({dtype}, {'nullable' if nullable else 'required'})."
+
+
+_GLOSSARY_CACHE = None
+
+
+def _load_glossary() -> list:
+    """Curated business-term glossary served via the API (config/glossary.json),
+    so the Data Dictionary's Glossary tab is fetched at runtime — not hardcoded in
+    the frontend bundle. Cached after first read."""
+    global _GLOSSARY_CACHE
+    if _GLOSSARY_CACHE is None:
+        import os, json
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "glossary.json")
+            with open(p, encoding="utf-8") as f:
+                _GLOSSARY_CACHE = json.load(f)
+        except Exception as exc:
+            log.warning("glossary load failed: %s", exc)
+            _GLOSSARY_CACHE = []
+    return _GLOSSARY_CACHE
+
+
 def fetch_data_dictionary() -> dict:
     """Public entry for GET /data-dictionary — a LIVE schema dictionary.
 
@@ -1522,19 +1606,26 @@ def fetch_data_dictionary() -> dict:
         if not tname:
             continue
         cname = r.get("column_name", "")
+        dtype = r.get("data_type", "")
         lin = lineage.get(tname, {}).get(cname, {})
         v = views.setdefault(tname, {"name": tname, "columnCount": 0, "grainHint": "", "columns": []})
+        cls = _classify_column(cname, dtype)
+        nullable = (r.get("is_nullable", "YES") or "").upper() == "YES"
+        fb = _SAP_LINEAGE.get(cname.lower())          # curated SAP-standard fallback
         v["columns"].append({
             "name":           cname,
-            "dataType":       r.get("data_type", ""),
-            "nullable":       (r.get("is_nullable", "YES") or "").upper() == "YES",
+            "dataType":       dtype,
+            "nullable":       nullable,
             "ordinal":        _safe_int(r.get("ordinal_position")),
-            "classification": _classify_column(cname, r.get("data_type", "")),
-            # Real SAP→semantic lineage parsed from the view DDL (null if absent).
-            "description":    lin.get("description"),
-            "sourceTable":    lin.get("sourceTable"),
-            "sourceField":    lin.get("sourceField"),
-            "infoObject":     lin.get("infoObject"),
+            "classification": cls,
+            # Lineage precedence: view DDL (authoritative) → curated SAP-standard
+            # fallback → null. Description falls back to a derived humanization so
+            # every column carries one. lineageSource flags where each row came from.
+            "description":    lin.get("description") or _derive_description(cname, cls, dtype, nullable),
+            "sourceTable":    lin.get("sourceTable") or (fb[0] if fb else None),
+            "sourceField":    lin.get("sourceField") or (fb[1] if fb else None),
+            "infoObject":     lin.get("infoObject")  or (fb[2] if fb else None),
+            "lineageSource":  "ddl" if (lin.get("sourceTable") or lin.get("sourceField") or lin.get("infoObject")) else ("curated" if fb else "derived"),
         })
         v["columnCount"] += 1
 
@@ -1548,6 +1639,7 @@ def fetch_data_dictionary() -> dict:
         "totalViews":   len(out),
         "totalColumns": sum(v["columnCount"] for v in out),
         "views":        out,
+        "glossary":     _load_glossary(),   # curated terms, served (not bundled)
     }
 
 

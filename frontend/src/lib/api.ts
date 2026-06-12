@@ -403,10 +403,11 @@ export type DataDictColumn = {
   nullable: boolean;
   ordinal: number;
   classification: string;                 // derived: key | measure | date | dimension
-  description: string | null;             // not in BQ → null (UI shows '—')
+  description: string | null;             // DDL comment → curated → derived from name
   sourceTable: string | null;
   sourceField: string | null;
   infoObject: string | null;
+  lineageSource?: 'ddl' | 'curated' | 'derived';  // provenance of the lineage row
 };
 
 export type DataDictView = {
@@ -416,10 +417,14 @@ export type DataDictView = {
   columns: DataDictColumn[];
 };
 
+export type GlossaryTerm = { term: string; full: string | null; def: string; screens: string[] };
+export type GlossarySection = { section: string; terms: GlossaryTerm[] };
+
 export type DataDictionaryResponse = {
   totalViews: number;
   totalColumns: number;
   views: DataDictView[];
+  glossary?: GlossarySection[];           // curated terms, served by the API (not bundled)
 };
 
 export async function fetchDataDictionary(): Promise<DataDictionaryResponse> {

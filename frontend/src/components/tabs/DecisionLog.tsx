@@ -8,7 +8,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { Clock, CheckCircle, XCircle, AlertTriangle, ChevronRight, ChevronDown, Loader2 } from 'lucide-react';
+import { Clock, CheckCircle, XCircle, AlertTriangle, ChevronRight, ChevronDown, Loader2, Download } from 'lucide-react';
 import {
   fetchDecisionLog, readSessionDecisions,
   type DecisionLogRow, type DecisionLogResponse,
@@ -16,6 +16,26 @@ import {
 import { DashboardSkeleton } from '../primitives';
 
 const LIMIT = 200;
+
+// Client-side export of ONE decision — the complete order + audit record for
+// the expanded row (every field the Decision Log holds for that order).
+function downloadDecisionJson(d: DecisionLogRow) {
+  const payload = {
+    exported_at: new Date().toISOString(),
+    source: 'GET /decision-log · tiger_decisions.fct_allocation_decisions',
+    decision: d,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const tag = String(d.poNumber || d.id || 'decision').replace(/[^\w.-]+/g, '_');
+  a.download = `decision_${tag}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -45,6 +65,9 @@ function outcomeColor(outcome: string): string {
 
 const fmtUsd = (v?: number) =>
   v == null || v === 0 ? '$0' : v < 0 ? `-$${Math.abs(v).toLocaleString()}` : `$${v.toLocaleString()}`;
+
+// Agent recommendation verb, normalized for display (PARTIAL_FULFILL → PARTIAL).
+const fmtRec = (a?: string) => ((a || '').toUpperCase().replace('PARTIAL_FULFILL', 'PARTIAL') || '—');
 
 function StatTile({
   label, value, sub, status,
@@ -87,6 +110,15 @@ function DetailPanel({ d }: { d: DecisionLogRow }) {
       <div style={{ marginTop: 12 }}>
         <div style={{ fontSize: 9, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700 }}>Rationale</div>
         <div style={{ fontSize: 12, color: '#334155', marginTop: 3, lineHeight: 1.6 }}>{d.rationale || '— (no rationale recorded)'}</div>
+      </div>
+      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'flex-end' }}>
+        <button
+          onClick={() => downloadDecisionJson(d)}
+          title="Download this order & decision record as JSON"
+          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #cbd5e1', borderRadius: 6, background: '#fff', color: '#1e293b', cursor: 'pointer', fontSize: 11, fontWeight: 600 }}
+        >
+          <Download className="w-3.5 h-3.5" /> Download JSON
+        </button>
       </div>
     </div>
   );
@@ -138,8 +170,8 @@ export function DecisionLog() {
   const overridesGoneWrong = rows.filter(d => d.wentWrong).length;
   const overrideEntries = rows.filter(d => d.aligned === false);
 
-  const colGrid = '76px 92px 108px 76px 78px 66px 50px 70px 1fr 88px 50px';
-  const headers = ['Time', 'Order', 'Customer', 'Material', 'Action', 'Fulfill', 'Fill %', 'User', 'Outcome', 'Financial', 'Aligned'];
+  const colGrid = '74px 96px 116px 72px 80px 88px 60px 44px 128px 1fr 86px 50px';
+  const headers = ['Time', 'Order', 'Customer', 'Material', 'Agent Rec', 'Decision', 'Fulfill', 'Fill %', 'User', 'Outcome', 'Financial', 'Aligned'];
 
   const hasPaging = total > LIMIT || offset > 0;
 
@@ -261,13 +293,14 @@ export function DecisionLog() {
                     {isOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}{tsLabel(d.timestamp)}
                   </span>
                   <span style={{ fontWeight: 600, color: '#1e293b', fontSize: 10, fontFamily: 'monospace' }}>{d.poNumber || '—'}</span>
-                  <span style={{ color: '#1e293b', fontWeight: 600 }}>{d.customer || '—'}</span>
+                  <span title={d.customer} style={{ color: '#1e293b', fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.customer || '—'}</span>
                   <span style={{ color: '#475569', fontSize: 10, fontFamily: 'monospace' }}>{d.material || '—'}</span>
-                  <span style={{ color: isAccept ? '#059669' : '#DB033B', fontSize: 10, fontWeight: 700 }}>{d.action || '—'}</span>
+                  <span style={{ color: '#334155', fontSize: 10, fontWeight: 700 }} title="What the AI agent recommended">{fmtRec(d.action)}</span>
+                  <span style={{ color: dec ? (isAccept ? '#059669' : '#DB033B') : '#94a3b8', fontSize: 10, fontWeight: 700 }} title="What the planner submitted">{dec ? (isAccept ? 'APPROVED' : 'REJECTED') : '—'}</span>
                   <span style={{ fontFamily: 'monospace', color: '#1e293b' }}>{(d.fulfillQty ?? 0).toLocaleString()} cs</span>
                   <span style={{ fontFamily: 'monospace', color: '#475569' }}>{(d.fillRatePct ?? 0)}%</span>
-                  <span style={{ fontSize: 10, color: '#64748b' }}>{d.userId || '—'}</span>
-                  <span style={{ color: outcomeColor(d.outcome), fontSize: 11, fontWeight: 500 }}>{d.outcome || '—'}</span>
+                  <span title={d.userId} style={{ fontSize: 10, color: '#64748b', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.userId || '—'}</span>
+                  <span title={d.outcome} style={{ color: outcomeColor(d.outcome), fontSize: 11, fontWeight: 500, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.outcome || '—'}</span>
                   <span style={{ textAlign: 'right', fontFamily: 'monospace', fontSize: 10, fontWeight: 600, color: (d.financialImpact ?? 0) < 0 ? '#DB033B' : '#64748b' }}>{fmtUsd(d.financialImpact)}</span>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
                     {d.aligned ? (
