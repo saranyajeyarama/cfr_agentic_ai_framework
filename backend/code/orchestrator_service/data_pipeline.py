@@ -170,18 +170,25 @@ def _fetch_global_kpis(client: bigquery.Client) -> dict:
             WHERE decision_date >= DATE_TRUNC(CURRENT_DATE(), MONTH)
         """).result())
         decisions_logged_mtd = _safe_int(d_rows[0].get("n")) if d_rows else 0
-        # Agent-recommendation acceptance: telemetry has no `aligned` column, so
-        # derive it — the human is "aligned" when their approve/reject matches
-        # whether the agent recommended a positive (ACCEPT/PARTIAL) action.
+        # Agent-recommendation acceptance — computed over the SAME source and the
+        # SAME "aligned" definition as the Decision Log, so the TopBar / Watchtower /
+        # My Dashboard numbers match the Decision Log's "AI Acceptance Rate".
+        # Aligned = the stored decision_aligned_with_agent flag (fallback: the human
+        # approved), mirroring _decision_row(); PLACEHOLDER rows excluded like the
+        # audit view. (The old telemetry XNOR wrongly marked an agent REJECT/DEFER
+        # that the human agreed with as mis-aligned.)
         a_rows = list(_cu.query(f"""
             SELECT
               COUNTIF(
-                (LOWER(user_decision) IN ('approved','accept','accepted'))
-                = (UPPER(agent_recommendation) IN ('ACCEPT','PARTIAL','PARTIAL_FULFILL'))
+                CASE
+                  WHEN LOWER(JSON_VALUE(decision_reason, '$.decision_aligned_with_agent')) IN ('true','false')
+                    THEN LOWER(JSON_VALUE(decision_reason, '$.decision_aligned_with_agent')) = 'true'
+                  ELSE LOWER(JSON_VALUE(decision_reason, '$.user_decision')) IN ('approved','accept','accepted')
+                END
               ) AS aligned,
               COUNT(*) AS total
-            FROM `{PROJECT_ID}.tiger_decisions.fct_user_execution_telemetry`
-            WHERE user_decision IS NOT NULL
+            FROM `{PROJECT_ID}.tiger_decisions.fct_allocation_decisions`
+            WHERE COALESCE(JSON_VALUE(decision_reason, '$.trigger.customer_name'), '') NOT LIKE 'PLACEHOLDER%'
         """).result())
         if a_rows:
             total = _safe_int(a_rows[0].get("total"))

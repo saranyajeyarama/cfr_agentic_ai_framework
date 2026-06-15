@@ -8,7 +8,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { Clock, CheckCircle, XCircle, AlertTriangle, ChevronRight, ChevronDown, Loader2, Download } from 'lucide-react';
+import { Clock, AlertTriangle, ChevronRight, ChevronDown, Loader2, Download } from 'lucide-react';
 import {
   fetchDecisionLog, readSessionDecisions,
   type DecisionLogRow, type DecisionLogResponse,
@@ -170,7 +170,8 @@ export function DecisionLog() {
   const overridesGoneWrong = rows.filter(d => d.wentWrong).length;
   const overrideEntries = rows.filter(d => d.aligned === false);
 
-  const colGrid = '74px 96px 116px 72px 80px 88px 60px 44px 128px 1fr 86px 50px';
+  const colGrid = '72px 92px 112px 66px 74px 82px 60px 42px 104px minmax(176px,1fr) 80px 48px';
+  const TABLE_MIN = 1008;  // sum of column min-widths → table scrolls instead of collapsing
   const headers = ['Time', 'Order', 'Customer', 'Material', 'Agent Rec', 'Decision', 'Fulfill', 'Fill %', 'User', 'Outcome', 'Financial', 'Aligned'];
 
   const hasPaging = total > LIMIT || offset > 0;
@@ -262,8 +263,11 @@ export function DecisionLog() {
             </span>
           </div>
 
+          {/* Horizontally scrollable grid — header + rows scroll together and keep
+              their column widths instead of collapsing on a narrow window. */}
+          <div style={{ overflowX: 'auto' }}>
           {/* Column headers */}
-          <div style={{ display: 'grid', gridTemplateColumns: colGrid, background: '#f8fafc', padding: '5px 12px', borderBottom: '1px solid #e2e8f0' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: colGrid, minWidth: TABLE_MIN, columnGap: 12, background: '#f8fafc', padding: '5px 12px', borderBottom: '1px solid #e2e8f0' }}>
             {headers.map(h => (
               <div key={h} style={{ fontSize: 9, color: '#94a3b8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</div>
             ))}
@@ -287,7 +291,7 @@ export function DecisionLog() {
               <div key={d.id || i} style={{ borderBottom: '1px solid #e2e8f0' }}>
                 <div
                   onClick={() => setOpenId(isOpen ? null : d.id)}
-                  style={{ display: 'grid', gridTemplateColumns: colGrid, padding: '9px 12px', background: d._session ? '#f0fdf4' : i % 2 === 0 ? '#fff' : '#f8fafc', fontSize: 11, alignItems: 'center', cursor: 'pointer' }}
+                  style={{ display: 'grid', gridTemplateColumns: colGrid, minWidth: TABLE_MIN, columnGap: 12, padding: '9px 12px', background: d._session ? '#f0fdf4' : i % 2 === 0 ? '#fff' : '#f8fafc', fontSize: 11, alignItems: 'center', cursor: 'pointer' }}
                 >
                   <span style={{ fontSize: 10, color: '#94a3b8', display: 'flex', alignItems: 'center', gap: 2 }}>
                     {isOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}{tsLabel(d.timestamp)}
@@ -301,19 +305,14 @@ export function DecisionLog() {
                   <span style={{ fontFamily: 'monospace', color: '#475569' }}>{(d.fillRatePct ?? 0)}%</span>
                   <span title={d.userId} style={{ fontSize: 10, color: '#64748b', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.userId || '—'}</span>
                   <span title={d.outcome} style={{ color: outcomeColor(d.outcome), fontSize: 11, fontWeight: 500, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.outcome || '—'}</span>
-                  <span style={{ textAlign: 'right', fontFamily: 'monospace', fontSize: 10, fontWeight: 600, color: (d.financialImpact ?? 0) < 0 ? '#DB033B' : '#64748b' }}>{fmtUsd(d.financialImpact)}</span>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                    {d.aligned ? (
-                      <><CheckCircle className="w-3 h-3 text-emerald-500" /><span style={{ color: '#059669', fontSize: 10, fontWeight: 600 }}>Yes</span></>
-                    ) : (
-                      <><XCircle className="w-3 h-3 text-[#DB033B]" /><span style={{ color: '#DB033B', fontSize: 10, fontWeight: 600 }}>No</span></>
-                    )}
-                  </div>
+                  <span style={{ fontFamily: 'monospace', fontSize: 10, fontWeight: 600, color: (d.financialImpact ?? 0) < 0 ? '#DB033B' : '#64748b' }}>{fmtUsd(d.financialImpact)}</span>
+                  <span style={{ color: d.aligned ? '#059669' : '#DB033B', fontSize: 10, fontWeight: 700 }}>{d.aligned ? 'Yes' : 'No'}</span>
                 </div>
                 {isOpen && <DetailPanel d={d} />}
               </div>
             );
           })}
+          </div>
 
           {/* Pagination */}
           {hasPaging && (

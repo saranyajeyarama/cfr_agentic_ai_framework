@@ -47,17 +47,39 @@ const OPENING_MESSAGE: ChatMessage = {
   text: 'Good morning. I have full visibility into your active orders, network status, and financial risk landscape. Ask me anything about the OpEx Tower — I have the same data the specialist agents do.',
 };
 
+// Conversation history persists for the browser session — survives a page reload,
+// clears when the tab closes (sessionStorage keeps it scoped to "this session").
+const NEXUS_CHAT_KEY = 'tiger:nexus:chat:v1';
+
+function loadMessages(): ChatMessage[] {
+  try {
+    const raw = sessionStorage.getItem(NEXUS_CHAT_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) return parsed as ChatMessage[];
+    }
+  } catch { /* sessionStorage unavailable / bad JSON → fall back to the greeting */ }
+  return [OPENING_MESSAGE];
+}
+
+function saveMessages(msgs: ChatMessage[]): void {
+  try { sessionStorage.setItem(NEXUS_CHAT_KEY, JSON.stringify(msgs)); } catch { /* ignore quota / privacy mode */ }
+}
+
 export function NexusCoPilot() {
   const [col, setCol]       = useState(false);
   const [input, setInput]   = useState('');
   const [loading, setLoading] = useState(false);
   const [apiStatus, setApiStatus] = useState<ApiStatus>('ready');
-  const [messages, setMessages]   = useState<ChatMessage[]>([OPENING_MESSAGE]);
+  const [messages, setMessages]   = useState<ChatMessage[]>(loadMessages);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!col) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, col]);
+
+  // Persist the conversation so it survives a page reload (within the session).
+  useEffect(() => { saveMessages(messages); }, [messages]);
 
   async function handleSend() {
     if (!input.trim() || loading) return;
