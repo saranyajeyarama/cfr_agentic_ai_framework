@@ -211,6 +211,28 @@ def _normalize_decision(d: dict, order_event, session_id: str = "") -> None:
         d["recommendation"] = {"action": "ACCEPT", "fulfill_qty_cs": 0,
                                "confidence": _avg_specialist_confidence(d), "expected_outcome": ""}
 
+    # Layer-2 SAP classification (Section 7): keep the agent's emitted sap_action;
+    # else attach a deterministic fallback so the Firestore action card and the
+    # DCE write both carry a decision_type/tcode. Tolerant of missing inputs.
+    try:
+        from sap_translation import resolve_classification
+        _recm = d.get("recommendation") or {}
+        _sa = _recm.get("sap_action")
+        if not (isinstance(_sa, dict) and _sa.get("decision_type")):
+            _recm["sap_action"] = resolve_classification({
+                "agent_recommendation": _recm.get("action"),
+                "agent_confidence_score": _recm.get("confidence"),
+                "conflicts_detected": d.get("conflicts_detected") or [],
+                "specialist_dispositions": {
+                    name: {"disposition": (s or {}).get("disposition")}
+                    for name, s in (d.get("specialist_signals") or {}).items()
+                },
+                "sap_action": _sa,
+            })
+            d["recommendation"] = _recm
+    except Exception:
+        pass
+
     # reasoning_chain: list of strings -> nested dict
     # ───────── BUG-FIX-PHASE1: skip meta-statements when flattening ─────────
     # When the agent returns a list, the FIRST item is often a meta-statement

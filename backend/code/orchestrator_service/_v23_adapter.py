@@ -340,10 +340,25 @@ def decision_to_v23_synthesis(decision: dict[str, Any]) -> dict[str, Any]:
         }
         for a in alts_in
     ]
+    # Fill rate = fulfilled ÷ ordered × 100 (the true fill rate). We compute it
+    # here rather than trust the model's `partial_fill_pct`, which it emits
+    # inconsistently — sometimes a 0–1 fraction (1.0 shown as "1%"), sometimes
+    # blank on a full ACCEPT. A full ACCEPT with no ordered qty defaults to 100%.
+    _action = str(rec.get("action") or "DEFER").upper()
+    _fulfill = _safe_float(rec.get("fulfill_qty_cs"), 0.0)
+    _ordered = _safe_float(order.get("ordered_quantity_cases"), 0.0)
+    if _ordered > 0:
+        _fill_pct = round(min(100.0, max(0.0, _fulfill / _ordered * 100.0)))
+    elif _action == "ACCEPT":
+        _fill_pct = 100
+    else:
+        _raw = _safe_float(rec.get("partial_fill_pct"), 0.0)
+        _fill_pct = round(_raw * 100) if 0 < _raw <= 1 else round(min(100.0, max(0.0, _raw)))
+
     rec_out = {
         "action": rec.get("action", "DEFER"),
-        "qty": _safe_float(rec.get("fulfill_qty_cs"), 0.0),
-        "fill_pct": _safe_float(rec.get("partial_fill_pct"), 0.0),
+        "qty": _fulfill,
+        "fill_pct": _fill_pct,
         "confidence": _coerce_confidence(rec.get("confidence")),
         "outcome": rec.get("expected_outcome", ""),
         "alternatives": alts_out,

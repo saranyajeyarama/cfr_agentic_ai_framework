@@ -42,6 +42,7 @@ COPY code/orchestrator_service/orchestrator.py     /app/orchestrator.py
 COPY code/orchestrator_service/firestore_client.py /app/firestore_client.py
 COPY code/orchestrator_service/bigquery_client.py  /app/bigquery_client.py
 COPY code/orchestrator_service/data_pipeline.py    /app/data_pipeline.py
+COPY code/orchestrator_service/sap_translation.py  /app/sap_translation.py
 COPY code/orchestrator_service/fulfillment_optimizer.py /app/fulfillment_optimizer.py
 COPY code/orchestrator_service/_v23_adapter.py     /app/_v23_adapter.py
 COPY code/orchestrator_service/main.py             /app/main.py

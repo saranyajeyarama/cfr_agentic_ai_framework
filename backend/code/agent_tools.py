@@ -1607,15 +1607,34 @@ def dce_write(
                  if isinstance(ordered, (int, float)) and ordered
                  and isinstance(allocated, (int, float)) else None)
 
+    # Layer-2 SAP classification (Section 7): prefer the synthesizer's emitted
+    # `sap_action`; else derive a deterministic fallback. Stored in
+    # decision_reason so the Decision Log + BATP layer read the tcode straight
+    # from the JSON. Never block a decision write on classification failure.
+    try:
+        from sap_translation import resolve_classification
+        sap_classification = resolve_classification({
+            "agent_recommendation": cs_action,
+            "agent_confidence_score": rec.get("confidence"),
+            "conflicts_detected": [{"resolution": c.get("resolution")} for c in conflicts],
+            "specialist_dispositions": {
+                name: {"disposition": s.get("disposition")} for name, s in signals.items()
+            },
+            "sap_action": rec.get("sap_action"),
+        })
+    except Exception:
+        sap_classification = None
+
     # Agent-specific payload packed into decision_reason as JSON (Option A).
     # `trigger` packs the original order context — fct_allocation_decisions
     # has only `sold_to`, so downstream consumers (Fulfillment Simulator)
     # JSON_VALUE the material_number / customer_name / mabd from here.
     decision_reason_obj = {
-        "_dce_schema": "agent_v2_01",
+        "_dce_schema": "agent_v2_02",
         "rationale": rec.get("expected_outcome"),
         "agent_recommendation": cs_action,
         "agent_confidence_score": rec.get("confidence"),
+        "sap_classification": sap_classification,
         "user_decision": user_decision,
         "decision_aligned_with_agent": aligned,
         "rejection_reason": rejection_reason,
@@ -1678,7 +1697,7 @@ def dce_write(
     return {"decision_id": decision_id,
             "table": table_ref,
             "inserted_at": datetime.now(timezone.utc).isoformat(),
-            "dce_schema": "agent_v2_01"}
+            "dce_schema": "agent_v2_02"}
 
 
 # ===========================================================================

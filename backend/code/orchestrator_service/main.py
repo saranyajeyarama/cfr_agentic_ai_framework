@@ -1697,6 +1697,24 @@ def decision_log(limit: int = 200, offset: int = 0) -> dict:
         raise HTTPException(status_code=500, detail="Decision log unavailable")
 
 
+@app.get("/decision-log/{decision_id}/sap-payload")
+def decision_sap_payload(decision_id: str) -> dict:
+    """Section-7 Layer-2 BATP SAP JSON for one agentic decision.
+
+    Resolves the SAP classification (agent-emitted `sap_classification` else a
+    deterministic fallback), looks up SAP master data from tiger_semantic, and
+    returns the `batp_payload` envelope (VA02 / VL02N / MIGO+ME21N, or an
+    escalation no-op). 404 if the decision_id is unknown."""
+    from data_pipeline import build_sap_payload
+    try:
+        return build_sap_payload(decision_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        log.error("sap-payload generation failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="SAP payload generation failed")
+
+
 # ---------------------------------------------------------------------------
 # Root Cause Hub + Safety Stock Optimizer — dedicated single-responsibility APIs
 # (split out of /dashboard-data so each tab fetches only what it needs)

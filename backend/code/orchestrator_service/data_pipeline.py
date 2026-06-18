@@ -34,6 +34,11 @@ from typing import Any
 
 from google.cloud import bigquery
 
+try:
+    import sap_translation  # Layer-2 SAP classification + BATP payload (Section 7)
+except Exception:  # never let an absent optional module break the whole pipeline import
+    sap_translation = None  # type: ignore
+
 PROJECT_ID   = os.environ.get("PROJECT_ID", "resilience-riskradar")
 SEMANTIC_DS  = f"{PROJECT_ID}.tiger_semantic"
 
@@ -1247,7 +1252,9 @@ _DECISION_SELECT = """
     JSON_VALUE(decision_reason, '$.orchestrator_version')        AS orchestrator_version,
     JSON_VALUE(decision_reason, '$.trigger.sales_order_number')  AS order_no,
     JSON_VALUE(decision_reason, '$.trigger.customer_name')       AS customer_name,
-    JSON_VALUE(decision_reason, '$.trigger.material_number')     AS material
+    JSON_VALUE(decision_reason, '$.trigger.material_number')     AS material,
+    JSON_VALUE(decision_reason, '$.sap_classification.decision_type')          AS decision_type,
+    JSON_VALUE(decision_reason, '$.sap_classification.sap_transaction_target') AS sap_tcode
 """
 # Exclude PLACEHOLDER test rows from the audit view.
 _DECISION_WHERE = ("COALESCE(JSON_VALUE(decision_reason, '$.trigger.customer_name'), '') "
@@ -1338,6 +1345,15 @@ def _decision_row(r: dict, penalty_fn) -> dict:
     penalty = penalty_fn(sold_to) if short > 0 else 0.0
     financial = -round(short * penalty) if short > 0 else 0
 
+    # Layer-2 SAP classification (Section 7): prefer the value the agent stored
+    # in decision_reason; else derive an action-only fallback for legacy rows.
+    decision_type = r.get("decision_type")
+    sap_tcode = r.get("sap_tcode")
+    if not decision_type and sap_translation is not None:
+        _cls = sap_translation.classify({"agent_recommendation": r.get("agent_rec")})
+        decision_type = _cls["decision_type"]
+        sap_tcode = _cls["sap_transaction_target"]
+
     return {
         "id":                  r.get("decision_id", ""),
         "timestamp":           ts,
@@ -1359,6 +1375,8 @@ def _decision_row(r: dict, penalty_fn) -> dict:
         "aligned":             aligned,
         "financialImpact":     financial,
         "wentWrong":           (not aligned) and short > 0,
+        "decisionType":        decision_type,
+        "sapTransactionTarget": sap_tcode,
     }
 
 
@@ -1412,6 +1430,129 @@ def fetch_decision_log_page(limit: int = 200, offset: int = 0) -> dict:
         "filtered_count": len(decisions),
         "decisions":      decisions,
     }
+
+
+def _sap_master_lookup(sales_order_number, material_number) -> dict:
+    """Look up SAP master/config fields for the BATP payload from tiger_semantic
+    (us-central1). Tolerant — any failed/empty lookup just yields fewer keys, and
+    sap_translation fills the rest with flagged placeholders. SO/material are
+    matched leading-zero-insensitively (decision values are unpadded)."""
+    out: dict = {}
+    try:
+        cc = _bq_client()
+        if sales_order_number:
+            so_rows = _run(cc, f"""
+                SELECT sales_organization, distribution_channel, division,
+                       plant_code, sales_uom, requested_delivery_date
+                FROM `{SEMANTIC_DS}.fct_sales_orders`
+                WHERE LTRIM(sales_order_number, '0') = LTRIM(@so, '0')
+                ORDER BY sales_order_item
+                LIMIT 1
+            """, [bigquery.ScalarQueryParameter("so", "STRING", str(sales_order_number))])
+            if so_rows:
+                s = so_rows[0]
+                rdd = s.get("requested_delivery_date")
+                out.update({
+                    "sales_org": s.get("sales_organization"),
+                    "distribution_channel": s.get("distribution_channel"),
+                    "division": s.get("division"),
+                    "plant": s.get("plant_code"),
+                    "sales_uom": s.get("sales_uom"),
+                    "requested_delivery_date": rdd.isoformat() if hasattr(rdd, "isoformat") else rdd,
+                })
+            dlv_rows = _run(cc, f"""
+                SELECT delivery_number, shipping_point, storage_location, plant_code
+                FROM `{SEMANTIC_DS}.fct_deliveries`
+                WHERE LTRIM(reference_sales_order_number, '0') = LTRIM(@so, '0')
+                ORDER BY delivery_item
+                LIMIT 1
+            """, [bigquery.ScalarQueryParameter("so", "STRING", str(sales_order_number))])
+            if dlv_rows:
+                d = dlv_rows[0]
+                out.update({
+                    "delivery_number": d.get("delivery_number"),
+                    "shipping_point": d.get("shipping_point"),
+                    "storage_location": d.get("storage_location"),
+                })
+                out.setdefault("plant", d.get("plant_code"))
+        if material_number:
+            inv = _run(cc, f"""
+                SELECT plant_code, SUM(ending_inventory_cases) AS inv
+                FROM `{SEMANTIC_DS}.fct_inventory_projection`
+                WHERE LTRIM(material_fert_number, '0') = LTRIM(@m, '0')
+                GROUP BY plant_code
+                ORDER BY inv DESC
+                LIMIT 5
+            """, [bigquery.ScalarQueryParameter("m", "STRING", str(material_number))])
+            plants = [x.get("plant_code") for x in inv if x.get("plant_code")]
+            alt = next((p for p in plants if p and p != out.get("plant")), None)
+            if alt:
+                out["split_plant"] = alt          # second source plant (split / transfer)
+    except Exception as exc:
+        log.warning("SAP master lookup failed (so=%s mat=%s): %s",
+                    sales_order_number, material_number, exc)
+    return {k: v for k, v in out.items() if v}
+
+
+def build_sap_payload(decision_id: str) -> dict:
+    """Section-7 BATP payload for one decision (Layer 2). Reads the decision from
+    tiger_decisions.fct_allocation_decisions, resolves the SAP classification
+    (agent-emitted else fallback), looks up master data from tiger_semantic, and
+    returns the `batp_payload` envelope. ESCALATION → transactions:[]."""
+    if sap_translation is None:
+        raise RuntimeError("sap_translation module is not deployed in this build")
+    import json as _json
+    dclient = _bq_decisions()
+    decisions_ds = f"{PROJECT_ID}.tiger_decisions"
+    rows = _run(dclient, f"""
+        SELECT decision_id, decision_status, decision_approved_by,
+               ordered_quantity_cases   AS ordered,
+               allocated_quantity_cases AS allocated,
+               shortfall_quantity_cases AS shortfall,
+               decision_reason
+        FROM `{decisions_ds}.fct_allocation_decisions`
+        WHERE decision_id = @did
+        LIMIT 1
+    """, [bigquery.ScalarQueryParameter("did", "STRING", decision_id)])
+    if not rows:
+        raise ValueError(f"decision {decision_id} not found")
+    r = rows[0]
+
+    reason: dict = {}
+    raw = r.get("decision_reason")
+    if raw:
+        try:
+            reason = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception:
+            reason = {}
+    trigger = reason.get("trigger") or {}
+    cls = sap_translation.resolve_classification(reason)
+
+    disputants: list = []
+    for c in reason.get("conflicts_detected") or []:
+        for x in (c.get("disputants") or []):
+            if x and x not in disputants:
+                disputants.append(x)
+
+    decision = {
+        "source_log_id":           decision_id,
+        "user_decision":           reason.get("user_decision"),
+        "agent_recommendation":    reason.get("agent_recommendation"),
+        "material_number":         trigger.get("material_number"),
+        "sales_order_number":      trigger.get("sales_order_number"),
+        "customer_name":           trigger.get("customer_name"),
+        "requested_delivery_date": trigger.get("requested_delivery_date"),
+        "ordered":                 _safe_float(r.get("ordered")),
+        "allocated":               _safe_float(r.get("allocated")),
+        "shortfall":               _safe_float(r.get("shortfall")),
+        "rationale":               reason.get("rationale"),
+        "disputants":              disputants,
+        **cls,   # decision_type, sap_transaction_target, change_type
+    }
+    master = ({} if cls["decision_type"] == "ESCALATION"
+              else _sap_master_lookup(trigger.get("sales_order_number"),
+                                      trigger.get("material_number")))
+    return sap_translation.build_batp_payload(decision, master)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

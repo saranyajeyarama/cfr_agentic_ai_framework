@@ -261,6 +261,22 @@ class AlternativeOption(BaseModel):
     viable: bool
 
 
+class SapAction(BaseModel):
+    """Layer-2 SAP classification the synthesizer emits so downstream BATP
+    translation knows which SAP transaction to prepare (Section 7). Optional
+    and backward-compatible — a deterministic fallback derives it when absent."""
+    decision_type: Literal[
+        "TRANSFER_RECOMMENDATION", "ORDER_ADJUSTMENT", "DELIVERY_FLAG", "ESCALATION"
+    ]
+    sap_transaction_target: Optional[
+        Literal["ME21N", "MIGO", "VA02", "VL02N"]
+    ] = None
+    change_type: Optional[
+        Literal["QUANTITY_CHANGE", "PLANT_CHANGE", "DATE_CHANGE", "EXPEDITE_FLAG"]
+    ] = None
+    reason: Optional[str] = None
+
+
 class Recommendation(BaseModel):
     action: Literal["ACCEPT", "REJECT", "PARTIAL_FULFILL", "DEFER"]
     fulfill_qty_cs: float = 0.0
@@ -268,6 +284,9 @@ class Recommendation(BaseModel):
     alternative_options: list[AlternativeOption] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     expected_outcome: str
+    # Layer-2 SAP classification (Section 7). Optional → older payloads still validate;
+    # the BATP layer derives a fallback when the agent omits it.
+    sap_action: Optional[SapAction] = None
 
 
 class ReasoningChain(BaseModel):

@@ -22,3 +22,10 @@ Thumbs.db
 !tsconfig.json
 !tsconfig.*.json
 *.zip
+
+
+# Python cache directories
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

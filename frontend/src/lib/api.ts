@@ -340,6 +340,8 @@ export type DecisionLogRow = {
   aligned: boolean;
   financialImpact: number;
   wentWrong: boolean;
+  decisionType?: string;          // Section-7 SAP decision_type (agent-emitted or fallback)
+  sapTransactionTarget?: string;  // SAP tcode (VA02/VL02N/MIGO/ME21N) or null for escalation
   _session?: boolean;        // appended optimistically this session (not yet round-tripped from BQ)
 };
 
@@ -353,6 +355,27 @@ export type DecisionLogResponse = {
  *  Decision Log can fall back to its in-memory current-session view. */
 export async function fetchDecisionLog(limit = 200, offset = 0): Promise<DecisionLogResponse> {
   return request<DecisionLogResponse>(`/decision-log?limit=${limit}&offset=${offset}`);
+}
+
+// ─── Section-7 SAP BATP payload for one decision (Layer-2 translation) ────────
+export type BatpPayload = {
+  batp_payload: {
+    payload_id: string;
+    source_log_id: string;
+    generated_at: string;
+    target_system: string;
+    execution_mode: string;
+    transactions: unknown[];
+    escalation?: unknown;
+    config_placeholders?: string[];
+    config_placeholders_note?: string;
+  };
+};
+
+/** Generate the Section-7 Layer-2 SAP JSON (BATP payload) for one decision.
+ *  Throws (BackendError 404/500) when the decision is unknown or generation fails. */
+export async function fetchSapPayload(decisionId: string): Promise<BatpPayload> {
+  return request<BatpPayload>(`/decision-log/${encodeURIComponent(decisionId)}/sap-payload`);
 }
 
 // ── In-memory current-session decisions (instant UX feedback + 5xx fallback) ──

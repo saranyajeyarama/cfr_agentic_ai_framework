@@ -51,6 +51,36 @@ type Phase = 'idle' | 'evaluating' | 'result' | 'decided' | 'error';
 
 type DecisionKind = 'approved' | 'rejected';
 
+// Per-order decisions persist for the browser session so each row keeps its
+// "Approved" / "Rejected" state when the user leaves Order Triage and comes
+// back. The tab switch unmounts this component, which would otherwise reset
+// the in-memory map and make a decided order look un-actioned again.
+const TRIAGE_DECISIONS_KEY = 'tiger:triage:decisions:v1';
+
+function loadTriageDecisions(): Record<string, DecisionKind> {
+  try {
+    const raw = sessionStorage.getItem(TRIAGE_DECISIONS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') return parsed as Record<string, DecisionKind>;
+    }
+  } catch { /* sessionStorage unavailable / bad JSON → start empty */ }
+  return {};
+}
+
+function saveTriageDecisions(m: Record<string, DecisionKind>): void {
+  try { sessionStorage.setItem(TRIAGE_DECISIONS_KEY, JSON.stringify(m)); } catch { /* ignore quota / privacy mode */ }
+}
+
+// Defensive display guard: a fill rate emitted as a 0–1 fraction (e.g. 1.0)
+// must read as 100%, not "1%". Clamp to 0–100 and round. (The backend adapter
+// now computes the true fill rate; this just hardens the UI.)
+function normFillPct(v: number | undefined | null): number {
+  const n = typeof v === 'number' && isFinite(v) ? v : 0;
+  const pct = n > 0 && n <= 1 ? n * 100 : n;
+  return Math.round(Math.min(100, Math.max(0, pct)));
+}
+
 // Hardcoded planner identity — replace with auth context when available.
 const USER_ID = 'planner.ops@mars.com';
 
@@ -264,7 +294,7 @@ function RecommendationCard({
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
             {([
               ['Fulfill Qty',  `${r.qty.toLocaleString()} cs`],
-              ['Fill Rate',    `${r.fill_pct}%`],
+              ['Fill Rate',    `${normFillPct(r.fill_pct)}%`],
               ['Action',       r.action.replace(/_/g, ' ')],
             ] as [string, string][]).map(([l, v]) => (
               <div key={l} style={{
@@ -820,9 +850,13 @@ export function OrderTriage({
   const [elapsedMs, setElapsedMs]     = useState<number>(0);
 
   // Local per-order decisions (so the row shows "Approved" / "Rejected" while
-  // we wait for the queue to refetch).
-  const [decisionByOrder, setDecisionByOrder] = useState<Record<string, DecisionKind>>({});
+  // we wait for the queue to refetch). Seeded from sessionStorage so the state
+  // survives a tab switch (component remount).
+  const [decisionByOrder, setDecisionByOrder] = useState<Record<string, DecisionKind>>(loadTriageDecisions);
   const [rejectModalOpen, setRejectModalOpen] = useState<boolean>(false);
+
+  // Persist decisions for the session whenever they change.
+  useEffect(() => { saveTriageDecisions(decisionByOrder); }, [decisionByOrder]);
 
   // Real-Time Inventory Snapshot — a fast /fulfillment/simulate run for the
   // selected order (per-DC ATP). Keyed by order id so it doesn't refire.
@@ -986,6 +1020,9 @@ export function OrderTriage({
     // Optimistic append so the decision shows in the Decision Log immediately
     // (and survives a backend outage). BQ reconciles on the next fetch.
     const recA = result.synthesis?.rec;
+    // Mirror the backend's action-only SAP fallback so the type shows instantly.
+    const recAAct = (recA?.action || '').toUpperCase();
+    const recAExec = recAAct === 'ACCEPT' || recAAct === 'PARTIAL_FULFILL' || recAAct === 'PARTIAL' || recAAct === 'DEFER';
     appendSessionDecision({
       id: result.session_id || selectedOrder.id,
       timestamp: new Date().toISOString(),
@@ -996,7 +1033,7 @@ export function OrderTriage({
       agentRecommendation: recA?.action || '',
       userDecision: 'approved',
       fulfillQty: recA?.qty ?? selectedOrder.qty ?? 0,
-      fillRatePct: recA?.fill_pct ?? 0,
+      fillRatePct: normFillPct(recA?.fill_pct),
       userId: USER_ID,
       rationale: recA?.outcome || '',
       sessionId: result.session_id || '',
@@ -1006,6 +1043,8 @@ export function OrderTriage({
       aligned: true,
       financialImpact: 0,
       wentWrong: false,
+      decisionType: recAExec ? 'ORDER_ADJUSTMENT' : 'ESCALATION',
+      sapTransactionTarget: recAExec ? 'VA02' : undefined,
     });
     try {
       await approveSession(result.session_id, USER_ID);
@@ -1026,6 +1065,8 @@ export function OrderTriage({
     setDecisionByOrder(prev => ({ ...prev, [selectedOrder.id]: 'rejected' }));
     setPhase('decided');
     const recR = result.synthesis?.rec;
+    const recRAct = (recR?.action || '').toUpperCase();
+    const recRExec = recRAct === 'ACCEPT' || recRAct === 'PARTIAL_FULFILL' || recRAct === 'PARTIAL' || recRAct === 'DEFER';
     appendSessionDecision({
       id: result.session_id || selectedOrder.id,
       timestamp: new Date().toISOString(),
@@ -1046,6 +1087,8 @@ export function OrderTriage({
       aligned: false,
       financialImpact: 0,
       wentWrong: false,
+      decisionType: recRExec ? 'ORDER_ADJUSTMENT' : 'ESCALATION',
+      sapTransactionTarget: recRExec ? 'VA02' : undefined,
     });
     try {
       await rejectSession(result.session_id, USER_ID, reason);

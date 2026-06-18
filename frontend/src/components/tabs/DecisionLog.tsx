@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Clock, AlertTriangle, ChevronRight, ChevronDown, Loader2, Download } from 'lucide-react';
 import {
-  fetchDecisionLog, readSessionDecisions,
+  fetchDecisionLog, fetchSapPayload, readSessionDecisions,
   type DecisionLogRow, type DecisionLogResponse,
 } from '../../lib/api';
 import { DashboardSkeleton } from '../primitives';
@@ -91,12 +91,39 @@ function StatTile({
 // ─── Detail panel (expanded row) ──────────────────────────────────────────────
 
 function DetailPanel({ d }: { d: DecisionLogRow }) {
+  const [sapBusy, setSapBusy] = useState(false);
+  const [sapErr, setSapErr]   = useState<string | null>(null);
   const Field = ({ label, value }: { label: string; value: string }) => (
     <div style={{ minWidth: 0 }}>
       <div style={{ fontSize: 9, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700 }}>{label}</div>
       <div style={{ fontSize: 12, color: '#1e293b', marginTop: 2, wordBreak: 'break-word' }}>{value || '—'}</div>
     </div>
   );
+
+  // Generate the Section-7 Layer-2 SAP JSON for THIS decision (backend builds it,
+  // looking up SAP master data from BigQuery), then download the envelope.
+  async function handleSapDownload() {
+    setSapBusy(true);
+    setSapErr(null);
+    try {
+      const payload = await fetchSapPayload(d.id);
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const tag = String(d.poNumber || d.id || 'decision').replace(/[^\w.-]+/g, '_');
+      a.download = `sap_payload_${tag}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setSapErr(e instanceof Error ? e.message : 'SAP payload generation failed');
+    } finally {
+      setSapBusy(false);
+    }
+  }
+
   return (
     <div style={{ gridColumn: '1 / -1', background: '#f8fafc', borderTop: '1px dashed #e2e8f0', padding: '14px 18px' }}>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: '12px 24px' }}>
@@ -104,6 +131,8 @@ function DetailPanel({ d }: { d: DecisionLogRow }) {
         <Field label="User Decision" value={d.userDecision} />
         <Field label="Rejection / Override Reason" value={d.overrideReason || '—'} />
         <Field label="Outcome" value={d.outcome} />
+        <Field label="SAP Transaction" value={d.sapTransactionTarget || '— (no SAP change)'} />
+        <Field label="SAP Decision Type" value={d.decisionType || '—'} />
         <Field label="Session ID" value={d.sessionId} />
         <Field label="Orchestrator Version" value={d.orchestratorVersion} />
       </div>
@@ -111,7 +140,16 @@ function DetailPanel({ d }: { d: DecisionLogRow }) {
         <div style={{ fontSize: 9, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700 }}>Rationale</div>
         <div style={{ fontSize: 12, color: '#334155', marginTop: 3, lineHeight: 1.6 }}>{d.rationale || '— (no rationale recorded)'}</div>
       </div>
-      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10 }}>
+        {sapErr && <span style={{ fontSize: 11, color: '#DB033B', fontWeight: 600 }}>{sapErr}</span>}
+        <button
+          onClick={handleSapDownload}
+          disabled={sapBusy}
+          title="Generate the Section-7 Layer-2 SAP JSON (BATP payload) for this decision and download it"
+          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #7c3aed', borderRadius: 6, background: sapBusy ? '#f5f3ff' : '#fff', color: '#7c3aed', cursor: sapBusy ? 'default' : 'pointer', fontSize: 11, fontWeight: 600, opacity: sapBusy ? 0.6 : 1 }}
+        >
+          {sapBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />} Download SAP JSON
+        </button>
         <button
           onClick={() => downloadDecisionJson(d)}
           title="Download this order & decision record as JSON"
@@ -170,9 +208,9 @@ export function DecisionLog() {
   const overridesGoneWrong = rows.filter(d => d.wentWrong).length;
   const overrideEntries = rows.filter(d => d.aligned === false);
 
-  const colGrid = '72px 92px 112px 66px 74px 82px 60px 42px 104px minmax(176px,1fr) 80px 48px';
-  const TABLE_MIN = 1008;  // sum of column min-widths → table scrolls instead of collapsing
-  const headers = ['Time', 'Order', 'Customer', 'Material', 'Agent Rec', 'Decision', 'Fulfill', 'Fill %', 'User', 'Outcome', 'Financial', 'Aligned'];
+  const colGrid = '72px 92px 112px 66px 74px 82px 70px 60px 42px 104px minmax(176px,1fr) 80px 48px';
+  const TABLE_MIN = 1078;  // sum of column min-widths → table scrolls instead of collapsing
+  const headers = ['Time', 'Order', 'Customer', 'Material', 'Agent Rec', 'Decision', 'SAP Txn', 'Fulfill', 'Fill %', 'User', 'Outcome', 'Financial', 'Aligned'];
 
   const hasPaging = total > LIMIT || offset > 0;
 
@@ -301,6 +339,7 @@ export function DecisionLog() {
                   <span style={{ color: '#475569', fontSize: 10, fontFamily: 'monospace' }}>{d.material || '—'}</span>
                   <span style={{ color: '#334155', fontSize: 10, fontWeight: 700 }} title="What the AI agent recommended">{fmtRec(d.action)}</span>
                   <span style={{ color: dec ? (isAccept ? '#059669' : '#DB033B') : '#94a3b8', fontSize: 10, fontWeight: 700 }} title="What the planner submitted">{dec ? (isAccept ? 'APPROVED' : 'REJECTED') : '—'}</span>
+                  <span style={{ color: '#7c3aed', fontSize: 10, fontWeight: 700, fontFamily: 'monospace' }} title={d.decisionType ? `Section-7 SAP transaction · ${d.decisionType}` : 'Section-7 SAP transaction'}>{d.sapTransactionTarget || '—'}</span>
                   <span style={{ fontFamily: 'monospace', color: '#1e293b' }}>{(d.fulfillQty ?? 0).toLocaleString()} cs</span>
                   <span style={{ fontFamily: 'monospace', color: '#475569' }}>{(d.fillRatePct ?? 0)}%</span>
                   <span title={d.userId} style={{ fontSize: 10, color: '#64748b', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.userId || '—'}</span>

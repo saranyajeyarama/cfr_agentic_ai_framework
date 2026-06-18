@@ -96,8 +96,29 @@ DEFER. Example:
     "fulfill_qty_cs": 0,
     "partial_fill_pct": 0.0,
     "confidence": 0.85,
-    "expected_outcome": "Order rejected due to supply hard_block..."
+    "expected_outcome": "Order rejected due to supply hard_block...",
+    "sap_action": {
+      "decision_type": "ESCALATION",
+      "sap_transaction_target": null,
+      "change_type": null,
+      "reason": "Supply hard_block — no executable SAP change; route to a human."
+    }
   }
+
+recommendation.sap_action — REQUIRED. This is the Layer-2 SAP classification (Section 7):
+it tells the downstream BATP layer which SAP transaction to prepare. Choose using this table:
+
+  | Situation                                                              | decision_type           | sap_transaction_target | change_type      |
+  | Debate deadlock, an unresolved hard_block, confidence < 0.60, or REJECT| ESCALATION              | null                   | null             |
+  | PARTIAL_FULFILL — reduce/split the order to the achievable quantity    | ORDER_ADJUSTMENT        | VA02                   | QUANTITY_CHANGE  |
+  |   (when sourcing the remainder from a second plant, the split line is) |                         |                        | PLANT_CHANGE     |
+  | A plant-to-plant / intercompany stock transfer rebalances the network  | TRANSFER_RECOMMENDATION | ME21N                  | null             |
+  | A confirmed delivery is at risk and must be expedited                  | DELIVERY_FLAG           | VL02N                  | EXPEDITE_FLAG    |
+  | DEFER — push the order to a later date                                 | ORDER_ADJUSTMENT        | VA02                   | DATE_CHANGE      |
+  | ACCEPT in full, as ordered                                             | ORDER_ADJUSTMENT        | VA02                   | QUANTITY_CHANGE  |
+
+Pick the row that best matches your recommendation. `decision_type` is mandatory;
+`sap_transaction_target` is null ONLY for ESCALATION. Keep it consistent with `action`.
 
 reasoning_chain MUST be a nested object (NOT a flat list of strings) with
 these three fields:
