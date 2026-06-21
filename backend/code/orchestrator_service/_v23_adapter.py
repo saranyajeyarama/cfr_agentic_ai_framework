@@ -221,6 +221,9 @@ def candidate_to_v23_order(candidate: dict[str, Any]) -> dict[str, Any]:
                 candidate.get("ordered_qty") or 0),
             "requested_delivery_date": delivery,
             "customer_name": candidate.get("sold_to_name"),
+            # Order identifiers so the Decision Log "Order" column is populated.
+            "sales_order_number": order_id,
+            "customer_po_number": po_id,
             "material_description": candidate.get("material_description"),
             "consensus_plan_qty_cases": float(
                 candidate.get("consensus_qty") or 0)

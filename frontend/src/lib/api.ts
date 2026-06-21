@@ -342,6 +342,7 @@ export type DecisionLogRow = {
   wentWrong: boolean;
   decisionType?: string;          // Section-7 SAP decision_type (agent-emitted or fallback)
   sapTransactionTarget?: string;  // SAP tcode (VA02/VL02N/MIGO/ME21N) or null for escalation
+  source?: string;                // 'order_triage' | 'fulfillment_simulator' (Decision Log origin)
   _session?: boolean;        // appended optimistically this session (not yet round-tripped from BQ)
 };
 
@@ -353,8 +354,11 @@ export type DecisionLogResponse = {
 
 /** Durable audit trail. Throws (BackendError/NetworkError) on failure so the
  *  Decision Log can fall back to its in-memory current-session view. */
-export async function fetchDecisionLog(limit = 200, offset = 0): Promise<DecisionLogResponse> {
-  return request<DecisionLogResponse>(`/decision-log?limit=${limit}&offset=${offset}`);
+export async function fetchDecisionLog(
+  limit = 200, offset = 0, source?: string,
+): Promise<DecisionLogResponse> {
+  const q = source ? `&source=${encodeURIComponent(source)}` : '';
+  return request<DecisionLogResponse>(`/decision-log?limit=${limit}&offset=${offset}${q}`);
 }
 
 // ─── Section-7 SAP BATP payload for one decision (Layer-2 translation) ────────
@@ -372,10 +376,82 @@ export type BatpPayload = {
   };
 };
 
-/** Generate the Section-7 Layer-2 SAP JSON (BATP payload) for one decision.
+/** Two Section-7 SAP payloads for one order: `recommended` (the triage decision
+ *  alone) and `executed` (the committed fulfilment split-sourcing plan, if any). */
+export type SapPayloadResponse = {
+  recommended: BatpPayload;
+  executed: BatpPayload | null;
+  has_plan: boolean;
+};
+
+/** Generate the Section-7 Layer-2 SAP JSON(s) for one decision — both the
+ *  recommended (triage) and executed (fulfilment plan) envelopes.
  *  Throws (BackendError 404/500) when the decision is unknown or generation fails. */
-export async function fetchSapPayload(decisionId: string): Promise<BatpPayload> {
-  return request<BatpPayload>(`/decision-log/${encodeURIComponent(decisionId)}/sap-payload`);
+export async function fetchSapPayload(decisionId: string): Promise<SapPayloadResponse> {
+  return request<SapPayloadResponse>(`/decision-log/${encodeURIComponent(decisionId)}/sap-payload`);
+}
+
+// ─── Fulfilment plan EXECUTE (commit a split-sourcing plan → Executed SAP JSON) ──
+export type FulfillmentExecuteRequest = {
+  incident_id?: string;
+  decision_id?: string;
+  sold_to?: string;
+  customer_name?: string;
+  material_number?: string;
+  sales_order_number?: string;
+  requested_delivery_date?: string;
+  scenario_id?: string;
+  ordered_quantity_cases?: number;
+  expedite?: boolean;
+  source?: 'agent' | 'planner';
+  plant_details?: Array<Record<string, unknown>>;
+};
+
+export type FulfillmentExecuteResponse = {
+  ok: boolean;
+  decision_id?: string | null;
+  plan: { lines: Array<Record<string, unknown>>; [k: string]: unknown };
+  sap_payload?: BatpPayload | null;
+};
+
+/** Commit the chosen fulfilment scenario so the order's "Executed" SAP payload
+ *  reflects the actual sourcing. Returns the plan + the executed BATP envelope. */
+export async function executeFulfillmentPlan(
+  req: FulfillmentExecuteRequest,
+): Promise<FulfillmentExecuteResponse> {
+  return request<FulfillmentExecuteResponse>('/fulfillment/execute', { method: 'POST', body: req });
+}
+
+// ─── Case Log (submission / suggestion / acceptance) + LLM FinOps ─────────────
+export type CaseLogResponse = {
+  log_type: string;
+  rows: Record<string, unknown>[];
+};
+
+/** Rows from one case-log table for the Logs tab. */
+export async function fetchCaseLogs(
+  logType: 'submission' | 'suggestion' | 'acceptance' = 'submission',
+  limit = 100, caseId?: string,
+): Promise<CaseLogResponse> {
+  const q = caseId ? `&case_id=${encodeURIComponent(caseId)}` : '';
+  return request<CaseLogResponse>(`/case-logs?log_type=${logType}&limit=${limit}${q}`);
+}
+
+export type FinopsTotals = {
+  calls: number; input_tokens: number; output_tokens: number;
+  total_tokens: number; est_cost_usd: number;
+};
+export type FinopsResponse = {
+  days: number;
+  totals: FinopsTotals;
+  by_agent: Array<Record<string, unknown> & { agent: string }>;
+  by_model: Array<Record<string, unknown> & { model: string }>;
+  by_day: Array<{ day: string; total_tokens: number; est_cost_usd: number; calls: number }>;
+};
+
+/** LLM token/cost FinOps rollup for the FinOps tab. */
+export async function fetchFinops(days = 30): Promise<FinopsResponse> {
+  return request<FinopsResponse>(`/finops/llm?days=${days}`);
 }
 
 // ── In-memory current-session decisions (instant UX feedback + 5xx fallback) ──

@@ -2,7 +2,7 @@ import { useState } from "react";
 import {
   LayoutDashboard, Inbox, GitMerge, FileSearch,
   PanelLeftClose, PanelLeftOpen, ShieldCheck,
-  Clock, Home, Activity, BookOpen,
+  Clock, Home, Activity, BookOpen, ScrollText, DollarSign,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
@@ -31,6 +31,8 @@ const MAIN_TABS: TabDef[] = [
 const ANALYTICS_TABS: TabDef[] = [
   { id: 'manager',    label: 'My Dashboard',   icon: Home     },
   { id: 'decisions',  label: 'Decision Log',   icon: Clock    },
+  { id: 'logs',       label: 'Agent Logs',     icon: ScrollText },
+  { id: 'finops',     label: 'LLM FinOps',     icon: DollarSign },
   { id: 'datahealth', label: 'Data Health',    icon: Activity },
   { id: 'dictionary', label: 'Data Dictionary', icon: BookOpen },
 ];

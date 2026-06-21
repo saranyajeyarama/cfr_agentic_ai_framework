@@ -115,6 +115,8 @@ export interface V23TriageResponse {
   order_id: string;
   synthesis: V23Synthesis;
   session_id: string;
+  case_id?: string;        // case-log lineage (stable per order)
+  suggestion_id?: string;  // case-log lineage (this evaluation run)
 }
 
 // ─── /data-health ────────────────────────────────────────────────────────────
@@ -187,6 +189,8 @@ export type ScreenId =
   | 'rootcause'
   | 'safetystock'
   | 'decisions'
+  | 'logs'
+  | 'finops'
   | 'manager'
   | 'datahealth'
   | 'dictionary'

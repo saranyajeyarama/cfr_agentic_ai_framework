@@ -1582,6 +1582,7 @@ def dce_write(
     user_decision: Literal["approved", "rejected", "cancelled"],
     user_id: Optional[str] = None,
     rejection_reason: Optional[str] = None,
+    source: str = "order_triage",
 ) -> dict:
     """Write one Decision Capture Engine record into the real
     fct_allocation_decisions schema (Option A — JSON in decision_reason)."""
@@ -1593,6 +1594,8 @@ def dce_write(
     dce = payload.get("dce_payload", {}) or {}
     signals = payload.get("specialist_signals", {}) or {}
     conflicts = payload.get("conflicts_detected", []) or []
+    case_id = payload.get("case_id")
+    suggestion_id = payload.get("suggestion_id")
 
     cs_action = rec.get("action")
     aligned = bool(cs_action) and user_decision == "approved"
@@ -1631,6 +1634,7 @@ def dce_write(
     # JSON_VALUE the material_number / customer_name / mabd from here.
     decision_reason_obj = {
         "_dce_schema": "agent_v2_02",
+        "source": source,   # order_triage | fulfillment_simulator (Decision Log filter)
         "rationale": rec.get("expected_outcome"),
         "agent_recommendation": cs_action,
         "agent_confidence_score": rec.get("confidence"),
@@ -1661,6 +1665,8 @@ def dce_write(
         },
         "trigger_source": order.get("trigger_source"),
         "session_id": session_id,
+        "case_id": case_id,
+        "suggestion_id": suggestion_id,
         "orchestrator_version": payload.get("orchestrator_version",
                                             "v2.01.0"),
         "agent_model_versions": payload.get(

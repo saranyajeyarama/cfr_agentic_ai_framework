@@ -650,6 +650,55 @@ class FulfillmentIncident(BaseModel):
     _demo_seed: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Fulfillment plan EXECUTE — when a planner/agent commits a split-sourcing plan
+# at the fulfillment center, persist it so Layer-2 builds the SAP JSON from the
+# ACTUAL plan (the "Executed" SAP payload), not the ATP-inferred guess.
+# ---------------------------------------------------------------------------
+class FulfillmentPlanLine(BaseModel):
+    plant: str
+    qty: float = 0.0
+    storage_location: Optional[str] = None
+    on_hand: bool = True               # plant already holds enough stock to ship its qty
+    replenish_from: Optional[str] = None  # source plant for an inter-DC transfer (ME21N/MIGO)
+    transit_h: Optional[float] = None
+    carrier: Optional[str] = None
+
+
+class FulfillmentPlan(BaseModel):
+    source: Literal["agent", "planner"] = "planner"
+    scenario_id: Optional[str] = None
+    plan_version: int = 1
+    total_ordered: float = 0.0
+    total_allocated: float = 0.0
+    shortfall: float = 0.0
+    expedite: bool = False
+    lines: list[FulfillmentPlanLine] = Field(default_factory=list)
+
+
+class FulfillmentExecuteRequest(BaseModel):
+    incident_id: str = ""
+    decision_id: Optional[str] = None
+    sold_to: str = ""
+    customer_name: Optional[str] = None
+    material_number: str = ""
+    sales_order_number: Optional[str] = None
+    requested_delivery_date: Optional[str] = None
+    scenario_id: Optional[str] = None
+    ordered_quantity_cases: float = 0.0
+    expedite: bool = False
+    source: Literal["agent", "planner"] = "planner"
+    # Raw per-plant split from the chosen scenario (plantDetails[] = [{code, qty, ...}]).
+    plant_details: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FulfillmentExecuteResponse(BaseModel):
+    ok: bool = True
+    decision_id: Optional[str] = None
+    plan: FulfillmentPlan
+    sap_payload: Optional[dict[str, Any]] = None   # the executed batp_payload (preview)
+
+
 class FulfillmentIncidentsResponse(BaseModel):
     incidents: list[FulfillmentIncident]
     meta: dict[str, Any] = Field(default_factory=dict)
@@ -676,6 +725,8 @@ class ExecutionTelemetryRequest(BaseModel):
     override_reason_code: Optional[str] = None
     session_id: Optional[str] = None
     decision_id: Optional[str] = None
+    case_id: Optional[str] = None         # case-log lineage (acceptance row)
+    suggestion_id: Optional[str] = None   # the suggestion this disposition responds to
     outcome_note: Optional[str] = None
     user_id: Optional[str] = "planner"
     source_tab: Optional[str] = "order_triage"

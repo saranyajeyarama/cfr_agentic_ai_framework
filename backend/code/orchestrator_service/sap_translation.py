@@ -331,6 +331,86 @@ def _me21n_migo(decision: dict, master: dict, placeholders: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Fulfillment-plan path — a split-sourcing plan committed at the fulfillment
+# center → a MULTI-transaction envelope (N-line VA02 + ME21N/MIGO per transfer
+# line + VL02N when expedited). See FULFILLMENT_ORDER_CHANGE_SAP_ARCHITECTURE.
+# ---------------------------------------------------------------------------
+def _transfer_pair(mat: str, qty: Any, supplying: str, receiving: str,
+                   storage: str, rdd: Any, uom: str, placeholders: list) -> list:
+    """ME21N STO (UB) + MIGO 641 to replenish `receiving` from `supplying`."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    pur_org = _DEFAULTS["purchasing_org"]; pur_grp = _DEFAULTS["purchasing_group"]
+    placeholders.extend(["purchasing_org", "purchasing_group"])
+    return [
+        {"transaction_code": "ME21N", "document_type": "STOCK_TRANSPORT_ORDER", "action": "CREATE",
+         "header": {"po_type": "UB", "supplying_plant": supplying, "purchasing_org": pur_org,
+                    "purchasing_group": pur_grp, "document_date": today,
+                    "header_text": f"STO {supplying}->{receiving} to cover {qty} cs split line"},
+         "line_items": [{"line_number": pad_item(10), "material_number": mat, "quantity": _num(qty),
+                         "unit_of_measure": uom, "delivery_date": rdd, "receiving_plant": receiving,
+                         "storage_location": storage, "item_text": "Replenish for fulfillment split per CFR plan."}]},
+        {"transaction_code": "MIGO", "document_type": "GOODS_MOVEMENT", "action": "CREATE",
+         "header": {"movement_type": "641", "posting_date": today, "document_date": today,
+                    "reference_document": "STO::ME21N#000010 (formatter substitutes the real PO number post-create)",
+                    "header_text": f"GI against STO {supplying}->{receiving} for {mat}."},
+         "line_items": [{"line_number": pad_item(10), "material_number": mat, "quantity": _num(qty),
+                         "unit_of_measure": uom, "plant_from": supplying, "storage_location_from": storage,
+                         "plant_to": receiving, "storage_location_to": storage,
+                         "batch_number": None, "special_stock_indicator": None}]},
+    ]
+
+
+def _build_from_plan(decision: dict, plan: dict, master: dict, placeholders: list) -> list:
+    """Multi-transaction set from a committed fulfillment plan.
+    VA02 (one line item per plan line) + ME21N/MIGO per transfer line + VL02N on expedite."""
+    mat = pad_material(decision.get("material_number"))
+    uom = master.get("sales_uom") or "CS"
+    storage_default = _m(master, "storage_location", placeholders)
+    rdd = master.get("requested_delivery_date") or decision.get("requested_delivery_date")
+    original_plant = str(master.get("plant") or "").strip()
+    lines = plan.get("lines") or []
+
+    so = pad_so(decision.get("sales_order_number"))
+    if not so:
+        placeholders.append("sales_order_number")
+
+    va_lines = []
+    for i, ln in enumerate(lines):
+        plant = str(ln.get("plant") or "")
+        storage = ln.get("storage_location") or storage_default
+        change_type = "QUANTITY_CHANGE" if (not original_plant or plant == original_plant) else "PLANT_CHANGE"
+        va_lines.append({
+            "item_number": pad_item(10 * (i + 1)),
+            "material_number": mat,
+            "order_quantity": _num(ln.get("qty")),
+            "order_quantity_uom": uom,
+            "delivering_plant": plant,
+            "storage_location": storage,
+            "requested_delivery_date": rdd,
+            "change_type": change_type,
+        })
+    sid = plan.get("scenario_id") or ""
+    txns = [{
+        "transaction_code": "VA02", "document_type": "SALES_ORDER", "action": "CHANGE",
+        "header": {"sales_order_number": so, "sales_org": _m(master, "sales_org", placeholders),
+                   "distribution_channel": _m(master, "distribution_channel", placeholders),
+                   "division": _m(master, "division", placeholders),
+                   "change_reason": decision.get("rationale") or f"Split sourcing per fulfillment plan {sid}."},
+        "line_items": va_lines,
+    }]
+    # Inter-DC replenishment for any line whose plant lacks on-hand stock.
+    for ln in lines:
+        if not ln.get("on_hand", True) and ln.get("replenish_from"):
+            txns += _transfer_pair(mat, ln.get("qty"), str(ln.get("replenish_from")),
+                                   str(ln.get("plant")), ln.get("storage_location") or storage_default,
+                                   rdd, uom, placeholders)
+    # Expedite the at-risk delivery.
+    if plan.get("expedite"):
+        txns.append(_vl02n(decision, master, placeholders))
+    return txns
+
+
+# ---------------------------------------------------------------------------
 # Envelope assembly (Section 7.1)
 # ---------------------------------------------------------------------------
 def build_batp_payload(decision: dict, master: Optional[dict] = None) -> dict:
@@ -355,7 +435,17 @@ def build_batp_payload(decision: dict, master: Optional[dict] = None) -> dict:
         "transactions": [],
     }
 
-    if decision_type == "ESCALATION":
+    plan = decision.get("fulfillment_plan")
+    if plan and (plan.get("lines")):
+        # A committed fulfillment-center plan drives the transactions directly
+        # (overrides the single decision_type branch below).
+        envelope["transactions"] = _build_from_plan(decision, plan, master, placeholders)
+        envelope["fulfillment_plan_ref"] = {
+            "scenario_id": plan.get("scenario_id"),
+            "plan_version": plan.get("plan_version"),
+            "source": plan.get("source"),
+        }
+    elif decision_type == "ESCALATION":
         envelope["escalation"] = {
             "reason": decision.get("rationale") or "Escalated — no executable SAP change.",
             "escalate_to": "Supply Planning Manager queue",

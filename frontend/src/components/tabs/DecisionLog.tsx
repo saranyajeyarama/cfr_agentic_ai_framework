@@ -12,6 +12,7 @@ import { Clock, AlertTriangle, ChevronRight, ChevronDown, Loader2, Download } fr
 import {
   fetchDecisionLog, fetchSapPayload, readSessionDecisions,
   type DecisionLogRow, type DecisionLogResponse,
+  type SapPayloadResponse, type BatpPayload,
 } from '../../lib/api';
 import { DashboardSkeleton } from '../primitives';
 
@@ -93,6 +94,8 @@ function StatTile({
 function DetailPanel({ d }: { d: DecisionLogRow }) {
   const [sapBusy, setSapBusy] = useState(false);
   const [sapErr, setSapErr]   = useState<string | null>(null);
+  const [sap, setSap]         = useState<SapPayloadResponse | null>(null);
+  const [tab, setTab]         = useState<'recommended' | 'executed'>('recommended');
   const Field = ({ label, value }: { label: string; value: string }) => (
     <div style={{ minWidth: 0 }}>
       <div style={{ fontSize: 9, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700 }}>{label}</div>
@@ -100,28 +103,56 @@ function DetailPanel({ d }: { d: DecisionLogRow }) {
     </div>
   );
 
-  // Generate the Section-7 Layer-2 SAP JSON for THIS decision (backend builds it,
-  // looking up SAP master data from BigQuery), then download the envelope.
-  async function handleSapDownload() {
+  // Fetch BOTH Section-7 SAP payloads for THIS decision — "Recommended" (the
+  // triage decision alone) and "Executed" (the committed fulfillment plan, if any).
+  async function loadSap() {
     setSapBusy(true);
     setSapErr(null);
     try {
-      const payload = await fetchSapPayload(d.id);
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const tag = String(d.poNumber || d.id || 'decision').replace(/[^\w.-]+/g, '_');
-      a.download = `sap_payload_${tag}.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      const data = await fetchSapPayload(d.id);
+      setSap(data);
+      setTab(data.has_plan ? 'executed' : 'recommended');
     } catch (e) {
       setSapErr(e instanceof Error ? e.message : 'SAP payload generation failed');
     } finally {
       setSapBusy(false);
     }
+  }
+
+  function tcodes(p: BatpPayload | null | undefined): string[] {
+    const txns = (p?.batp_payload?.transactions ?? []) as Array<{ transaction_code?: string }>;
+    return txns.map(t => t?.transaction_code || '?');
+  }
+
+  function downloadSap(which: 'recommended' | 'executed') {
+    const env = which === 'executed' ? sap?.executed : sap?.recommended;
+    if (!env) return;
+    const blob = new Blob([JSON.stringify(env, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const tag = String(d.poNumber || d.id || 'decision').replace(/[^\w.-]+/g, '_');
+    a.download = `sap_${which}_${tag}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  const CHIP_COLOR: Record<string, [string, string]> = {
+    VA02: ['#eef2ff', '#3730a3'], ME21N: ['#fef3c7', '#92400e'],
+    MIGO: ['#fef3c7', '#92400e'], VL02N: ['#fee2e2', '#991b1b'],
+  };
+  function Chips({ codes }: { codes: string[] }) {
+    if (!codes.length) return <span style={{ fontSize: 11, color: '#64748b' }}>no SAP transactions (escalation)</span>;
+    return (
+      <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 4 }}>
+        {codes.map((c, i) => {
+          const [bg, fg] = CHIP_COLOR[c] ?? ['#f1f5f9', '#334155'];
+          return <span key={i} style={{ fontSize: 9, fontWeight: 800, padding: '2px 7px', borderRadius: 10, background: bg, color: fg }}>{c}</span>;
+        })}
+      </span>
+    );
   }
 
   return (
@@ -133,6 +164,7 @@ function DetailPanel({ d }: { d: DecisionLogRow }) {
         <Field label="Outcome" value={d.outcome} />
         <Field label="SAP Transaction" value={d.sapTransactionTarget || '— (no SAP change)'} />
         <Field label="SAP Decision Type" value={d.decisionType || '—'} />
+        <Field label="Source" value={d.source === 'fulfillment_simulator' ? 'Fulfilment Simulator' : 'Order Triage'} />
         <Field label="Session ID" value={d.sessionId} />
         <Field label="Orchestrator Version" value={d.orchestratorVersion} />
       </div>
@@ -140,16 +172,64 @@ function DetailPanel({ d }: { d: DecisionLogRow }) {
         <div style={{ fontSize: 9, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 700 }}>Rationale</div>
         <div style={{ fontSize: 12, color: '#334155', marginTop: 3, lineHeight: 1.6 }}>{d.rationale || '— (no rationale recorded)'}</div>
       </div>
-      <div style={{ marginTop: 14, display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10 }}>
-        {sapErr && <span style={{ fontSize: 11, color: '#DB033B', fontWeight: 600 }}>{sapErr}</span>}
-        <button
-          onClick={handleSapDownload}
-          disabled={sapBusy}
-          title="Generate the Section-7 Layer-2 SAP JSON (BATP payload) for this decision and download it"
-          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #7c3aed', borderRadius: 6, background: sapBusy ? '#f5f3ff' : '#fff', color: '#7c3aed', cursor: sapBusy ? 'default' : 'pointer', fontSize: 11, fontWeight: 600, opacity: sapBusy ? 0.6 : 1 }}
-        >
-          {sapBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />} Download SAP JSON
-        </button>
+      {/* SAP Transaction Set — Recommended (triage) vs Executed (fulfilment) */}
+      <div style={{ marginTop: 14, borderTop: '1px solid #e2e8f0', paddingTop: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 10, fontWeight: 800, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.06em' }}>SAP Transaction Set</span>
+          {!sap && (
+            <button onClick={loadSap} disabled={sapBusy}
+              title="Generate the Section-7 Layer-2 SAP JSON (BATP payload) for this decision"
+              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '5px 11px', border: '1px solid #7c3aed', borderRadius: 6, background: sapBusy ? '#f5f3ff' : '#fff', color: '#7c3aed', cursor: sapBusy ? 'default' : 'pointer', fontSize: 11, fontWeight: 600, opacity: sapBusy ? 0.6 : 1 }}>
+              {sapBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null} Generate SAP JSON
+            </button>
+          )}
+          {sapErr && <span style={{ fontSize: 11, color: '#DB033B', fontWeight: 600 }}>{sapErr}</span>}
+        </div>
+
+        {sap && (() => {
+          const active = tab === 'executed' ? (sap.executed ?? sap.recommended) : sap.recommended;
+          const recN = tcodes(sap.recommended).length;
+          const exeN = tcodes(sap.executed).length;
+          return (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <div style={{ display: 'inline-flex', border: '1px solid #cbd5e1', borderRadius: 7, overflow: 'hidden' }}>
+                  {(['recommended', 'executed'] as const).map(t => {
+                    const on = tab === t;
+                    const disabled = t === 'executed' && !sap.has_plan;
+                    return (
+                      <button key={t} onClick={() => !disabled && setTab(t)} disabled={disabled}
+                        style={{ padding: '4px 12px', fontSize: 10, fontWeight: 700, border: 'none', cursor: disabled ? 'not-allowed' : 'pointer',
+                                 background: on ? '#DB033B' : '#f8fafc', color: on ? '#fff' : (disabled ? '#cbd5e1' : '#64748b') }}>
+                        {t === 'recommended' ? 'Recommended (triage)' : 'Executed (fulfilment)'}
+                      </button>
+                    );
+                  })}
+                </div>
+                {sap.has_plan
+                  ? <span style={{ fontSize: 9, fontWeight: 800, color: '#b91c3c', background: '#fef2f2', border: '1px solid #f3c5cf', borderRadius: 10, padding: '2px 9px' }}>Δ {recN} txn → {exeN} txns</span>
+                  : <span style={{ fontSize: 9, color: '#94a3b8' }}>no fulfilment plan executed yet</span>}
+              </div>
+
+              <div style={{ marginTop: 8 }}><Chips codes={tcodes(active)} /></div>
+
+              <pre style={{ marginTop: 8, maxHeight: 220, overflow: 'auto', background: '#0f172a', color: '#e2e8f0', borderRadius: 6, padding: '10px 12px', fontSize: 10, lineHeight: 1.5, fontFamily: 'ui-monospace, monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {JSON.stringify(active, null, 2)}
+              </pre>
+
+              <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
+                <button onClick={() => downloadSap(tab === 'executed' && sap.has_plan ? 'executed' : 'recommended')}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #7c3aed', borderRadius: 6, background: '#fff', color: '#7c3aed', cursor: 'pointer', fontSize: 11, fontWeight: 600 }}>
+                  <Download className="w-3.5 h-3.5" /> Download {tab === 'executed' && sap.has_plan ? 'Executed' : 'Recommended'} JSON
+                </button>
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* Full order + decision record */}
+      <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
         <button
           onClick={() => downloadDecisionJson(d)}
           title="Download this order & decision record as JSON"
@@ -171,12 +251,13 @@ export function DecisionLog() {
   const [fellBack, setFellBack] = useState<boolean>(false);
   const [offset, setOffset]   = useState<number>(0);
   const [openId, setOpenId]   = useState<string | null>(null);
+  const [sourceFilter, setSourceFilter] = useState<'all' | 'order_triage' | 'fulfillment_simulator'>('all');
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetchDecisionLog(LIMIT, offset);
+      const r = await fetchDecisionLog(LIMIT, offset, sourceFilter === 'all' ? undefined : sourceFilter);
       setResp(r);
       setFellBack(false);
     } catch (e) {
@@ -188,7 +269,7 @@ export function DecisionLog() {
     } finally {
       setLoading(false);
     }
-  }, [offset]);
+  }, [offset, sourceFilter]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -196,7 +277,9 @@ export function DecisionLog() {
 
   const bqRows = resp?.decisions ?? [];
   // Merge fresh current-session decisions (not yet round-tripped from BQ) on page 1.
-  const sessionRows = (!fellBack && offset === 0) ? readSessionDecisions() : [];
+  const sessionRows = (!fellBack && offset === 0)
+    ? readSessionDecisions().filter(r => sourceFilter === 'all' || (r.source || 'order_triage') === sourceFilter)
+    : [];
   const bqKeys = new Set(bqRows.map(r => r.sessionId || r.id));
   const freshSession = sessionRows.filter(r => !bqKeys.has(r.sessionId || r.id));
   const rows: DecisionLogRow[] = [...freshSession, ...bqRows];
@@ -296,9 +379,23 @@ export function DecisionLog() {
                 Newest first · click a row for full rationale &amp; audit detail
               </div>
             </div>
-            <span style={{ fontSize: 11, color: '#94a3b8' }}>
-              {loading ? <Loader2 className="inline w-3 h-3 animate-spin" /> : `${pageCount} shown · ${total} total`}
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              {/* Source filter — All / Order Triage / Fulfilment */}
+              <div style={{ display: 'inline-flex', border: '1px solid #cbd5e1', borderRadius: 7, overflow: 'hidden' }} title="Filter decisions by origin">
+                {([['all', 'All'], ['order_triage', 'Order Triage'], ['fulfillment_simulator', 'Fulfilment']] as const).map(([val, lbl]) => {
+                  const on = sourceFilter === val;
+                  return (
+                    <button key={val} onClick={() => { setSourceFilter(val); setOffset(0); }}
+                      style={{ padding: '4px 11px', fontSize: 10, fontWeight: 700, border: 'none', cursor: 'pointer', background: on ? '#DB033B' : '#fff', color: on ? '#fff' : '#64748b' }}>
+                      {lbl}
+                    </button>
+                  );
+                })}
+              </div>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                {loading ? <Loader2 className="inline w-3 h-3 animate-spin" /> : `${pageCount} shown · ${total} total`}
+              </span>
+            </div>
           </div>
 
           {/* Horizontally scrollable grid — header + rows scroll together and keep
@@ -326,7 +423,8 @@ export function DecisionLog() {
             const dec = (d.userDecision || '').toLowerCase();
             const isAccept = dec === 'approved' || dec === 'accept' || dec === 'accepted';
             return (
-              <div key={d.id || i} style={{ borderBottom: '1px solid #e2e8f0' }}>
+              <div key={d.id || i} title={d.source === 'fulfillment_simulator' ? 'Fulfilment Simulator' : 'Order Triage'}
+                   style={{ borderBottom: '1px solid #e2e8f0', borderLeft: `3px solid ${d.source === 'fulfillment_simulator' ? '#7c3aed' : 'transparent'}` }}>
                 <div
                   onClick={() => setOpenId(isOpen ? null : d.id)}
                   style={{ display: 'grid', gridTemplateColumns: colGrid, minWidth: TABLE_MIN, columnGap: 12, padding: '9px 12px', background: d._session ? '#f0fdf4' : i % 2 === 0 ? '#fff' : '#f8fafc', fontSize: 11, alignItems: 'center', cursor: 'pointer' }}

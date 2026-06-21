@@ -430,6 +430,8 @@ async def _invoke_agent(
 
     t0 = _now_ms()
     response_json: dict | None = None
+    _resp_text = ""           # final response text (for token estimate + submission payload)
+    _usage = None             # Vertex usage_metadata if exposed by the event
 
     # Hold the concurrency permit for the entire ADK run, including all
     # tool calls and follow-up LLM turns inside the async generator.
@@ -467,6 +469,8 @@ async def _invoke_agent(
                 text = "".join(
                     p.text for p in event.content.parts
                     if getattr(p, "text", None))
+                _resp_text = text
+                _usage = getattr(event, "usage_metadata", None) or _usage
                 response_json = _extract_json(text)
                 try:
                     _save_raw_response(agent_name, adk_session_id, text, response_json)
@@ -500,6 +504,29 @@ async def _invoke_agent(
         agent=agent_name, round_idx=round_idx, action="response",
         model_response_json=response_json, latency_ms=_latency_ms,
     )
+    # Case-log SUBMISSION row (best-effort; never blocks). Tokens from Vertex
+    # usage_metadata when exposed, else a chars/4 estimate.
+    try:
+        from data_pipeline import write_submission_log
+        _model = getattr(getattr(agent, "model", None), "model", None) or AGENT_MODEL_VERSIONS.split(",")[0]
+        if _usage is not None:
+            _in = getattr(_usage, "prompt_token_count", None)
+            _out = getattr(_usage, "candidates_token_count", None)
+            _cached = getattr(_usage, "cached_content_token_count", 0) or 0
+        else:
+            _in = len(json.dumps(prompt_payload)) // 4
+            _out = len(_resp_text) // 4
+            _cached = 0
+        write_submission_log(
+            case_id=getattr(writer, "case_id", None),
+            suggestion_id=getattr(writer, "suggestion_id", None),
+            session_id=writer.session_id, agent=agent_name, model=_model, round=round_idx,
+            input_tokens=_in or 0, cached_tokens=_cached, output_tokens=_out or 0,
+            latency_ms=_latency_ms, feature="order_triage", endpoint="/v23/triage",
+            payload={"prompt_payload": prompt_payload, "response_text": _resp_text[:20000]},
+        )
+    except Exception as _sub_err:
+        _l.warning("submission-log write failed: %s", _sub_err)
     if response_json is None:
         # Graceful error envelope — the synthesizer expects this shape.
         return {
@@ -638,9 +665,14 @@ async def _synthesize(order_event: CustomerOrderEvent,
 # Public entrypoint
 # ---------------------------------------------------------------------------
 async def run_session(session_id: str, trigger_type: str,
-                      order_event: CustomerOrderEvent) -> None:
+                      order_event: CustomerOrderEvent,
+                      case_id: str | None = None,
+                      suggestion_id: str | None = None) -> None:
     """Run the 5-agent N-to-N parallel + debate-on-conflict flow."""
     writer = StepWriter(session_id)
+    # Case-log lineage ids (carried on submission rows + the final decision).
+    writer.case_id = case_id
+    writer.suggestion_id = suggestion_id
     log = get_session_logger(__name__, session_id)
     log.info("Session started trigger=%s sold_to=%s material=%s qty=%s",
              trigger_type,
@@ -751,6 +783,9 @@ async def run_session(session_id: str, trigger_type: str,
         decision["trigger_type"] = trigger_type
 
         rec = decision.get("recommendation", {})
+        # Thread the case-log ids onto the decision so dce_write / acceptance can read them.
+        decision["case_id"] = case_id
+        decision["suggestion_id"] = suggestion_id
         log.info("Session complete status=awaiting_approval action=%s confidence=%s",
                  rec.get("action"), rec.get("confidence"))
         update_session(session_id, status="awaiting_approval",
@@ -802,6 +837,22 @@ def _finalize(session_id: str, action_card: dict, user_id: str,
                                        else "rejected"),
                    decision_id=result["decision_id"], user_id=user_id,
                    ended_at="NOW")
+
+    # Case-log ACCEPTANCE row for the authoritative approve/reject (backend-sourced
+    # ids — no frontend dependency). Best-effort; never blocks finalize.
+    try:
+        from data_pipeline import write_acceptance_log
+        write_acceptance_log(
+            suggestion_id=action_card.get("suggestion_id"),
+            case_id=action_card.get("case_id"),
+            session_id=session_id, decision_id=result["decision_id"],
+            disposition=("accepted" if user_decision == "approved" else "rejected"),
+            decision_aligned_with_agent=(user_decision == "approved"),
+            override_reason=rejection_reason, user_id=user_id, agent="customer_supply",
+            model=(action_card.get("agent_model_versions") or "gemini-2.5-pro").split(",")[0],
+        )
+    except Exception as _acc_err:
+        _log.warning("acceptance-log write (finalize) failed: %s", _acc_err)
     return result["decision_id"]
 
 

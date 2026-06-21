@@ -1026,7 +1026,7 @@ export function OrderTriage({
     appendSessionDecision({
       id: result.session_id || selectedOrder.id,
       timestamp: new Date().toISOString(),
-      poNumber: selectedOrder.po || selectedOrder.id,
+      poNumber: selectedOrder.id || selectedOrder.po,
       customer: selectedOrder.customer,
       material: selectedOrder.sku,
       action: recA?.action || '',
@@ -1045,6 +1045,7 @@ export function OrderTriage({
       wentWrong: false,
       decisionType: recAExec ? 'ORDER_ADJUSTMENT' : 'ESCALATION',
       sapTransactionTarget: recAExec ? 'VA02' : undefined,
+      source: 'order_triage',
     });
     try {
       await approveSession(result.session_id, USER_ID);
@@ -1070,7 +1071,7 @@ export function OrderTriage({
     appendSessionDecision({
       id: result.session_id || selectedOrder.id,
       timestamp: new Date().toISOString(),
-      poNumber: selectedOrder.po || selectedOrder.id,
+      poNumber: selectedOrder.id || selectedOrder.po,
       customer: selectedOrder.customer,
       material: selectedOrder.sku,
       action: recR?.action || '',
@@ -1089,6 +1090,7 @@ export function OrderTriage({
       wentWrong: false,
       decisionType: recRExec ? 'ORDER_ADJUSTMENT' : 'ESCALATION',
       sapTransactionTarget: recRExec ? 'VA02' : undefined,
+      source: 'order_triage',
     });
     try {
       await rejectSession(result.session_id, USER_ID, reason);
@@ -1341,6 +1343,8 @@ export function OrderTriage({
                             : 'Recommendation rejected — logged'}
                         </div>
                         <div style={{ fontSize: 11, opacity: 0.9, marginTop: 2 }}>
+                          {result.case_id ? `case_id=${result.case_id} · ` : ''}
+                          {result.suggestion_id ? `suggestion_id=${result.suggestion_id.slice(0, 8)} · ` : ''}
                           session_id={result.session_id} · user={USER_ID}
                         </div>
                       </div>

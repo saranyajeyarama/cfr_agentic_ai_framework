@@ -1254,7 +1254,8 @@ _DECISION_SELECT = """
     JSON_VALUE(decision_reason, '$.trigger.customer_name')       AS customer_name,
     JSON_VALUE(decision_reason, '$.trigger.material_number')     AS material,
     JSON_VALUE(decision_reason, '$.sap_classification.decision_type')          AS decision_type,
-    JSON_VALUE(decision_reason, '$.sap_classification.sap_transaction_target') AS sap_tcode
+    JSON_VALUE(decision_reason, '$.sap_classification.sap_transaction_target') AS sap_tcode,
+    COALESCE(JSON_VALUE(decision_reason, '$.source'), 'order_triage')           AS source
 """
 # Exclude PLACEHOLDER test rows from the audit view.
 _DECISION_WHERE = ("COALESCE(JSON_VALUE(decision_reason, '$.trigger.customer_name'), '') "
@@ -1377,6 +1378,7 @@ def _decision_row(r: dict, penalty_fn) -> dict:
         "wentWrong":           (not aligned) and short > 0,
         "decisionType":        decision_type,
         "sapTransactionTarget": sap_tcode,
+        "source":              r.get("source") or "order_triage",
     }
 
 
@@ -1399,29 +1401,33 @@ def _fetch_decision_log(client: bigquery.Client) -> list[dict]:
     return [_decision_row(r, lambda st: rates.get(st, 25.0)) for r in rows]
 
 
-def fetch_decision_log_page(limit: int = 200, offset: int = 0) -> dict:
+def fetch_decision_log_page(limit: int = 200, offset: int = 0, source: str | None = None) -> dict:
     """Paginated audit trail for GET /decision-log.
 
     Returns {total_count, filtered_count, decisions[]}. total_count is the full
     row count (for pagination); filtered_count is rows on this page. Newest first.
+    `source` (order_triage | fulfillment_simulator) filters by decision origin.
     """
     limit = max(1, min(int(limit or 200), 1000))
     offset = max(0, int(offset or 0))
     dclient = _bq_decisions()
     decisions_ds = f"{PROJECT_ID}.tiger_decisions"
+    where = _DECISION_WHERE
+    params = [bigquery.ScalarQueryParameter("limit", "INT64", limit),
+              bigquery.ScalarQueryParameter("offset", "INT64", offset)]
+    if source in ("order_triage", "fulfillment_simulator"):
+        where += (" AND COALESCE(JSON_VALUE(decision_reason, '$.source'), 'order_triage') = @source")
+        params.append(bigquery.ScalarQueryParameter("source", "STRING", source))
     # One query: page rows + full filtered count via COUNT(*) OVER() (window runs
     # over all WHERE-matching rows, before LIMIT) — avoids a second COUNT query.
     rows = _run(dclient, f"""
         SELECT {_DECISION_SELECT},
                COUNT(*) OVER() AS total_rows
         FROM `{decisions_ds}.fct_allocation_decisions`
-        WHERE {_DECISION_WHERE}
+        WHERE {where}
         ORDER BY decision_date DESC
         LIMIT @limit OFFSET @offset
-    """, [
-        bigquery.ScalarQueryParameter("limit", "INT64", limit),
-        bigquery.ScalarQueryParameter("offset", "INT64", offset),
-    ])
+    """, params)
     total = _safe_int(rows[0].get("total_rows")) if rows else 0
     rates = _penalty_rates([r.get("sold_to") for r in rows])
     decisions = [_decision_row(r, lambda st: rates.get(st, 25.0)) for r in rows]
@@ -1505,7 +1511,7 @@ def build_sap_payload(decision_id: str) -> dict:
     dclient = _bq_decisions()
     decisions_ds = f"{PROJECT_ID}.tiger_decisions"
     rows = _run(dclient, f"""
-        SELECT decision_id, decision_status, decision_approved_by,
+        SELECT decision_id, decision_status, decision_approved_by, sold_to,
                ordered_quantity_cases   AS ordered,
                allocated_quantity_cases AS allocated,
                shortfall_quantity_cases AS shortfall,
@@ -1549,10 +1555,570 @@ def build_sap_payload(decision_id: str) -> dict:
         "disputants":              disputants,
         **cls,   # decision_type, sap_transaction_target, change_type
     }
+    so_num = trigger.get("sales_order_number")
+    mat_num = trigger.get("material_number")
     master = ({} if cls["decision_type"] == "ESCALATION"
-              else _sap_master_lookup(trigger.get("sales_order_number"),
-                                      trigger.get("material_number")))
-    return sap_translation.build_batp_payload(decision, master)
+              else _sap_master_lookup(so_num, mat_num))
+
+    # Recommended = the triage decision alone (what the agents recommended).
+    recommended = sap_translation.build_batp_payload(decision, master)
+
+    # Executed = the committed fulfillment split-sourcing plan, if any (what the
+    # fulfillment center decided to ship — drives a multi-transaction envelope).
+    plan = read_fulfillment_plan(decision_id=decision_id,
+                                 sold_to=r.get("sold_to"),
+                                 material_number=mat_num,
+                                 sales_order_number=so_num)
+    executed = None
+    if plan and plan.get("lines"):
+        executed = sap_translation.build_batp_payload({**decision, "fulfillment_plan": plan}, master)
+
+    return {"recommended": recommended, "executed": executed, "has_plan": bool(executed)}
+
+
+# ---------------------------------------------------------------------------
+# Fulfillment plan store (executed split-sourcing plan) — feeds the "Executed"
+# SAP payload. Lives in tiger_decisions; mirrors the rec-cache write pattern.
+# ---------------------------------------------------------------------------
+_FULFILLMENT_PLAN_TABLE = f"{_DECISIONS_PROJECT}.tiger_decisions.fct_fulfillment_plan"
+_fulfillment_plan_table_ready = False
+
+
+def _ensure_fulfillment_plan_table() -> None:
+    global _fulfillment_plan_table_ready
+    if _fulfillment_plan_table_ready:
+        return
+    try:
+        client = _bq_decisions()
+        schema = [
+            bigquery.SchemaField("decision_id",        "STRING"),
+            bigquery.SchemaField("incident_id",        "STRING"),
+            bigquery.SchemaField("sold_to",            "STRING"),
+            bigquery.SchemaField("material_number",    "STRING"),
+            bigquery.SchemaField("sales_order_number", "STRING"),
+            bigquery.SchemaField("scenario_id",        "STRING"),
+            bigquery.SchemaField("plan_version",       "INT64"),
+            bigquery.SchemaField("expedite",           "BOOL"),
+            bigquery.SchemaField("plan_json",          "STRING"),
+            bigquery.SchemaField("created_at",         "TIMESTAMP", mode="REQUIRED"),
+        ]
+        table = bigquery.Table(_FULFILLMENT_PLAN_TABLE, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY, field="created_at")
+        table.description = ("Executed fulfillment split-sourcing plans. Latest row per order feeds "
+                             "the 'Executed' Section-7 SAP payload (build_sap_payload).")
+        client.create_table(table, exists_ok=True)
+        _fulfillment_plan_table_ready = True
+        log.info("Fulfillment plan table ready: %s", _FULFILLMENT_PLAN_TABLE)
+    except Exception as exc:
+        log.warning("fulfillment plan table ensure failed: %s", exc)
+
+
+def _plant_inventory(material_number) -> dict:
+    """{plant_code: ending_inventory_cases} for a material (us-central1)."""
+    out: dict = {}
+    if not material_number:
+        return out
+    try:
+        cc = _bq_client()
+        rows = _run(cc, f"""
+            SELECT plant_code, SUM(ending_inventory_cases) AS inv
+            FROM `{SEMANTIC_DS}.fct_inventory_projection`
+            WHERE LTRIM(material_fert_number, '0') = LTRIM(@m, '0')
+            GROUP BY plant_code
+        """, [bigquery.ScalarQueryParameter("m", "STRING", str(material_number))])
+        for r in rows:
+            if r.get("plant_code"):
+                out[r["plant_code"]] = _safe_float(r.get("inv"))
+    except Exception as exc:
+        log.warning("plant inventory lookup failed (%s): %s", material_number, exc)
+    return out
+
+
+def _resolve_decision_id(sold_to, material_number) -> "str | None":
+    """Most-recent decision_id for a (sold_to, material) — links a fulfillment
+    plan to its triage decision when the caller didn't pass a decision_id."""
+    if not (sold_to or material_number):
+        return None
+    try:
+        dclient = _bq_decisions()
+        rows = _run(dclient, f"""
+            SELECT decision_id
+            FROM `{PROJECT_ID}.tiger_decisions.fct_allocation_decisions`
+            WHERE sold_to = @st
+              AND LTRIM(COALESCE(JSON_VALUE(decision_reason,'$.trigger.material_number'),''),'0') = LTRIM(@m,'0')
+            ORDER BY decision_date DESC
+            LIMIT 1
+        """, [bigquery.ScalarQueryParameter("st", "STRING", str(sold_to or "")),
+              bigquery.ScalarQueryParameter("m", "STRING", str(material_number or ""))])
+        return rows[0].get("decision_id") if rows else None
+    except Exception as exc:
+        log.warning("resolve decision_id failed: %s", exc)
+        return None
+
+
+def read_fulfillment_plan(decision_id=None, sold_to=None,
+                          material_number=None, sales_order_number=None) -> "dict | None":
+    """Latest committed fulfillment plan for a decision/order, or None. Tries the
+    strongest key first (decision_id), then sales order, then sold_to+material — so
+    BOTH a fulfilment decision row and the original triage row resolve the plan."""
+    import json as _json
+    _ensure_fulfillment_plan_table()
+    attempts = []
+    if decision_id:
+        attempts.append(("decision_id = @d",
+                         [bigquery.ScalarQueryParameter("d", "STRING", str(decision_id))]))
+    if sales_order_number:
+        attempts.append(("LTRIM(sales_order_number,'0') = LTRIM(@so,'0')",
+                         [bigquery.ScalarQueryParameter("so", "STRING", str(sales_order_number))]))
+    if sold_to and material_number:
+        attempts.append(("sold_to = @st AND LTRIM(material_number,'0') = LTRIM(@m,'0')",
+                         [bigquery.ScalarQueryParameter("st", "STRING", str(sold_to)),
+                          bigquery.ScalarQueryParameter("m", "STRING", str(material_number))]))
+    for cond, params in attempts:
+        try:
+            rows = _run(_bq_decisions(), f"""
+                SELECT plan_json FROM `{_FULFILLMENT_PLAN_TABLE}`
+                WHERE {cond} ORDER BY created_at DESC LIMIT 1
+            """, params)
+        except Exception as exc:
+            log.warning("read fulfillment plan failed: %s", exc)
+            return None
+        if rows:
+            try:
+                return _json.loads(rows[0].get("plan_json") or "{}")
+            except Exception:
+                return None
+    return None
+
+
+def execute_fulfillment_plan(req: dict) -> dict:
+    """Persist a committed split-sourcing plan (from plantDetails[]) and return the
+    plan + the 'Executed' SAP payload preview. Per-line on_hand / replenish_from
+    are inferred from live plant inventory (tiger_semantic)."""
+    import json as _json
+    material = req.get("material_number") or ""
+    ordered = _safe_float(req.get("ordered_quantity_cases"))
+    details = req.get("plant_details") or []
+    inv = _plant_inventory(material)
+
+    lines, allocated = [], 0.0
+    for d in details:
+        plant = str(d.get("code") or d.get("plant") or "").strip()
+        if not plant:
+            continue
+        qty = _safe_float(d.get("qty"))
+        allocated += qty
+        on_hand = (inv.get(plant, 0.0) >= qty) if inv else True
+        replenish = None
+        if not on_hand:
+            replenish = next((p for p, q in sorted(inv.items(), key=lambda kv: kv[1], reverse=True)
+                              if p != plant and q >= qty), None) or \
+                        next((p for p in inv if p != plant), None)
+        lines.append({
+            "plant": plant, "qty": qty,
+            "storage_location": d.get("storage_location") or d.get("storageLocation"),
+            "on_hand": bool(on_hand), "replenish_from": replenish,
+            "transit_h": d.get("transitHours") or d.get("transit_h"),
+            "carrier": d.get("carrier"),
+        })
+
+    plan = {
+        "source": req.get("source") or "planner",
+        "scenario_id": req.get("scenario_id"),
+        "plan_version": 1,
+        "total_ordered": ordered or allocated,
+        "total_allocated": allocated,
+        "shortfall": max((ordered or allocated) - allocated, 0.0),
+        "expedite": bool(req.get("expedite")),
+        "lines": lines,
+    }
+
+    so = req.get("sales_order_number")
+
+    # Always record this Execute as its own Decision Log entry (source=fulfillment_simulator),
+    # so it is auditable + filterable in the Decision Log. The new decision_id owns the plan.
+    has_transfer = any((not ln.get("on_hand", True) and ln.get("replenish_from")) for ln in lines)
+    decision_type = "TRANSFER_RECOMMENDATION" if has_transfer else "ORDER_ADJUSTMENT"
+    tcode = "ME21N" if has_transfer else "VA02"
+    summary = ", ".join(f"{ln['plant']} {int(ln['qty'])} cs" for ln in lines) or "no lines"
+    rationale = (f"Fulfilment plan {plan.get('scenario_id') or ''} committed: {summary}"
+                 + ("; expedite delivery" if plan["expedite"] else ""))
+    new_decision_id = None
+    try:
+        from agent_tools import dce_write
+        dres = dce_write(
+            session_id=str(req.get("incident_id") or "fulfillment"),
+            decision_payload_json=_json.dumps({
+                "order": {
+                    "sold_to": req.get("sold_to"), "customer_name": req.get("customer_name"),
+                    "material_number": material, "sales_order_number": so,
+                    "ordered_quantity_cases": plan["total_ordered"],
+                    "requested_delivery_date": req.get("requested_delivery_date"),
+                    "trigger_source": "fulfillment_simulator",
+                },
+                "recommendation": {
+                    "action": "PARTIAL_FULFILL" if plan["shortfall"] > 0 else "ACCEPT",
+                    "fulfill_qty_cs": plan["total_allocated"], "confidence": 0.9,
+                    "expected_outcome": rationale,
+                    "sap_action": {"decision_type": decision_type,
+                                   "sap_transaction_target": tcode, "change_type": "QUANTITY_CHANGE"},
+                },
+                "specialist_signals": {}, "conflicts_detected": [],
+            }),
+            user_decision="approved", user_id="fulfillment_simulator",
+            source="fulfillment_simulator",
+        )
+        new_decision_id = dres.get("decision_id")
+    except Exception as exc:
+        log.warning("fulfillment dce_write failed: %s", exc)
+
+    decision_id = new_decision_id or req.get("decision_id") or _resolve_decision_id(req.get("sold_to"), material)
+
+    _ensure_fulfillment_plan_table()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        row = {
+            "decision_id": decision_id, "incident_id": req.get("incident_id"),
+            "sold_to": req.get("sold_to"), "material_number": material,
+            "sales_order_number": so, "scenario_id": plan["scenario_id"],
+            "plan_version": plan["plan_version"], "expedite": plan["expedite"],
+            "plan_json": _json.dumps(plan), "created_at": now,
+        }
+        errors = _bq_decisions().insert_rows_json(_FULFILLMENT_PLAN_TABLE, [row])
+        if errors:
+            log.error("fulfillment plan insert errors: %s", errors)
+    except Exception as exc:
+        log.warning("fulfillment plan write failed: %s", exc)
+
+    sap_payload = None
+    if sap_translation is not None and lines:
+        master = _sap_master_lookup(so, material)
+        decision = {
+            "source_log_id": decision_id, "user_decision": "approved",
+            "material_number": material, "sales_order_number": so,
+            "ordered": plan["total_ordered"], "allocated": plan["total_allocated"],
+            "shortfall": plan["shortfall"],
+            "rationale": f"Fulfillment plan {plan.get('scenario_id') or ''} committed.",
+            "decision_type": "ORDER_ADJUSTMENT", "fulfillment_plan": plan,
+        }
+        try:
+            sap_payload = sap_translation.build_batp_payload(decision, master)
+        except Exception as exc:
+            log.warning("executed sap payload build failed: %s", exc)
+
+    # Case-log ACCEPTANCE row for the fulfilment commit (its own case; no suggestion).
+    try:
+        write_acceptance_log(
+            case_id=(f"CASE-{so}" if so else
+                     (f"CASE-{req.get('incident_id')}" if req.get("incident_id") else None)),
+            decision_id=decision_id, disposition="modified",
+            override_reason="Fulfilment re-source (split sourcing)",
+            user_id="fulfillment_simulator", agent="fulfillment",
+            sap_execution_entry=(sap_payload.get("batp_payload")
+                                 if isinstance(sap_payload, dict) else None),
+        )
+    except Exception as exc:
+        log.warning("fulfilment acceptance-log write failed: %s", exc)
+
+    return {"ok": True, "decision_id": decision_id, "plan": plan, "sap_payload": sap_payload}
+
+
+# ===========================================================================
+# Case Log — 3 append-only tables (submission / suggestion / acceptance) keyed by
+# case_id -> suggestion_id (-> acceptance_id). Lineage + FinOps substrate.
+# Additive · best-effort · gated by CASE_LOG_ENABLED · never blocks a request.
+# See CASE_LOG_DESIGN.md. Tokens + cost live on the submission table.
+# ===========================================================================
+import uuid as _uuid
+import json as _cjson
+
+CASE_LOG_ENABLED = os.environ.get("CASE_LOG_ENABLED", "true").lower() not in ("0", "false", "no")
+_CASE_DS = f"{_DECISIONS_PROJECT}.tiger_decisions"
+_SUBMISSION_LOG_TABLE = f"{_CASE_DS}.fct_submission_log"
+_SUGGESTION_LOG_TABLE = f"{_CASE_DS}.fct_suggestion_log"
+_ACCEPTANCE_LOG_TABLE = f"{_CASE_DS}.fct_acceptance_log"
+_FINOPS_VIEW = f"{_CASE_DS}.vw_llm_finops_daily"
+_case_log_ready = {"submission": False, "suggestion": False, "acceptance": False, "view": False}
+
+# Per-1M-token USD prices — illustrative; tune to the contract. Used for est_cost_usd.
+MODEL_PRICES = {
+    "gemini-2.5-pro":   {"in": 1.25, "cached_in": 0.31,  "out": 10.0},
+    "gemini-2.5-flash": {"in": 0.30, "cached_in": 0.075, "out": 2.50},
+    "_default":         {"in": 0.30, "cached_in": 0.075, "out": 2.50},
+}
+
+
+def _est_cost(model, input_tokens, cached_tokens, output_tokens) -> float:
+    m = (model or "").lower()
+    price = (MODEL_PRICES["gemini-2.5-pro"] if "pro" in m
+             else MODEL_PRICES["gemini-2.5-flash"] if "flash" in m
+             else MODEL_PRICES["_default"])
+    billable_in = max(0, _safe_int(input_tokens) - _safe_int(cached_tokens))
+    return round((billable_in * price["in"]
+                  + _safe_int(cached_tokens) * price["cached_in"]
+                  + _safe_int(output_tokens) * price["out"]) / 1_000_000.0, 6)
+
+
+_SUBMISSION_SCHEMA = [
+    bigquery.SchemaField("submission_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("case_id", "STRING"), bigquery.SchemaField("suggestion_id", "STRING"),
+    bigquery.SchemaField("session_id", "STRING"), bigquery.SchemaField("agent", "STRING"),
+    bigquery.SchemaField("model", "STRING"), bigquery.SchemaField("round", "INT64"),
+    bigquery.SchemaField("feature", "STRING"), bigquery.SchemaField("endpoint", "STRING"),
+    bigquery.SchemaField("input_tokens", "INT64"), bigquery.SchemaField("cached_tokens", "INT64"),
+    bigquery.SchemaField("output_tokens", "INT64"), bigquery.SchemaField("total_tokens", "INT64"),
+    bigquery.SchemaField("est_cost_usd", "FLOAT64"), bigquery.SchemaField("cache_hit", "STRING"),
+    bigquery.SchemaField("latency_ms", "FLOAT64"), bigquery.SchemaField("sold_to", "STRING"),
+    bigquery.SchemaField("material_number", "STRING"), bigquery.SchemaField("payload", "STRING"),
+    bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
+]
+_SUGGESTION_SCHEMA = [
+    bigquery.SchemaField("suggestion_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("case_id", "STRING"), bigquery.SchemaField("session_id", "STRING"),
+    bigquery.SchemaField("order_id", "STRING"), bigquery.SchemaField("sold_to", "STRING"),
+    bigquery.SchemaField("material_number", "STRING"), bigquery.SchemaField("customer_name", "STRING"),
+    bigquery.SchemaField("source", "STRING"), bigquery.SchemaField("agent", "STRING"),
+    bigquery.SchemaField("model", "STRING"), bigquery.SchemaField("recommendation", "STRING"),
+    bigquery.SchemaField("confidence", "FLOAT64"), bigquery.SchemaField("decision_type", "STRING"),
+    bigquery.SchemaField("sap_transaction_target", "STRING"), bigquery.SchemaField("source_views", "STRING"),
+    bigquery.SchemaField("orchestrator_version", "STRING"), bigquery.SchemaField("is_reevaluation", "BOOL"),
+    bigquery.SchemaField("payload", "STRING"),
+    bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
+]
+_ACCEPTANCE_SCHEMA = [
+    bigquery.SchemaField("acceptance_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("suggestion_id", "STRING"), bigquery.SchemaField("case_id", "STRING"),
+    bigquery.SchemaField("session_id", "STRING"), bigquery.SchemaField("decision_id", "STRING"),
+    bigquery.SchemaField("disposition", "STRING"),
+    bigquery.SchemaField("decision_aligned_with_agent", "BOOL"),
+    bigquery.SchemaField("override_reason", "STRING"), bigquery.SchemaField("modification_delta", "STRING"),
+    bigquery.SchemaField("planner_rationale", "STRING"), bigquery.SchemaField("user_id", "STRING"),
+    bigquery.SchemaField("agent", "STRING"), bigquery.SchemaField("model", "STRING"),
+    bigquery.SchemaField("sap_execution_entry", "STRING"),
+    bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
+]
+_CASE_TABLES = {
+    "submission": (_SUBMISSION_LOG_TABLE, _SUBMISSION_SCHEMA, ["case_id", "suggestion_id"]),
+    "suggestion": (_SUGGESTION_LOG_TABLE, _SUGGESTION_SCHEMA, ["case_id"]),
+    "acceptance": (_ACCEPTANCE_LOG_TABLE, _ACCEPTANCE_SCHEMA, ["suggestion_id", "case_id"]),
+}
+
+
+def _ensure_case_table(kind: str) -> None:
+    if _case_log_ready[kind]:
+        return
+    table, schema, cluster = _CASE_TABLES[kind]
+    try:
+        t = bigquery.Table(table, schema=schema)
+        t.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY, field="created_at")
+        t.clustering_fields = cluster
+        _bq_decisions().create_table(t, exists_ok=True)
+        _case_log_ready[kind] = True
+    except Exception as exc:
+        log.warning("case-log ensure %s table failed: %s", kind, exc)
+
+
+def _ensure_finops_view() -> None:
+    if _case_log_ready["view"]:
+        return
+    _ensure_case_table("submission")
+    try:
+        _bq_decisions().query(f"""
+            CREATE VIEW IF NOT EXISTS `{_FINOPS_VIEW}` AS
+            SELECT DATE(created_at) AS day, feature, agent, model,
+                   COUNT(*) AS calls,
+                   SUM(input_tokens) AS input_tokens, SUM(cached_tokens) AS cached_tokens,
+                   SUM(output_tokens) AS output_tokens, SUM(total_tokens) AS total_tokens,
+                   SUM(est_cost_usd) AS est_cost_usd, AVG(latency_ms) AS avg_latency_ms,
+                   SAFE_DIVIDE(COUNTIF(cache_hit != 'none'), COUNT(*)) AS cache_hit_rate
+            FROM `{_SUBMISSION_LOG_TABLE}`
+            GROUP BY day, feature, agent, model
+        """).result()
+        _case_log_ready["view"] = True
+        log.info("FinOps view ready: %s", _FINOPS_VIEW)
+    except Exception as exc:
+        log.warning("finops view ensure failed: %s", exc)
+
+
+def _case_log_insert(kind: str, row: dict) -> None:
+    """Append one case-log row. No-op when disabled; never raises."""
+    if not CASE_LOG_ENABLED:
+        return
+    table, _, _ = _CASE_TABLES[kind]
+    try:
+        _ensure_case_table(kind)
+        errors = _bq_decisions().insert_rows_json(table, [row])
+        if errors:
+            log.error("case-log %s insert errors: %s", kind, errors)
+    except Exception as exc:
+        log.warning("case-log %s write failed: %s", kind, exc)
+
+
+def _json_or_none(v):
+    if v is None:
+        return None
+    return v if isinstance(v, str) else _cjson.dumps(v, default=str)
+
+
+def write_submission_log(*, case_id=None, suggestion_id=None, session_id=None, agent=None, model=None,
+                         round=None, input_tokens=0, cached_tokens=0, output_tokens=0, cache_hit="none",
+                         latency_ms=None, feature="order_triage", endpoint=None, sold_to=None,
+                         material_number=None, payload=None) -> None:
+    it, ct, ot = _safe_int(input_tokens), _safe_int(cached_tokens), _safe_int(output_tokens)
+    _case_log_insert("submission", {
+        "submission_id": str(_uuid.uuid4()), "case_id": case_id, "suggestion_id": suggestion_id,
+        "session_id": session_id, "agent": agent, "model": model,
+        "round": (int(round) if round is not None else None), "feature": feature, "endpoint": endpoint,
+        "input_tokens": it, "cached_tokens": ct, "output_tokens": ot, "total_tokens": it + ot,
+        "est_cost_usd": _est_cost(model, it, ct, ot), "cache_hit": cache_hit or "none",
+        "latency_ms": (_safe_float(latency_ms) if latency_ms is not None else None),
+        "sold_to": sold_to, "material_number": material_number, "payload": _json_or_none(payload),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def write_suggestion_log(*, suggestion_id=None, case_id=None, session_id=None, order_id=None, sold_to=None,
+                         material_number=None, customer_name=None, source="order_triage",
+                         agent="customer_supply", model=None, recommendation=None, confidence=None,
+                         decision_type=None, sap_transaction_target=None, source_views=None,
+                         orchestrator_version=None, is_reevaluation=False, payload=None) -> None:
+    _case_log_insert("suggestion", {
+        "suggestion_id": suggestion_id or str(_uuid.uuid4()), "case_id": case_id, "session_id": session_id,
+        "order_id": order_id, "sold_to": sold_to, "material_number": material_number,
+        "customer_name": customer_name, "source": source, "agent": agent, "model": model,
+        "recommendation": recommendation,
+        "confidence": (_safe_float(confidence) if confidence is not None else None),
+        "decision_type": decision_type, "sap_transaction_target": sap_transaction_target,
+        "source_views": _json_or_none(source_views), "orchestrator_version": orchestrator_version,
+        "is_reevaluation": bool(is_reevaluation), "payload": _json_or_none(payload),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def write_acceptance_log(*, suggestion_id=None, case_id=None, session_id=None, decision_id=None,
+                         disposition=None, decision_aligned_with_agent=None, override_reason=None,
+                         modification_delta=None, planner_rationale=None, user_id=None, agent=None,
+                         model=None, sap_execution_entry=None) -> None:
+    _case_log_insert("acceptance", {
+        "acceptance_id": str(_uuid.uuid4()), "suggestion_id": suggestion_id, "case_id": case_id,
+        "session_id": session_id, "decision_id": decision_id, "disposition": disposition,
+        "decision_aligned_with_agent": (None if decision_aligned_with_agent is None
+                                        else bool(decision_aligned_with_agent)),
+        "override_reason": override_reason, "modification_delta": _json_or_none(modification_delta),
+        "planner_rationale": planner_rationale, "user_id": user_id, "agent": agent, "model": model,
+        "sap_execution_entry": _json_or_none(sap_execution_entry),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def latest_acceptance_for(case_id=None, suggestion_id=None) -> "dict | None":
+    """The most-recent acceptance (per suggestion) for a case/suggestion — for the UI."""
+    if not (case_id or suggestion_id):
+        return None
+    cond = "case_id = @c" if case_id else "suggestion_id = @s"
+    param = (bigquery.ScalarQueryParameter("c", "STRING", str(case_id)) if case_id
+             else bigquery.ScalarQueryParameter("s", "STRING", str(suggestion_id)))
+    try:
+        _ensure_case_table("acceptance")
+        rows = _run(_bq_decisions(), f"""
+            SELECT * FROM `{_ACCEPTANCE_LOG_TABLE}` WHERE {cond}
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY suggestion_id ORDER BY created_at DESC) = 1
+            ORDER BY created_at DESC LIMIT 1
+        """, [param])
+        return dict(rows[0]) if rows else None
+    except Exception as exc:
+        log.warning("latest_acceptance_for failed: %s", exc)
+        return None
+
+
+def fetch_case_logs(log_type: str = "submission", limit: int = 100,
+                    case_id: str | None = None) -> dict:
+    """Rows from one case-log table (newest first), for the Logs tab. payload
+    truncated to keep the response light. Best-effort → empty list on failure."""
+    kind = log_type if log_type in _CASE_TABLES else "submission"
+    table, _, _ = _CASE_TABLES[kind]
+    limit = max(1, min(int(limit or 100), 500))
+    params = [bigquery.ScalarQueryParameter("lim", "INT64", limit)]
+    where = ""
+    if case_id:
+        where = "WHERE case_id = @c"
+        params.append(bigquery.ScalarQueryParameter("c", "STRING", str(case_id)))
+    # submission/suggestion carry a big `payload` blob → truncate it; acceptance has none.
+    select = ("* EXCEPT(payload), SUBSTR(IFNULL(payload, ''), 0, 6000) AS payload"
+              if kind in ("submission", "suggestion") else "*")
+    try:
+        _ensure_case_table(kind)
+        rows = _run(_bq_decisions(), f"""
+            SELECT {select}
+            FROM `{table}` {where}
+            ORDER BY created_at DESC LIMIT @lim
+        """, params)
+    except Exception as exc:
+        log.warning("fetch_case_logs %s failed: %s", kind, exc)
+        return {"log_type": kind, "rows": []}
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k, v in list(d.items()):
+            if hasattr(v, "isoformat"):
+                d[k] = v.isoformat()
+        out.append(d)
+    return {"log_type": kind, "rows": out}
+
+
+def fetch_finops_llm(days: int = 30) -> dict:
+    """LLM token/cost rollup for the FinOps tab — totals + by-agent + by-model +
+    daily series, read from vw_llm_finops_daily. Best-effort → zeros on failure."""
+    _ensure_finops_view()
+    days = max(1, min(int(days or 30), 365))
+    try:
+        rows = _run(_bq_decisions(), f"""
+            SELECT CAST(day AS STRING) AS day, feature, agent, model, calls,
+                   input_tokens, cached_tokens, output_tokens, total_tokens,
+                   est_cost_usd, avg_latency_ms, cache_hit_rate
+            FROM `{_FINOPS_VIEW}`
+            WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL @d DAY)
+        """, [bigquery.ScalarQueryParameter("d", "INT64", days)])
+    except Exception as exc:
+        log.warning("fetch_finops_llm failed: %s", exc)
+        rows = []
+
+    def _blank():
+        return {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "est_cost_usd": 0.0}
+
+    totals = _blank()
+    by_agent: dict = {}
+    by_model: dict = {}
+    by_day: dict = {}
+    for r in rows:
+        ci, co, ct = _safe_int(r.get("calls")), _safe_int(r.get("output_tokens")), _safe_int(r.get("total_tokens"))
+        ii, cost = _safe_int(r.get("input_tokens")), _safe_float(r.get("est_cost_usd"))
+        for bucket, key in ((totals, None),
+                            (by_agent.setdefault(r.get("agent") or "?", _blank()), None),
+                            (by_model.setdefault(r.get("model") or "?", _blank()), None)):
+            bucket["calls"] += ci; bucket["input_tokens"] += ii
+            bucket["output_tokens"] += co; bucket["total_tokens"] += ct
+            bucket["est_cost_usd"] += cost
+        dk = r.get("day")
+        dd = by_day.setdefault(dk, {"day": dk, "total_tokens": 0, "est_cost_usd": 0.0, "calls": 0})
+        dd["total_tokens"] += ct; dd["est_cost_usd"] += cost; dd["calls"] += ci
+
+    def _rows(m, key_name):
+        out = []
+        for k, v in m.items():
+            v = {**v, "est_cost_usd": round(v["est_cost_usd"], 4), key_name: k}
+            out.append(v)
+        return sorted(out, key=lambda x: -x["est_cost_usd"])
+
+    totals["est_cost_usd"] = round(totals["est_cost_usd"], 4)
+    day_series = sorted(by_day.values(), key=lambda d: d["day"])
+    for d in day_series:
+        d["est_cost_usd"] = round(d["est_cost_usd"], 4)
+    return {"days": days, "totals": totals,
+            "by_agent": _rows(by_agent, "agent"), "by_model": _rows(by_model, "model"),
+            "by_day": day_series}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

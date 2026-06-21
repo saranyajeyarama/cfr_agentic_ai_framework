@@ -5,7 +5,8 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { cn } from '../../lib/utils';
-import { simulateFulfillment, recommendFulfillment } from '../../lib/api';
+import { simulateFulfillment, recommendFulfillment, executeFulfillmentPlan } from '../../lib/api';
+import type { FulfillmentExecuteResponse } from '../../lib/api';
 import type { FulfillmentRecommendation } from '../../lib/types';
 import {
   type FulfillmentIncident,
@@ -74,6 +75,9 @@ export function FulfillmentSimulator({
   const [activeIncidentId, setActiveIncidentId] = useState<string>('');
   const [selectedScenarioId, setSelectedScenarioId] = useState<string>('');
   const [appliedPlan, setAppliedPlan] = useState<{ incidentId: string; scenarioName: string; at: string } | null>(null);
+  const [execBusy, setExecBusy] = useState(false);
+  const [execErr, setExecErr]   = useState<string | null>(null);
+  const [sapExec, setSapExec]   = useState<FulfillmentExecuteResponse | null>(null);
 
   // Dynamic Sourcing Constraints (re-simulate with blocked plants).
   const [constraintText, setConstraintText] = useState('');
@@ -177,6 +181,8 @@ export function FulfillmentSimulator({
   const handleIncidentClick = (id: string) => {
     setActiveIncidentId(id);
     setAppliedPlan(null);
+    setSapExec(null);
+    setExecErr(null);
     setConstraintText('');
     setReSim(null);
   };
@@ -271,9 +277,45 @@ export function FulfillmentSimulator({
     }
   };
 
-  const handleExecute = () => {
+  // Commit the chosen sourcing plan → persists it as the order's "Executed" SAP
+  // payload (Decision Log → SAP Transaction Set → Executed) and previews the txns.
+  const handleExecute = async () => {
     if (!incident || !selectedScenario) return;
-    setAppliedPlan({ incidentId: incident.id, scenarioName: selectedScenario.name, at: new Date().toISOString() });
+    setExecBusy(true);
+    setExecErr(null);
+    try {
+      const res = await executeFulfillmentPlan({
+        incident_id: incident.id,
+        sold_to: incident.soldTo ?? undefined,
+        customer_name: incident.customer ?? undefined,
+        material_number: incident.materialNumber ?? undefined,
+        sales_order_number: incident.id ?? undefined,
+        ordered_quantity_cases: incident.orderedQty ?? undefined,
+        scenario_id: selectedScenario.id,
+        expedite: (incident.fineAtRisk ?? 0) > 0,
+        source: agentRec && selectedScenarioId === recommended?.id ? 'agent' : 'planner',
+        plant_details: (selectedScenario.plantDetails ?? []) as Array<Record<string, unknown>>,
+      });
+      setSapExec(res);
+      setAppliedPlan({ incidentId: incident.id, scenarioName: selectedScenario.name, at: new Date().toISOString() });
+    } catch (e) {
+      setExecErr(e instanceof Error ? e.message : 'Execute failed');
+    } finally {
+      setExecBusy(false);
+    }
+  };
+
+  const downloadExecSap = () => {
+    if (!sapExec?.sap_payload) return;
+    const blob = new Blob([JSON.stringify(sapExec.sap_payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sap_executed_${incident?.id || 'plan'}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   };
 
   // ── tab-level empty/loading/error ───────────────────────────────────────────
@@ -716,20 +758,36 @@ export function FulfillmentSimulator({
               {appliedPlan && appliedPlan.incidentId === incident.id && (
                 <div className="px-4 py-3 rounded-lg text-sm bg-emerald-50 border border-emerald-200 text-emerald-800 flex items-start gap-3">
                   <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
-                  <div>
-                    <div className="font-semibold">Plan applied: {appliedPlan.scenarioName}</div>
+                  <div className="flex-1">
+                    <div className="font-semibold">Plan committed: {appliedPlan.scenarioName}</div>
                     <div className="text-xs text-emerald-700 mt-0.5">
-                      Logged at {new Date(appliedPlan.at).toLocaleString()} — action this plan manually in SAP (no execute endpoint yet).
+                      Logged {new Date(appliedPlan.at).toLocaleString()} — persisted as the order's <b>Executed</b> SAP payload (Decision Log → SAP Transaction Set → Executed).
                     </div>
+                    {sapExec?.sap_payload && (
+                      <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[10px] font-bold uppercase tracking-wide text-emerald-700 mr-1">SAP transactions</span>
+                        {(((sapExec.sap_payload as { batp_payload?: { transactions?: Array<{ transaction_code?: string }> } })
+                            .batp_payload?.transactions) ?? []).map((t, i) => (
+                          <span key={i} className="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-white border border-emerald-300 text-emerald-800">
+                            {t?.transaction_code || '?'}
+                          </span>
+                        ))}
+                        <button onClick={downloadExecSap} className="ml-1 text-xs font-semibold text-[#7c3aed] underline">Download SAP JSON</button>
+                      </div>
+                    )}
                   </div>
                 </div>
+              )}
+              {execErr && (
+                <div className="px-4 py-2 rounded-lg text-sm bg-red-50 border border-red-200 text-red-700">{execErr}</div>
               )}
               <div className="flex items-stretch gap-3">
                 <button
                   onClick={handleExecute}
-                  className="flex-1 bg-[#DB033B] hover:opacity-90 text-white font-bold py-3 rounded-lg text-sm transition-opacity flex items-center justify-center gap-2 shadow-md"
+                  disabled={execBusy}
+                  className="flex-1 bg-[#DB033B] hover:opacity-90 disabled:opacity-50 text-white font-bold py-3 rounded-lg text-sm transition-opacity flex items-center justify-center gap-2 shadow-md"
                 >
-                  Execute: {selectedScenario.name}
+                  {execBusy ? <><Loader2 className="w-4 h-4 animate-spin" /> Executing…</> : <>Execute: {selectedScenario.name}</>}
                 </button>
                 <button
                   onClick={() => runRecommend(Boolean(agentRec))}

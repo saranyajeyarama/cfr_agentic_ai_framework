@@ -62,6 +62,7 @@ from schemas import (
     FulfillmentIncidentsResponse,
     FulfillmentRecommendRequest, FulfillmentRecommendation,
     FulfillmentRecommendResponse,
+    FulfillmentExecuteRequest, FulfillmentExecuteResponse,
     ExecutionTelemetryRequest, ExecutionTelemetryWriteResponse,
     ExecutionTelemetryListResponse,
 )
@@ -1209,6 +1210,25 @@ async def fulfillment_recommend(
         cached=False)
 
 
+@app.post("/fulfillment/execute", response_model=FulfillmentExecuteResponse)
+def fulfillment_execute(req: FulfillmentExecuteRequest) -> FulfillmentExecuteResponse:
+    """Commit a chosen split-sourcing plan at the fulfillment center: persist it
+    (linked to the order's decision) so the Decision Log's "Executed" SAP payload
+    reflects the actual sourcing, and return the executed BATP envelope preview."""
+    from data_pipeline import execute_fulfillment_plan
+    try:
+        result = execute_fulfillment_plan(req.model_dump())
+        return FulfillmentExecuteResponse(
+            ok=bool(result.get("ok")),
+            decision_id=result.get("decision_id"),
+            plan=result.get("plan") or {"lines": []},
+            sap_payload=result.get("sap_payload"),
+        )
+    except Exception as exc:
+        log.error("fulfillment execute failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Fulfillment execute failed")
+
+
 # ---------------------------------------------------------------------------
 # Nexus co-pilot chat — Gemini via Vertex AI  [v2.02]
 # ---------------------------------------------------------------------------
@@ -1370,6 +1390,10 @@ async def v23_triage(order_id: str, backend: dict, force: bool = False) -> dict:
             "customer_name": backend.get("customer_name"),
             "material_description": backend.get("material_description"),
             "ship_to": backend.get("ship_to"),
+            # Carry the order identifier so the Decision Log "Order" column is
+            # populated. Falls back to the path order_id (the UI's order.id).
+            "sales_order_number": backend.get("sales_order_number") or order_id,
+            "customer_po_number": backend.get("customer_po_number"),
         })
     except Exception as exc:
         raise HTTPException(
@@ -1378,14 +1402,20 @@ async def v23_triage(order_id: str, backend: dict, force: bool = False) -> dict:
 
     # Run the session inline (same pattern as /sessions/sync)
     session_id = _new_session_id()
+    # Case-log lineage ids: case_id is STABLE per order (re-evaluate reuses it);
+    # suggestion_id is fresh per evaluation run (force re-eval ⇒ new suggestion).
+    case_id = f"CASE-{order_id}"
+    suggestion_id = uuid.uuid4().hex
     create_session(
         session_id=session_id,
         trigger_type="manual",
         trigger_payload={**order_event.to_dict(),
-                         "trigger_source": "v23_payload"},
+                         "trigger_source": "v23_payload",
+                         "case_id": case_id, "suggestion_id": suggestion_id},
     )
     _run_t0 = datetime.now(timezone.utc)
-    await _run_session_tracked(session_id, "manual", order_event)
+    await _run_session_tracked(session_id, "manual", order_event,
+                               case_id=case_id, suggestion_id=suggestion_id)
     _run_duration_ms = (datetime.now(timezone.utc) - _run_t0).total_seconds() * 1000.0
     sess = get_session(session_id)
     if not sess:
@@ -1405,9 +1435,32 @@ async def v23_triage(order_id: str, backend: dict, force: bool = False) -> dict:
     _write_triage_cache(order_id, backend, session_id, synthesis, decision,
                         duration_ms=_run_duration_ms)
 
+    # Case-log SUGGESTION row (one per evaluation run; best-effort, never blocks).
+    try:
+        from data_pipeline import write_suggestion_log
+        _rec = decision.get("recommendation", {}) or {}
+        _sap = _rec.get("sap_action") or {}
+        write_suggestion_log(
+            suggestion_id=suggestion_id, case_id=case_id, session_id=session_id,
+            order_id=order_id, sold_to=backend.get("sold_to"),
+            material_number=backend.get("material_number"),
+            customer_name=backend.get("customer_name"), source="order_triage",
+            agent="customer_supply",
+            model=(decision.get("agent_model_versions") or "gemini-2.5-pro").split(",")[0],
+            recommendation=_rec.get("action"), confidence=_rec.get("confidence"),
+            decision_type=_sap.get("decision_type"),
+            sap_transaction_target=_sap.get("sap_transaction_target"),
+            orchestrator_version=decision.get("orchestrator_version"),
+            is_reevaluation=bool(force), payload=synthesis,
+        )
+    except Exception as _sg_err:
+        log.warning("suggestion-log write failed: %s", _sg_err)
+
     return {
         "order_id": order_id,
         "session_id": session_id,
+        "case_id": case_id,
+        "suggestion_id": suggestion_id,
         "synthesis": synthesis,
         # Bonus — also return the unmapped v2.1 contract for clients that
         # want it. Frontend can ignore.
@@ -1622,6 +1675,24 @@ def write_telemetry(req: ExecutionTelemetryRequest) -> ExecutionTelemetryWriteRe
         log.error("Telemetry BQ insert errors: %s", errors)
         raise HTTPException(status_code=500, detail=f"BigQuery insert failed: {errors}")
     log.info("Telemetry written: id=%s decision=%s po=%s", telemetry_id, req.user_decision, req.po_number)
+
+    # Case-log ACCEPTANCE row — one per human disposition (supports multiple overrides;
+    # UI reads the latest). Best-effort; never affects the telemetry response.
+    try:
+        from data_pipeline import write_acceptance_log
+        _disp = {"accept": "accepted", "approved": "accepted", "modify": "modified",
+                 "reject": "rejected", "rejected": "rejected", "defer": "deferred"}
+        _ud = (req.user_decision or "").lower()
+        write_acceptance_log(
+            suggestion_id=req.suggestion_id, case_id=req.case_id, session_id=req.session_id,
+            decision_id=req.decision_id, disposition=_disp.get(_ud, _ud or None),
+            decision_aligned_with_agent=(_ud in ("accept", "approved")),
+            override_reason=req.override_reason, planner_rationale=req.outcome_note,
+            user_id=req.user_id or "planner", agent="customer_supply",
+        )
+    except Exception as _acc_err:
+        log.warning("acceptance-log write failed: %s", _acc_err)
+
     return ExecutionTelemetryWriteResponse(telemetry_id=telemetry_id, status="written")
 
 
@@ -1678,7 +1749,7 @@ def read_telemetry(limit: int = 20) -> ExecutionTelemetryListResponse:
 # Decision Log — durable, paginated audit trail
 # ---------------------------------------------------------------------------
 @app.get("/decision-log")
-def decision_log(limit: int = 200, offset: int = 0) -> dict:
+def decision_log(limit: int = 200, offset: int = 0, source: str | None = None) -> dict:
     """Paginated audit trail of agentic decisions (newest first), read from
     tiger_decisions.fct_allocation_decisions.
 
@@ -1691,7 +1762,7 @@ def decision_log(limit: int = 200, offset: int = 0) -> dict:
     """
     from data_pipeline import fetch_decision_log_page
     try:
-        return fetch_decision_log_page(limit=limit, offset=offset)
+        return fetch_decision_log_page(limit=limit, offset=offset, source=source)
     except Exception as exc:
         log.error("decision-log fetch failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Decision log unavailable")
@@ -1713,6 +1784,29 @@ def decision_sap_payload(decision_id: str) -> dict:
     except Exception as exc:
         log.error("sap-payload generation failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="SAP payload generation failed")
+
+
+@app.get("/case-logs")
+def case_logs(log_type: str = "submission", limit: int = 100,
+              case_id: str | None = None) -> dict:
+    """Rows from one case-log table (submission|suggestion|acceptance) for the Logs tab."""
+    from data_pipeline import fetch_case_logs
+    try:
+        return fetch_case_logs(log_type=log_type, limit=limit, case_id=case_id)
+    except Exception as exc:
+        log.error("case-logs fetch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Case logs unavailable")
+
+
+@app.get("/finops/llm")
+def finops_llm(days: int = 30) -> dict:
+    """LLM token/cost FinOps rollup (totals + by-agent + by-model + daily) for the FinOps tab."""
+    from data_pipeline import fetch_finops_llm
+    try:
+        return fetch_finops_llm(days=days)
+    except Exception as exc:
+        log.error("finops fetch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="FinOps data unavailable")
 
 
 # ---------------------------------------------------------------------------

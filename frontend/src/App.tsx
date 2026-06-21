@@ -31,6 +31,8 @@ import { FulfillmentSimulator } from './components/tabs/FulfillmentSimulator';
 import { RootCauseHub } from './components/tabs/RootCauseHub';
 import { SafetyStockOptimizer } from './components/tabs/SafetyStockOptimizer';
 import { DecisionLog } from './components/tabs/DecisionLog';
+import { LogsPage } from './components/tabs/LogsPage';
+import { FinOpsPage } from './components/tabs/FinOpsPage';
 import { ManagerDashboard } from './components/tabs/ManagerDashboard';
 import { DataHealthPage } from './components/tabs/DataHealthPage';
 import { DataDictionaryPage } from './components/tabs/DataDictionaryPage';
@@ -91,6 +93,8 @@ export default function App() {
               {activeTab === 'rootcause'   && <RootCauseHub />}
               {activeTab === 'safetystock' && <SafetyStockOptimizer />}
               {activeTab === 'decisions'   && <DecisionLog />}
+              {activeTab === 'logs'        && <LogsPage />}
+              {activeTab === 'finops'      && <FinOpsPage />}
               {activeTab === 'manager'     && <ManagerDashboard onNavigate={setActiveTab} />}
               {activeTab === 'datahealth'  && <DataHealthPage />}
               {activeTab === 'dictionary'  && <DataDictionaryPage />}
