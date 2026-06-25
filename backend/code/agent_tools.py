@@ -52,6 +52,7 @@ from typing import Any, Literal, Optional
 from google.adk.tools import FunctionTool
 from google.cloud import bigquery
 
+import asyncio
 import logging as _logging
 import time as _time
 _tool_log = _logging.getLogger(__name__)
@@ -104,6 +105,21 @@ def _run_query(sql: str, params: list) -> list[dict]:
         _tool_log.error("BQ query FAILED latency_ms=%d error=%s sql=%.120s",
                         _ms, exc, sql.strip(), exc_info=True)
         raise
+
+
+async def _run_query_async(sql: str, params: list) -> list[dict]:
+    """Async wrapper around _run_query. Offloads the blocking BigQuery call
+    to a worker thread so the event loop stays free while the query runs.
+
+    google-adk 1.0.0 awaits coroutine tools (FunctionTool.run_async), but
+    runs sync tools inline on the event loop — so a sync tool's blocking
+    `.result()` stalls every other concurrent agent. Tools that `await`
+    this helper instead let the 4 specialists' DB waits genuinely overlap
+    under parallel fan-out. Behaviour and return shape are identical to
+    _run_query; only the threading differs. Same pattern already used for
+    the chat route (main.py asyncio.to_thread).
+    """
+    return await asyncio.to_thread(_run_query, sql, params)
 
 
 def _p(name: str, type_: str, value) -> bigquery.ScalarQueryParameter:
@@ -440,7 +456,7 @@ def get_open_sales_orders(
             "row_count": len(rows)}
 
 
-def get_order_history(
+async def get_order_history(
     sold_to: str,
     material_number: str,
     lookback_weeks: Optional[int] = None,
@@ -467,13 +483,13 @@ def get_order_history(
       GROUP BY iso_week
       ORDER BY iso_week DESC
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_sales_orders",
             "row_count": len(rows)}
 
 
-def classify_order_vs_forecast(
+async def classify_order_vs_forecast(
     sold_to: str,
     material_number: str,
 ) -> dict:
@@ -526,7 +542,7 @@ def classify_order_vs_forecast(
                                                AS is_above_forecast
       FROM plan, actual
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     if not rows:
         return {"error": "No plan or actual data found",
                 "view_queried": ("tiger_semantic.fct_forecast + "
@@ -537,7 +553,7 @@ def classify_order_vs_forecast(
     return r
 
 
-def get_otif_performance(
+async def get_otif_performance(
     sold_to: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -594,13 +610,13 @@ def get_otif_performance(
       ORDER BY deliveries_total DESC
       LIMIT 100
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_otif",
             "row_count": len(rows)}
 
 
-def get_active_alerts(
+async def get_active_alerts(
     sold_to: Optional[str] = None,
     lookback_days: Optional[int] = None,
     limit: Optional[int] = None,
@@ -656,7 +672,7 @@ def get_active_alerts(
       ORDER BY financial_exposure_usd DESC, o.days_late DESC
       LIMIT @lim
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_otif + fct_chargebacks",
             "row_count": len(rows)}
@@ -665,7 +681,7 @@ def get_active_alerts(
 # ===========================================================================
 # INVENTORY  →  fct_inventory_projection (primary), fct_inventory_batch_snapshot
 # ===========================================================================
-def get_finished_goods_inventory(
+async def get_finished_goods_inventory(
     material_number: str,
     plant_code: Optional[str] = None,
     requested_delivery_date: Optional[str] = None,
@@ -761,7 +777,7 @@ def get_finished_goods_inventory(
       ORDER BY plant_code, projection_week_start_date ASC
     """
     try:
-        rows = _run_query(sql, params)
+        rows = await _run_query_async(sql, params)
         print(f"[DEBUG-INV-PLAN] get_fgi strategy={_window_strategy} "
               f"rows={len(rows)} plants={sorted(set(r.get('plant_code') for r in rows))}")
     except Exception as e:
@@ -792,7 +808,7 @@ def get_finished_goods_inventory(
           ORDER BY plant_code, projection_week_start_date ASC
           LIMIT 100
         """
-        rows = _run_query(sql, params)
+        rows = await _run_query_async(sql, params)
         _window_strategy = "fallback_after_error"
 
     # ───────── DEBUG-RDD: result log ─────────
@@ -803,7 +819,7 @@ def get_finished_goods_inventory(
             "row_count": len(rows)}
 
 
-def get_safety_stock_position(
+async def get_safety_stock_position(
     material_number: str,
     plant_code: Optional[str] = None,
     requested_delivery_date: Optional[str] = None,
@@ -868,7 +884,7 @@ def get_safety_stock_position(
       LIMIT 50
     """
     try:
-        rows = _run_query(sql, params)
+        rows = await _run_query_async(sql, params)
     except Exception as e:
         # ───────── DEBUG-RDD: query failed; fall back to original ─────────
         _tool_log.warning("get_ssp query failed strategy=%s err=%r retrying", _window_strategy, e)
@@ -890,7 +906,7 @@ def get_safety_stock_position(
           ORDER BY plant_code, projection_week_start_date ASC
           LIMIT 50
         """
-        rows = _run_query(sql, params)
+        rows = await _run_query_async(sql, params)
         _window_strategy = "fallback_after_error"
 
     # ───────── DEBUG-RDD: result log ─────────
@@ -901,7 +917,7 @@ def get_safety_stock_position(
             "row_count": len(rows)}
 
 
-def get_shelf_life_risk(
+async def get_shelf_life_risk(
     material_number: str,
     plant_code: Optional[str] = None,
 ) -> dict:
@@ -936,7 +952,7 @@ def get_shelf_life_risk(
       ORDER BY days_to_expiry ASC
       LIMIT 100
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "report_only": True,
             "note": ("Batch expiry reported as information. No customer "
@@ -949,7 +965,7 @@ def get_shelf_life_risk(
 # ===========================================================================
 # SUPPLY & PRODUCTION  →  fct_production_orders, fct_bills_of_materials
 # ===========================================================================
-def get_production_orders(
+async def get_production_orders(
     material_number: str,
     horizon_days: Optional[int] = None,
     status_filter: Optional[Literal["CRTD", "REL", "TECO"]] = None,
@@ -995,13 +1011,13 @@ def get_production_orders(
       ORDER BY planned_end_date ASC
       LIMIT 50
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_production_orders",
             "row_count": len(rows)}
 
 
-def get_raw_materials_status(
+async def get_raw_materials_status(
     material_number: str,
 ) -> dict:
     """Directional raw-material adequacy for a FERT SKU.
@@ -1036,7 +1052,7 @@ def get_raw_materials_status(
       LEFT JOIN comp_proj cp USING (component_material_number)
     """
     try:
-        rows = _run_query(sql, params)
+        rows = await _run_query_async(sql, params)
     except Exception as exc:
         return {"rows": [], "directional_concern": False,
                 "rationale": f"BOM/projection lookup unavailable: {exc}",
@@ -1059,7 +1075,7 @@ def get_raw_materials_status(
 # ===========================================================================
 # PROCUREMENT  →  fct_purchase_orders
 # ===========================================================================
-def get_procurement_orders(
+async def get_procurement_orders(
     material_number: Optional[str] = None,
     vendor_number: Optional[str] = None,
     horizon_days: Optional[int] = None,
@@ -1103,7 +1119,7 @@ def get_procurement_orders(
       ORDER BY scheduled_delivery_date ASC
       LIMIT 50
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_purchase_orders",
             "row_count": len(rows)}
@@ -1112,7 +1128,7 @@ def get_procurement_orders(
 # ===========================================================================
 # MASTER DATA  →  dim_customer
 # ===========================================================================
-def get_customer_compliance_rules(
+async def get_customer_compliance_rules(
     sold_to: str,
 ) -> dict:
     """Customer-specific compliance profile. Source of truth: dim_customer.
@@ -1138,7 +1154,7 @@ def get_customer_compliance_rules(
       WHERE customer_number = @sold_to
       LIMIT 1
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     if not rows:
         return {"error": f"Customer {sold_to} not found in dim_customer",
                 "view_queried": "tiger_semantic.dim_customer"}
@@ -1150,7 +1166,7 @@ def get_customer_compliance_rules(
 # ===========================================================================
 # CHARGEBACKS  →  fct_chargebacks
 # ===========================================================================
-def get_chargeback_risk(
+async def get_chargeback_risk(
     sold_to: str,
     lookback_days: Optional[int] = None,
 ) -> dict:
@@ -1201,7 +1217,7 @@ def get_chargeback_risk(
         )                                            AS top_root_causes
       FROM cb
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     r = rows[0] if rows else {}
     r["sold_to"] = sold_to
     r["view_queried"] = "tiger_semantic.fct_chargebacks"
@@ -1211,7 +1227,7 @@ def get_chargeback_risk(
 # ===========================================================================
 # LOGISTICS  →  fct_shipments, fct_otif, dim_carrier
 # ===========================================================================
-def get_carrier_otp(
+async def get_carrier_otp(
     origin_plant: Optional[str] = None,
     destination_region: Optional[str] = None,
     trailing_days: Optional[int] = None,
@@ -1259,13 +1275,13 @@ def get_carrier_otp(
       ORDER BY shipments DESC
       LIMIT 10
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_shipments + dim_carrier",
             "row_count": len(rows)}
 
 
-def get_lane_transit_profile(
+async def get_lane_transit_profile(
     origin_plant: str,
     destination_region: str,
     trailing_days: Optional[int] = None,
@@ -1310,7 +1326,7 @@ def get_lane_transit_profile(
         AND actual_departure_date >=
             DATE_SUB(CURRENT_DATE(), INTERVAL @days DAY)
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     r = rows[0] if rows else {"origin_plant": origin_plant,
                               "destination_region": destination_region,
                               "shipment_count": 0}
@@ -1326,7 +1342,7 @@ def get_lane_transit_profile(
 # of scope. Retail Intelligence now does real work against fct_demand_drivers
 # (Anaplan-sourced consumer-takeaway / ACV distribution).
 # ===========================================================================
-def get_consumer_takeaway(
+async def get_consumer_takeaway(
     sold_to: str,
     material_number: str,
     weeks_back: Optional[int] = None,
@@ -1377,13 +1393,13 @@ def get_consumer_takeaway(
             DATE_SUB(CURRENT_DATE(), INTERVAL @weeks WEEK)
       ORDER BY d.driver_week_start_date ASC
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_demand_drivers + dim_material",
             "row_count": len(rows)}
 
 
-def get_promotional_context(
+async def get_promotional_context(
     sold_to: str,
     material_number: str,
 ) -> dict:
@@ -1418,7 +1434,7 @@ def get_promotional_context(
       ORDER BY p.promo_start_date ASC
       LIMIT 20
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     return {"rows": rows,
             "view_queried": "tiger_semantic.fct_promo_plan + dim_material",
             "row_count": len(rows)}
@@ -1427,7 +1443,7 @@ def get_promotional_context(
 # ===========================================================================
 # DEMAND PLANNING  →  fct_forecast_accuracy
 # ===========================================================================
-def get_forecast_accuracy(
+async def get_forecast_accuracy(
     sold_to: str,
     material_number: Optional[str] = None,
     lag_weeks: Optional[int] = None,
@@ -1477,7 +1493,7 @@ def get_forecast_accuracy(
         AND fa.lag_weeks = @lag
         {zrep_filter}
     """
-    rows = _run_query(sql, params)
+    rows = await _run_query_async(sql, params)
     r = rows[0] if rows else {"sold_to": sold_to, "n_observations": 0}
     r["view_queried"] = "tiger_semantic.fct_forecast_accuracy"
     return r
@@ -1979,6 +1995,25 @@ def _tolerant(fn):
     accepts_var_kw = any(
         p.kind is _inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
     )
+
+    # Async tools (async def, e.g. those awaiting _run_query_async) need an
+    # async wrapper, otherwise the wrapper returns an un-awaited coroutine
+    # and ADK — which checks iscoroutinefunction on THIS wrapper, not the
+    # wrapped fn — runs it synchronously and fails to serialize the result.
+    # The async branch mirrors the sync logic exactly; only it awaits fn.
+    if _inspect.iscoroutinefunction(fn):
+        @_functools.wraps(fn)
+        async def awrapper(**kwargs):
+            if accepts_var_kw:
+                return await fn(**kwargs)
+            recognized = {k: v for k, v in kwargs.items() if k in accepted}
+            ignored = sorted(set(kwargs) - accepted)
+            result = await fn(**recognized) or {}
+            if ignored and isinstance(result, dict):
+                result.setdefault("_ignored_kwargs", ignored)
+            return result
+
+        return awrapper
 
     @_functools.wraps(fn)
     def wrapper(**kwargs):
