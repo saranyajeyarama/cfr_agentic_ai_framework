@@ -41,7 +41,14 @@ services:
       # Cap concurrent agent runs across the whole process. 1 = strictest
       # (full serialization across sessions). 3 = ~3 sessions can run
       # their current agent in parallel without OOM under typical RAM.
+      # Bumped to 4 so the parallel Round-1 fan-out (4 specialists) is not
+      # re-serialized by the semaphore. Drop to "2"/"3" if the container is
+      # OOM-killed (exit 137) under parallel load.
       AGENT_CONCURRENCY: "1"
+      # Round-1 specialist fan-out mode. "1" = parallel (asyncio.gather over
+      # the 4 specialists). "0" / unset = the proven sequential loop.
+      # Flip to "0" and restart to revert instantly — no rebuild needed.
+      TRIAGE_PARALLEL: "0"
       # Tool result row cap. ADK keeps every tool response in session
       # memory; capping keeps the per-agent footprint bounded.
       TOOL_ROW_CAP: "50"

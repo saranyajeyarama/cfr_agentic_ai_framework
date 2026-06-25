@@ -61,6 +61,14 @@ _ADK_USER_ID = "orchestrator"
 # env var if local Vertex quota permits.
 _AGENT_CONCURRENCY = asyncio.Semaphore(int(os.environ.get("AGENT_CONCURRENCY", "1")))
 
+# Round-1 specialist fan-out mode. Default OFF = the proven sequential loop
+# (one specialist at a time). Set TRIAGE_PARALLEL=1 to fan the 4 specialists
+# out concurrently via asyncio.gather — faster, but only safe when Vertex
+# quota tolerates concurrent calls (raise AGENT_CONCURRENCY to match, e.g. 4).
+# If parallel mode starts producing httpx ReadError/ConnectError, flip this
+# back to 0 — no code change or redeploy needed.
+_TRIAGE_PARALLEL = os.environ.get("TRIAGE_PARALLEL", "0") == "1"
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -695,17 +703,49 @@ async def run_session(session_id: str, trigger_type: str,
             "instruction": ("Evaluate this order in your domain. Return "
                             "your structured signal."),
         }
-        # Specialists run sequentially. Parallel fan-out via asyncio.gather
-        # blasts Vertex AI past its per-minute connection budget when
-        # several sessions are in flight, producing httpx ReadError /
-        # ConnectError mid-stream. Sequential is slower but deterministic.
-        results = []
-        for name in SPECIALIST_AGENTS:
-            log.info("Specialist start agent=%s round=1", name)
-            _t_spec = _now_ms()
-            results.append(
-                await _invoke_agent(name, order_payload, writer, round_idx=1, log=log))
-            log.info("Specialist done agent=%s round=1 latency_ms=%d", name, _now_ms() - _t_spec)
+        # Specialists fan out in one of two modes (see _TRIAGE_PARALLEL):
+        #   - sequential (default): one specialist at a time. Slower but
+        #     deterministic and gentle on Vertex quota.
+        #   - parallel (TRIAGE_PARALLEL=1): all 4 via asyncio.gather. Faster,
+        #     but parallel Vertex calls under cumulative load can fail with
+        #     httpx ReadError/ConnectError — keep AGENT_CONCURRENCY in step.
+        # The 4 specialists are data-independent here (same input, no
+        # cross-reads); they only fan in at _detect_conflicts below.
+        if _TRIAGE_PARALLEL:
+            log.info("Fan-out mode=parallel n=%d", len(SPECIALIST_AGENTS))
+            _t_par = _now_ms()
+            results = await asyncio.gather(*[
+                _invoke_agent(name, order_payload, writer, round_idx=1, log=log)
+                for name in SPECIALIST_AGENTS
+            ], return_exceptions=True)
+            # An exception from one specialist must not abort the batch — map
+            # it to the same graceful error envelope _invoke_agent returns on
+            # a no-response, so conflict-detection + synthesis see a valid shape.
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    _name = SPECIALIST_AGENTS[i]
+                    log.warning("Specialist failed agent=%s round=1 error=%s",
+                                _name, r)
+                    results[i] = {
+                        "agent": _name,
+                        "disposition": "CAUTION",
+                        "confidence": 0.0,
+                        "hard_block": False,
+                        "signal": {"error": f"{_name} raised: {str(r)[:200]}"},
+                        "evidence": [],
+                        "reasoning_summary":
+                            f"{_name} failed during parallel fan-out.",
+                    }
+            log.info("Fan-out parallel done latency_ms=%d", _now_ms() - _t_par)
+        else:
+            log.info("Fan-out mode=sequential n=%d", len(SPECIALIST_AGENTS))
+            results = []
+            for name in SPECIALIST_AGENTS:
+                log.info("Specialist start agent=%s round=1", name)
+                _t_spec = _now_ms()
+                results.append(
+                    await _invoke_agent(name, order_payload, writer, round_idx=1, log=log))
+                log.info("Specialist done agent=%s round=1 latency_ms=%d", name, _now_ms() - _t_spec)
         signals: dict[str, dict] = dict(zip(SPECIALIST_AGENTS, results))
         log.info("Fan-out complete n_specialists=%d", len(signals))
         writer.write(agent="orchestrator", round_idx=1, action="route",
