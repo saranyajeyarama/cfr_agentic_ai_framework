@@ -82,9 +82,12 @@ from _v23_adapter import (
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "resilience-riskradar")
 REGION = os.environ.get("REGION", "us-central1")
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")
+# Provider label for /health. LLM_PROVIDER (model_provider) wins; AI_PROVIDER kept for back-compat.
+AI_PROVIDER = os.environ.get("LLM_PROVIDER") or os.environ.get("AI_PROVIDER", "gemini")
 
 PROVIDER_NAMES = {"gemini": "Gemini 2.5 Flash (Vertex AI)"}
+
+import model_provider  # provider-agnostic model selection (env-driven; Gemini default)
 
 app = FastAPI(
     title="Tiger Foods Customer Supply Agentic AI",
@@ -1164,13 +1167,8 @@ async def fulfillment_recommend(
                 cached=True, cached_at=cached.get("cached_at"))
 
     rec_dict: dict | None = None
-    # 2) Try the LLM.
+    # 2) Try the LLM (provider-agnostic; Gemini default, others via LLM_PROVIDER).
     try:
-        import vertexai
-        from vertexai.generative_models import GenerativeModel
-        vertexai.init(project=PROJECT_ID, location=REGION)
-        model = GenerativeModel(model_name="gemini-2.5-flash",
-                                system_instruction=_FULFILLMENT_REC_SYSTEM_PROMPT)
         user_payload = {
             "order": {
                 "incident_id": req.incident_id,
@@ -1183,8 +1181,11 @@ async def fulfillment_recommend(
                 for s in (req.scenarios or [])
             ],
         }
-        resp = await asyncio.to_thread(model.generate_content, _json.dumps(user_payload))
-        parsed = _extract_json(getattr(resp, "text", "") or "")
+        _text = await asyncio.to_thread(
+            model_provider.complete,
+            [{"role": "user", "text": _json.dumps(user_payload)}],
+            _FULFILLMENT_REC_SYSTEM_PROMPT, "fulfillment_recommend")
+        parsed = _extract_json(_text or "")
         if parsed and parsed.get("recommended_scenario_id") in valid_ids:
             rec_dict = {
                 "recommended_scenario_id": parsed["recommended_scenario_id"],
@@ -1238,29 +1239,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if not req.messages:
         raise HTTPException(status_code=400, detail="No messages provided")
     try:
-        import vertexai
-        from vertexai.generative_models import (
-            Content, GenerativeModel, Part,
-        )
-        vertexai.init(project=PROJECT_ID, location=REGION)
-
-        kwargs: dict = {"model_name": "gemini-2.5-flash"}
-        if req.systemPrompt:
-            kwargs["system_instruction"] = req.systemPrompt
-        model = GenerativeModel(**kwargs)
-
-        # All messages except the last form the history.
-        history: list = []
-        for m in req.messages[:-1]:
-            role = "user" if m.role == "user" else "model"
-            history.append(Content(role=role,
-                                    parts=[Part.from_text(m.text)]))
-        chat_session = model.start_chat(history=history)
-
-        # Vertex SDK is synchronous — run off the event loop.
-        response = await asyncio.to_thread(
-            chat_session.send_message, req.messages[-1].text)
-        return ChatResponse(text=response.text)
+        # Provider-agnostic (Gemini default; OpenAI/others via LLM_PROVIDER). The
+        # factory maps req.messages (.role/.text) to whichever backend is active.
+        text = await asyncio.to_thread(
+            model_provider.complete, req.messages, req.systemPrompt, "chat")
+        return ChatResponse(text=text)
 
     except HTTPException:
         raise

@@ -50,7 +50,11 @@ from agent_tools import (
     TRANSPORTATION_TOOLS,
     RETAIL_INTELLIGENCE_TOOLS,
     FULFILLMENT_TOOLS,
+    _T,
 )
+import mapping_tools as _mt
+# Provider-agnostic model selection (env-driven; Gemini default). See model_provider.py.
+from model_provider import build_model, temperature_for
 
 import logging
 _log = logging.getLogger(__name__)
@@ -103,8 +107,8 @@ _JSON_DISCIPLINE = (
 def make_customer_supply() -> LlmAgent:
     return LlmAgent(
         name="customer_supply",
-        model=Gemini(model="gemini-2.5-pro"),
-        generate_content_config=_cfg(0.2),
+        model=build_model("customer_supply"),
+        generate_content_config=_cfg(temperature_for("customer_supply")),
         description=(
             "Synthesizer. Receives the normalized order event and the four "
             "specialist signals, runs conflict detection and debate-on-"
@@ -118,8 +122,8 @@ def make_customer_supply() -> LlmAgent:
 def make_supply_planning() -> LlmAgent:
     return LlmAgent(
         name="supply_planning",
-        model=Gemini(model="gemini-2.5-flash"),
-        generate_content_config=_cfg(0.1),
+        model=build_model("supply_planning"),
+        generate_content_config=_cfg(temperature_for("supply_planning")),
         description=(
             "Forward available-to-promise from inventory projection, "
             "production order execution risk, raw-material adequacy, "
@@ -133,8 +137,8 @@ def make_supply_planning() -> LlmAgent:
 def make_demand_planning() -> LlmAgent:
     return LlmAgent(
         name="demand_planning",
-        model=Gemini(model="gemini-2.5-pro"),
-        generate_content_config=_cfg(0.2),
+        model=build_model("demand_planning"),
+        generate_content_config=_cfg(temperature_for("demand_planning")),
         description=(
             "Order-vs-consensus-forecast gap analysis, above-forecast "
             "classification, forecast accuracy / bias, promo attribution."
@@ -147,8 +151,8 @@ def make_demand_planning() -> LlmAgent:
 def make_transportation() -> LlmAgent:
     return LlmAgent(
         name="transportation",
-        model=Gemini(model="gemini-2.5-flash"),
-        generate_content_config=_cfg(0.1),
+        model=build_model("transportation"),
+        generate_content_config=_cfg(temperature_for("transportation")),
         description=(
             "OTIF risk by account, lane transit feasibility, carrier OTP, "
             "chargeback exposure. Influences customer-supply decisions; "
@@ -162,8 +166,8 @@ def make_transportation() -> LlmAgent:
 def make_retail_intelligence() -> LlmAgent:
     return LlmAgent(
         name="retail_intelligence",
-        model=Gemini(model="gemini-2.5-pro"),
-        generate_content_config=_cfg(0.2),
+        model=build_model("retail_intelligence"),
+        generate_content_config=_cfg(temperature_for("retail_intelligence")),
         description=(
             "Consumer-takeaway and promotional context reader. Classifies "
             "an order as genuine pull, buffer build, or promo-driven using "
@@ -181,8 +185,8 @@ def make_retail_intelligence() -> LlmAgent:
 def make_fulfillment_agent() -> LlmAgent:
     return LlmAgent(
         name="fulfillment",
-        model=Gemini(model="gemini-2.5-pro"),
-        generate_content_config=_cfg(0.1),
+        model=build_model("fulfillment"),
+        generate_content_config=_cfg(temperature_for("fulfillment")),
         description=(
             "Fulfillment routing optimizer for already-approved at-risk "
             "orders. Walks the 5-step business sequence (supply check, "
@@ -192,6 +196,23 @@ def make_fulfillment_agent() -> LlmAgent:
         ),
         instruction=_load_prompt("fulfillment_agent") + _JSON_DISCIPLINE,
         tools=FULFILLMENT_TOOLS,
+    )
+
+
+def make_schema_mapping_agent() -> LlmAgent:
+    # Deploy-time only (DEPLOY.md Option B): invoked by tools/run_schema_mapping.py
+    # to map a client's source schema onto the standard Silver contract.
+    return LlmAgent(
+        name="schema_mapping",
+        model=build_model("schema_mapping"),
+        generate_content_config=_cfg(temperature_for("schema_mapping")),
+        description=(
+            "Maps a client's source tables/columns onto the standard Silver "
+            "schema and emits a SchemaMappingProposal (mapped/ambiguous/unmapped)."
+        ),
+        instruction=_load_prompt("schema_mapping_agent") + _JSON_DISCIPLINE,
+        tools=[_T(_mt.get_standard_schema), _T(_mt.list_client_tables),
+               _T(_mt.describe_client_table), _T(_mt.profile_client_column)],
     )
 
 
@@ -207,6 +228,7 @@ _FACTORIES = {
     "transportation":      make_transportation,
     "retail_intelligence": make_retail_intelligence,
     "fulfillment":         make_fulfillment_agent,
+    "schema_mapping":      make_schema_mapping_agent,
 }
 
 

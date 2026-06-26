@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>CFR Agentic AI — Deployment Package</title>
+<style>
+  @page{ size:A4; margin:15mm 14mm; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --ink:#0f172a; --muted:#54637a; --line:#e3e9f1; --soft:#f5f8fc;
+    --accent:#0284c7; --accent2:#7c3aed; --green:#067a55; --amber:#b45309; --ms:#7c3aed;
+    --codebg:#0d1828; --codeink:#cfe6ff;
+  }
+  html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--ink);
+    font-size:10.5pt;line-height:1.5;background:#fff}
+  .cover{border-bottom:2px solid var(--line);padding-bottom:14px;margin-bottom:18px}
+  .bar{height:7px;border-radius:7px;background:linear-gradient(90deg,var(--accent),var(--accent2));margin-bottom:14px}
+  .eyebrow{font-size:9.5pt;letter-spacing:2px;text-transform:uppercase;color:var(--accent);font-weight:800}
+  h1{font-size:24pt;letter-spacing:-.5px;line-height:1.08;margin:7px 0 8px}
+  h1 .g{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .csub{font-size:11pt;color:var(--muted);max-width:168mm;line-height:1.45}
+  .metarow{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:12px;font-size:9pt;color:var(--muted)}
+  .metarow b{color:var(--ink)}
+  .toc{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:11px 16px;margin-bottom:20px;
+    columns:2;column-gap:26px;font-size:9.3pt}
+  .toc div{margin:2px 0;color:var(--muted)}.toc b{color:var(--ink)}
+  section{margin-bottom:16px;page-break-inside:avoid}
+  h2{font-size:13.5pt;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid var(--line);
+    display:flex;align-items:baseline;gap:9px}
+  h2 .num{color:var(--accent);font-weight:800;font-size:11pt}
+  h3{font-size:10.8pt;margin:11px 0 4px;color:#1c2941}
+  p{margin:6px 0;max-width:176mm}
+  ul{margin:5px 0 5px 4px;list-style:none}
+  li{position:relative;padding-left:15px;margin:4px 0}
+  li::before{content:"";position:absolute;left:2px;top:7px;width:5px;height:5px;border-radius:50%;
+    background:linear-gradient(135deg,var(--accent),var(--accent2))}
+  b{color:#0b1220}
+  code{font-family:"SF Mono",Consolas,monospace;font-size:8.8pt;background:#eef3f9;border:1px solid var(--line);
+    border-radius:4px;padding:1px 5px;color:#0b4a6f}
+  pre{background:var(--codebg);color:var(--codeink);border-radius:9px;padding:11px 14px;margin:8px 0;
+    font-family:"SF Mono",Consolas,monospace;font-size:8.5pt;line-height:1.5;overflow:auto;white-space:pre-wrap}
+  pre .c{color:#7f9bbb}
+  table{width:100%;border-collapse:collapse;font-size:9.3pt;margin:8px 0;border:1px solid var(--line);
+    border-radius:8px;overflow:hidden}
+  th,td{text-align:left;padding:7px 11px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#eef3f9;font-size:8.3pt;text-transform:uppercase;letter-spacing:.5px;color:#3a4a63}
+  tr:last-child td{border-bottom:none}
+  .callout{background:var(--soft);border-left:4px solid var(--accent);border-radius:0 8px 8px 0;padding:9px 14px;margin:9px 0;font-size:9.8pt}
+  .callout.g{border-left-color:var(--green);background:#ecfdf5}
+  .callout.a{border-left-color:var(--amber);background:#fffbeb}
+  .callout b{color:#0b1220}
+  .pipe{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin:8px 0}
+  .pp{background:var(--soft);border:1px solid var(--line);border-radius:7px;padding:5px 9px;font-size:8.6pt;font-weight:700}
+  .pp.gate{background:#fff7ed;border-color:#fed7aa;color:#9a3412}
+  .pa{color:var(--accent);font-weight:800}
+  .diag{display:flex;align-items:center;justify-content:center;gap:10px;margin:14px 0;flex-wrap:wrap}
+  .box{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:10px 14px;text-align:center;min-width:1.55in}
+  .box .t{font-size:10pt;font-weight:800}.box .s{font-size:8.5pt;color:var(--muted);margin-top:2px}
+  .box.acc{border-color:#0e7490;background:#e8f6fb}.box.vio{border-color:#7c3aed;background:#f5f0ff}
+  .bdg{font-size:8pt;font-weight:800;padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap}
+  .ok{color:var(--green);border-color:#a7f3d0;background:#ecfdf5}
+  .pend{color:var(--amber);border-color:#fde68a;background:#fffbeb}
+  .msb{color:var(--ms);border-color:#e9d5ff;background:#faf5ff}
+  .foot{margin-top:14px;padding-top:9px;border-top:2px solid var(--line);font-size:8.3pt;color:var(--muted)}
+</style></head>
+<body>
+
+<div class="cover">
+  <div class="bar"></div>
+  <div class="eyebrow">Deployment Package · Consolidated Reference</div>
+  <h1>CFR Agentic AI — <span class="g">Deployment Package</span></h1>
+  <div class="csub">The single reference for deploying the app on <b>GCP / Databricks / Local</b>, running it over
+  a client's own data sources (Option B), and switching the LLM provider (<b>Gemini → OpenAI / Anthropic / …</b>) —
+  with the current folder structure, architecture, runbook, and verification status.</div>
+  <div class="metarow">
+    <span><b>Targets:</b> Local · GCP · Databricks</span>
+    <span><b>LLM:</b> env-switchable (Gemini default)</span>
+    <span><b>Mapping:</b> Option B (dynamic, human-gated)</span>
+    <span><b>Status:</b> Milestone A complete &amp; verified</span>
+  </div>
+</div>
+
+<div class="toc">
+  <div><b>1.</b> Overview &amp; what it delivers</div>
+  <div><b>2.</b> Package structure (current)</div>
+  <div><b>3.</b> Architecture — the four seams</div>
+  <div><b>4.</b> Deploy — the 5 steps</div>
+  <div><b>5.</b> Option B — dynamic source mapping</div>
+  <div><b>6.</b> LLM provider switch (OpenAI &amp; others)</div>
+  <div><b>7.</b> Platform support &amp; AWS/Azure</div>
+  <div><b>8.</b> Verification status</div>
+  <div><b>9.</b> Implementation reference (file map)</div>
+  <div><b>10.</b> Status / out of scope</div>
+</div>
+
+<section>
+  <h2><span class="num">1</span> Overview &amp; what it delivers</h2>
+  <p>The app (FastAPI + Google ADK 5-agent orchestration + React/Vite UI) reads a tabular <b>Silver layer</b>
+  (BigQuery <code>tiger_semantic</code> — 34 views / 569 columns) and writes decisions to <code>tiger_decisions</code>.
+  This package makes that same app <b>portable</b>:</p>
+  <ul>
+    <li><b>Any platform</b> — one driver deploys to GCP (Cloud Run) or Databricks, or locally via Docker.</li>
+    <li><b>Any data source</b> — a human-gated agent maps a client's schema onto the standard contract and exposes
+      it as <b>virtual views</b>, so the app reads it with <b>zero app-code change</b>.</li>
+    <li><b>Any model</b> — the LLM provider is an <b>env switch</b>: Gemini by default, OpenAI / Anthropic / others
+      via ADK's LiteLlm wrapper.</li>
+  </ul>
+  <div class="callout g"><b>Design principle:</b> every change is additive and backwards-compatible. With no env
+  overrides set, the app behaves exactly as the original GCP build.</div>
+</section>
+
+<section>
+  <h2><span class="num">2</span> Package structure (current)</h2>
+  <p>All deploy-time assets live in one dedicated folder; the modules the running app imports stay in
+  <code>backend/code/</code> (so they sit on the container's flat <code>/app</code> path).</p>
+  <pre>deployment/                         <span class="c"># the dedicated package folder</span>
+  STEPS.md                          <span class="c"># the runbook (deploy steps + Option B + LLM switch)</span>
+  README.md                         <span class="c"># folder index</span>
+  data-model.md                     <span class="c"># standard Silver contract (generated)</span>
+  config/
+    platform.env.example
+    gcp/        silver.config.json · env.gcp · deploy.config.json
+    databricks/ silver.config.json · env.databricks · databricks.app.yaml · databricks.bundle.yml
+  scripts/
+    driver.py · driver.sh           <span class="c"># platform-selectable deploy -> live URL</span>
+    run_schema_mapping.py           <span class="c"># Option-B mapping runner</span>
+    gen_data_model.py               <span class="c"># regenerates data-model.md</span>
+  docs/  CFR_DEPLOYMENT_PACKAGE.{html,pdf}   <span class="c"># this document</span>
+
+backend/code/                       <span class="c"># app-imported modules (copied to /app by Dockerfile)</span>
+  orchestrator_service/silver_target.py     <span class="c"># data seam (SEMANTIC_DS / DECISIONS_DS)</span>
+  orchestrator_service/model_provider.py    <span class="c"># LLM provider factory (env-driven)</span>
+  platform_adapters/                        <span class="c"># BigQuery + Databricks catalog adapters</span>
+  mapping_tools.py                          <span class="c"># Option-B introspection / mapping tools</span>
+
+deploy.sh · cloudbuild.yaml · deploy-gcp.sh · docker-compose.yml   <span class="c"># repo root (unchanged location)</span></pre>
+</section>
+
+<section>
+  <h2><span class="num">3</span> Architecture — the four seams</h2>
+  <div class="diag">
+    <div class="box vio"><div class="t">Client source</div><div class="s">SAP / Anaplan / any</div></div>
+    <div class="pa">→</div>
+    <div class="box acc"><div class="t">Mapping agent</div><div class="s">introspect · map · views</div></div>
+    <div class="pa">→</div>
+    <div class="box"><div class="t">Virtual Silver</div><div class="s"><code>SEMANTIC_DS</code></div></div>
+    <div class="pa">→</div>
+    <div class="box acc"><div class="t">The app</div><div class="s">5-agent triage · UI</div></div>
+  </div>
+  <table>
+    <tr><th>Seam</th><th>What it does</th><th>Where</th></tr>
+    <tr><td><b>Data seam</b></td><td>App reads a config-resolved <code>{SEMANTIC_DS}.&lt;view&gt;</code>; a virtual layer swaps in transparently. Env default = the GCP literal.</td><td><code>silver_target.py</code></td></tr>
+    <tr><td><b>Platform adapters</b></td><td>One interface, two impls (BigQuery + Databricks): introspect · profile · render view DDL.</td><td><code>platform_adapters/</code></td></tr>
+    <tr><td><b>LLM factory</b></td><td>Env-driven provider/model selection; Gemini default, others via LiteLlm.</td><td><code>model_provider.py</code></td></tr>
+    <tr><td><b>Driver</b></td><td>Picks platform, exports the resolved target, deploys, smoke-tests, prints the URL.</td><td><code>scripts/driver.py</code></td></tr>
+  </table>
+</section>
+
+<section>
+  <h2><span class="num">4</span> Deploy — the 5 steps</h2>
+  <p>Run from the repo root. Prereqs: Python 3.10+ · Docker (local) · <code>gcloud</code> (GCP) · <code>databricks</code> CLI (Databricks).</p>
+  <ol style="margin-left:16px;font-size:10pt">
+    <li><b>Pick platform</b> — <code>export DEPLOY_PLATFORM=gcp|databricks|local</code></li>
+    <li><b>Configure</b> — edit <code>deployment/config/&lt;platform&gt;/silver.config.json</code> (data binding)</li>
+    <li><b>Map client data</b> <i>(only if the schema differs — else skip)</i> — see §5</li>
+    <li><b>Deploy</b> — one command, returns the live URL</li>
+    <li><b>Verify</b> — health + data-dictionary checks</li>
+  </ol>
+  <pre>bash deployment/scripts/driver.sh --platform local      --smoke   <span class="c"># -> http://localhost:3001</span>
+bash deployment/scripts/driver.sh --platform gcp        --smoke   <span class="c"># wraps deploy.sh -> Cloud Run URL</span>
+bash deployment/scripts/driver.sh --platform databricks           <span class="c"># bundle + apps -> App URL</span>
+<span class="c"># --dry-run prints the resolved config + commands without executing.</span>
+
+<span class="c"># Verify:</span>
+curl &lt;url&gt;/healthz · /api/health · /api/data-dictionary   <span class="c"># 200 + non-empty "views" = data wired</span></pre>
+  <div class="callout">GCP is also deployed via <code>deploy.sh</code> / <code>cloudbuild.yaml</code> / <code>deploy-gcp.sh</code> — the driver wraps these. They build the backend from <code>./backend</code>, so the new modules + (optional) litellm ship automatically.</div>
+</section>
+
+<section>
+  <h2><span class="num">5</span> Option B — dynamic source mapping</h2>
+  <p>When a client's tables/columns differ from the standard schema, an agent maps them and creates
+  rename-only virtual views named exactly like our 34 standard views — so the app reads them unchanged.</p>
+  <div class="pipe">
+    <span class="pp">a · Introspect</span><span class="pa">→</span>
+    <span class="pp">b · Profile + Propose</span><span class="pa">→</span>
+    <span class="pp gate">c · Human gate</span><span class="pa">→</span>
+    <span class="pp">d · Apply (create views)</span>
+  </div>
+  <pre>py deployment/scripts/run_schema_mapping.py --platform gcp --source &lt;proj.client_raw&gt; --introspect-only
+py deployment/scripts/run_schema_mapping.py --platform gcp --source &lt;proj.client_raw&gt;          <span class="c"># propose, then STOP</span>
+<span class="c"># edit schema_mapping_out/mapping_worksheet.md -> confirm rows into proposal.json mapped[]</span>
+py deployment/scripts/run_schema_mapping.py --platform gcp --source &lt;proj.client_raw&gt; --apply  <span class="c"># create views</span></pre>
+  <div class="callout a"><b>Guardrail (in code, not just the prompt):</b> low-confidence / column-less proposals are
+  demoted to <i>ambiguous</i>; uncovered required keys are surfaced as <i>unmapped</i>. Nothing is invented and no
+  required column is silently NULL — a human approves before any view is created.</div>
+</section>
+
+<section>
+  <h2><span class="num">6</span> LLM provider switch (OpenAI &amp; others)</h2>
+  <p><b>Default is Gemini (Vertex) — no keys, no change.</b> Switching to another provider is env-only; one factory
+  (<code>model_provider.py</code>) routes all 5 agents + the schema-mapping agent + the direct chat/recommend calls.</p>
+  <pre>LLM_PROVIDER=openai                 <span class="c"># gemini (default) | openai | anthropic | azure | …</span>
+OPENAI_API_KEY=sk-...               <span class="c"># or ANTHROPIC_API_KEY=...</span>
+LLM_MODEL_DEFAULT=gpt-4o            <span class="c"># optional global model</span>
+LLM_MODEL_CUSTOMER_SUPPLY=gpt-4o   <span class="c"># optional per-agent: LLM_MODEL_&lt;AGENT&gt;</span></pre>
+  <h3>Prerequisite — <code>litellm</code> must be in the image</h3>
+  <p>Non-Gemini providers use <code>litellm</code>, installed <b>non-fatally</b> in <code>backend/Dockerfile</code>
+  (a Gemini build can never break on it). To use OpenAI it must be present:</p>
+  <ul>
+    <li>Check the build log — a <code>WARN: litellm not installed under current pins</code> line means it did not install.</li>
+    <li>To require it: add <code>litellm&gt;=1.40,&lt;2.0</code> to <code>backend/code/orchestrator_service/requirements.txt</code> and rebuild.</li>
+  </ul>
+  <h3>Where to set it</h3>
+  <ul>
+    <li><b>Local:</b> add the vars to the backend <code>environment:</code> block in <code>docker-compose.yml</code>, then <code>docker compose up --build</code>.</li>
+    <li><b>GCP:</b> export them before the deploy script (pass-through is wired):
+      <code>LLM_PROVIDER=openai OPENAI_API_KEY=sk-... bash deploy-gcp.sh</code></li>
+  </ul>
+  <div class="callout"><b>Verify:</b> <code>curl &lt;url&gt;/api/health</code> → <code>"provider": "openai"</code>.
+  <b>Production keys:</b> use Secret Manager (<code>--set-secrets=OPENAI_API_KEY=…</code>), not plaintext env.
+  FinOps cost rows exist for <code>gpt-4o(/mini)</code> and <code>claude-3-5-sonnet/haiku</code>.</div>
+</section>
+
+<section>
+  <h2><span class="num">7</span> Platform support &amp; extending to AWS/Azure</h2>
+  <table>
+    <tr><th>Platform</th><th>Compute</th><th>Silver data</th><th>Status</th></tr>
+    <tr><td><b>GCP</b></td><td>Cloud Run</td><td>BigQuery</td><td><span class="bdg ok">Done · verified</span></td></tr>
+    <tr><td><b>Databricks</b> (AWS/Azure/GCP-hosted)</td><td>Databricks Apps</td><td>Unity Catalog</td><td><span class="bdg pend">Mapping+views done · read-path Milestone B</span></td></tr>
+    <tr><td><b>AWS native</b></td><td>ECS / App Runner</td><td>Redshift / Snowflake</td><td><span class="bdg msb">Extension</span></td></tr>
+    <tr><td><b>Azure native</b></td><td>Container Apps</td><td>Synapse / Fabric</td><td><span class="bdg msb">Extension</span></td></tr>
+  </table>
+  <p><b>Adding a platform = 3 pieces, no app rewrite:</b> (1) <code>deployment/config/&lt;platform&gt;/silver.config.json</code>;
+  (2) <code>backend/code/platform_adapters/&lt;platform&gt;_adapter.py</code> implementing the 5-method
+  <code>CatalogAdapter</code> + register in <code>get_adapter()</code>; (3) a deploy branch in <code>driver.py</code>.</p>
+</section>
+
+<section>
+  <h2><span class="num">8</span> Verification status</h2>
+  <table>
+    <tr><th>Check</th><th>Method</th><th>Result</th></tr>
+    <tr><td>Backend modules + scripts compile</td><td>py_compile</td><td><span class="bdg ok">PASS</span></td></tr>
+    <tr><td>LLM switch — gemini default → openai/anthropic, per-agent overrides</td><td>host test</td><td><span class="bdg ok">PASS</span></td></tr>
+    <tr><td>Data seam — default + <code>SEMANTIC_DS</code> override</td><td>live BigQuery</td><td><span class="bdg ok">PASS · 34/569</span></td></tr>
+    <tr><td>Mapping introspect via runner</td><td>live BigQuery</td><td><span class="bdg ok">PASS · 34/569</span></td></tr>
+    <tr><td>Driver dispatch (gcp / local)</td><td>dry-run</td><td><span class="bdg ok">PASS</span></td></tr>
+    <tr><td>Backend image build (litellm install)</td><td>docker build</td><td><span class="bdg pend">RUN AT DEPLOY (non-fatal)</span></td></tr>
+    <tr><td>Databricks app read-path</td><td>—</td><td><span class="bdg msb">MILESTONE B</span></td></tr>
+  </table>
+</section>
+
+<section>
+  <h2><span class="num">9</span> Implementation reference (file map)</h2>
+  <h3>New modules (app-imported, in <code>backend/code/</code>)</h3>
+  <p><code>orchestrator_service/silver_target.py</code> · <code>orchestrator_service/model_provider.py</code> ·
+  <code>platform_adapters/{__init__,base,bigquery_adapter,databricks_adapter}.py</code> · <code>mapping_tools.py</code></p>
+  <h3>Minimal core edits (additive, backwards-compatible)</h3>
+  <table>
+    <tr><th>File</th><th>Change</th></tr>
+    <tr><td><code>agent_tools.py</code></td><td>import <code>SEMANTIC_DS</code>/<code>DECISIONS_DS</code> from the seam (defensive fallback)</td></tr>
+    <tr><td><code>data_pipeline.py</code></td><td>seam import; <code>fetch_data_dictionary</code> uses <code>{semantic_dataset()}</code>; <code>MODEL_PRICES</code> + cross-provider <code>_est_cost</code></td></tr>
+    <tr><td><code>agents.py</code></td><td>6 agents build via <code>build_model()</code>; <code>schema_mapping</code> agent registered</td></tr>
+    <tr><td><code>main.py</code></td><td>direct chat / fulfillment calls via <code>model_provider.complete()</code>; <code>/health</code> reads <code>LLM_PROVIDER</code></td></tr>
+    <tr><td><code>backend/Dockerfile</code></td><td>COPY the new modules; non-fatal constrained <code>litellm</code> install</td></tr>
+    <tr><td><code>deploy.sh</code> · <code>deploy-gcp.sh</code> · <code>cloudbuild.yaml</code></td><td>thread <code>LLM_*</code> env; cloudbuild <code>AI_PROVIDER=claude</code> landmine fixed → Gemini default</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2><span class="num">10</span> Status / out of scope</h2>
+  <ul>
+    <li><b>GCP</b> end-to-end &amp; verified. <b>Databricks</b> mapping + view creation done; the app's read-path against Unity Catalog is <b>Milestone B</b> (the seam is in place).</li>
+    <li>Gemini is the default everywhere; non-Gemini providers need <code>litellm</code> installed + a key.</li>
+    <li><b>Out of scope:</b> live SAP execution (still mocked); stale <code>tiger_semantic</code> snapshots (data-team refresh).</li>
+  </ul>
+  <div class="foot">CFR Agentic AI — Customer Supply · Deployment Package (consolidated). Runbook: <code>deployment/STEPS.md</code> ·
+  contract: <code>deployment/data-model.md</code> · entry point: <code>deployment/scripts/driver.sh</code>.</div>
+</section>
+
+</body></html>

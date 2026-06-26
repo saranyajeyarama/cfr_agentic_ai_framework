@@ -35,3 +35,8 @@ python-dateutil==2.9.0.post0
 # Linear programming solver for the Fulfillment Simulator (Phase 1).
 # Ships with the bundled CBC solver — no system packages required.
 pulp>=2.7,<3.0
+
+# Provider-agnostic LLM access for non-Gemini models (OpenAI, Anthropic, Azure, …)
+# via ADK's LiteLlm wrapper is installed SEPARATELY and NON-FATALLY in
+# backend/Dockerfile (constrained by these pins) so a resolver conflict can never
+# break the build. Gemini (the default) never imports it. Keys come from env.

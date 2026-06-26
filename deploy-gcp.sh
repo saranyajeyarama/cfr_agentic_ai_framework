@@ -22,10 +22,10 @@
 #     (run ./deploy.sh once if not).
 #
 # Usage:
-#   ./deploy-v2-3-local.sh                       # build + deploy v2.3 frontend
-#   PROJECT_ID=my-project ./deploy-v2-3-local.sh
-#   TAG=v2.3.1 ./deploy-v2-3-local.sh
-#   DEPLOY_BACKEND=1 ./deploy-v2-3-local.sh       # also rebuild + redeploy backend
+#   ./deploy-gcp.sh                       # build + deploy v2.3 frontend
+#   PROJECT_ID=my-project ./deploy-gcp.sh
+#   TAG=v2.3.1 ./deploy-gcp.sh
+#   DEPLOY_BACKEND=1 ./deploy-gcp.sh       # also rebuild + redeploy backend
 # =============================================================================
 
 set -euo pipefail
@@ -83,6 +83,11 @@ if [[ "${DEPLOY_BACKEND}" == "1" ]]; then
   BACKEND_ENV="${BACKEND_ENV},OTEL_SDK_DISABLED=true"
   BACKEND_ENV="${BACKEND_ENV},AGENT_CONCURRENCY=${AGENT_CONCURRENCY}"
   BACKEND_ENV="${BACKEND_ENV},TOOL_ROW_CAP=${TOOL_ROW_CAP}"
+  # Multi-provider LLM (model_provider.py) — passed through ONLY when set, so the
+  # Gemini default is unchanged. To use OpenAI/Anthropic: export LLM_PROVIDER + the key.
+  [[ -n "${LLM_PROVIDER:-}" ]]      && BACKEND_ENV="${BACKEND_ENV},LLM_PROVIDER=${LLM_PROVIDER}"
+  [[ -n "${OPENAI_API_KEY:-}" ]]    && BACKEND_ENV="${BACKEND_ENV},OPENAI_API_KEY=${OPENAI_API_KEY}"
+  [[ -n "${LLM_MODEL_DEFAULT:-}" ]] && BACKEND_ENV="${BACKEND_ENV},LLM_MODEL_DEFAULT=${LLM_MODEL_DEFAULT}"
 
   echo "[backend] Deploying Cloud Run service..."
   gcloud run deploy "${BACKEND_SERVICE}" \

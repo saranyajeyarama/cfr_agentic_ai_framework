@@ -61,8 +61,15 @@ _tool_log = _logging.getLogger(__name__)
 # Connection constants
 # ---------------------------------------------------------------------------
 PROJECT_ID = os.environ.get("PROJECT_ID", "resilience-riskradar")
-SEMANTIC_DS = f"{PROJECT_ID}.tiger_semantic"
-DECISIONS_DS = f"{PROJECT_ID}.tiger_decisions"
+# Silver (read) + decisions (write) dataset ids — resolved via the silver_target
+# seam so a deployment can repoint at a virtual Silver layer with the SEMANTIC_DS
+# env var (DEPLOY.md Option B). Defensive fallback keeps identical env-aware
+# defaults if the shared module isn't importable.
+try:
+    from silver_target import SEMANTIC_DS, DECISIONS_DS
+except Exception:
+    SEMANTIC_DS = os.environ.get("SEMANTIC_DS") or f"{PROJECT_ID}.tiger_semantic"
+    DECISIONS_DS = os.environ.get("DECISIONS_DS") or f"{PROJECT_ID}.tiger_decisions"
 
 # Demo anchor — see resolve_demo_scenario(). Pinned via env once chosen.
 DEMO_SOLD_TO = os.environ.get("DEMO_SOLD_TO")        # e.g. "0001000245"

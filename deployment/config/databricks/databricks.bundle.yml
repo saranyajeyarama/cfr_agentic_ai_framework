@@ -1,0 +1,19 @@
+# Databricks Asset Bundle (DAB) — deploys the backend as a Databricks App.
+# Skeleton/template: fill <...> and `databricks bundle deploy -t dev`.
+# Docs: https://docs.databricks.com/dev-tools/bundles/
+bundle:
+  name: tiger-cfr-agentic
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://<workspace>.cloud.databricks.com
+
+resources:
+  apps:
+    tiger_orchestrator:
+      name: tiger-orchestrator
+      description: "CFR Agentic AI orchestrator (FastAPI + ADK) on Databricks Apps"
+      source_code_path: ../../backend
+      # Runtime config is in databricks.app.yaml (command + env).

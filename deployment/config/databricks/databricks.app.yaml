@@ -1,0 +1,21 @@
+# Databricks Apps manifest — runs the FastAPI backend as a Databricks App.
+# The command launches the same uvicorn entrypoint as the container (main:app).
+# Databricks Apps inject DATABRICKS_APP_PORT; bind to it (here shown as 8000).
+# Replace <...> placeholders; inject DATABRICKS_TOKEN via a Databricks secret.
+name: tiger-orchestrator
+command:
+  - uvicorn
+  - main:app
+  - --host
+  - "0.0.0.0"
+  - --port
+  - "8000"
+env:
+  - name: DEPLOY_PLATFORM
+    value: databricks
+  - name: AI_PROVIDER
+    value: gemini
+  - name: SEMANTIC_DS
+    value: <client_catalog>.tiger_semantic
+  - name: DECISIONS_DS
+    value: <client_catalog>.tiger_decisions

@@ -17,6 +17,7 @@ substitutions:
   _BACKEND_SERVICE: tiger-orchestrator
   _FRONTEND_SERVICE: tiger-frontend
   _BACKEND_SA: tiger-agents-sa@resilience-riskradar.iam.gserviceaccount.com
+  _LLM_PROVIDER: gemini      # gemini (default) | openai | anthropic | …  (provider keys via Secret Manager)
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -80,7 +81,10 @@ steps:
       - --concurrency=80
       - --min-instances=0
       - --max-instances=10
-      - --set-env-vars=PROJECT_ID=$PROJECT_ID,PROMPTS_DIR=/app/agents,AI_PROVIDER=claude
+      # Gemini is the default. For OpenAI/Anthropic: --substitutions=_LLM_PROVIDER=openai
+      # AND wire the key via Secret Manager (do NOT put keys in substitutions), e.g. add arg:
+      #   - --set-secrets=OPENAI_API_KEY=openai-api-key:latest
+      - --set-env-vars=PROJECT_ID=$PROJECT_ID,PROMPTS_DIR=/app/agents,LLM_PROVIDER=${_LLM_PROVIDER},AI_PROVIDER=${_LLM_PROVIDER}
       - --quiet
     waitFor: [push-backend]
 

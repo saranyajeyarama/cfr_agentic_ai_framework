@@ -79,6 +79,16 @@ if [[ -n "${ANTHROPIC_API_KEY}" ]]; then
   BACKEND_ENV="${BACKEND_ENV},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
 fi
 
+# Multi-provider LLM (model_provider.py) — passed through ONLY when set, so the
+# Gemini default is unchanged. LLM_PROVIDER overrides AI_PROVIDER; the factory
+# reads provider keys (OPENAI_API_KEY) and per-agent LLM_MODEL_* / LLM_MODEL_DEFAULT.
+LLM_PROVIDER="${LLM_PROVIDER:-}"
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+LLM_MODEL_DEFAULT="${LLM_MODEL_DEFAULT:-}"
+[[ -n "${LLM_PROVIDER}"      ]] && BACKEND_ENV="${BACKEND_ENV},LLM_PROVIDER=${LLM_PROVIDER}"
+[[ -n "${OPENAI_API_KEY}"    ]] && BACKEND_ENV="${BACKEND_ENV},OPENAI_API_KEY=${OPENAI_API_KEY}"
+[[ -n "${LLM_MODEL_DEFAULT}" ]] && BACKEND_ENV="${BACKEND_ENV},LLM_MODEL_DEFAULT=${LLM_MODEL_DEFAULT}"
+
 echo "[3/5] Deploying backend Cloud Run service (private, AI_PROVIDER=${AI_PROVIDER})..."
 gcloud run deploy "${BACKEND_SERVICE}" \
   --image="${BACKEND_IMAGE}" \

@@ -32,6 +32,13 @@ COPY code/orchestrator_service/requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip \
     && pip install -r /app/requirements.txt
 
+# Optional: provider-agnostic LLM access (OpenAI/Anthropic/… via ADK LiteLlm).
+# Installed under the existing pins as CONSTRAINTS and NON-FATAL — a resolver
+# conflict can never break the build, and Gemini (the default) never imports it.
+# To require it instead, move "litellm>=1.40,<2.0" back into requirements.txt.
+RUN pip install -c /app/requirements.txt "litellm>=1.40,<2.0" \
+    || echo "WARN: litellm not installed under current pins; non-Gemini providers unavailable until installed"
+
 # Agent tools (the single tool layer — sits at /app so it imports flat)
 COPY code/agent_tools.py /app/agent_tools.py
 
@@ -47,6 +54,13 @@ COPY code/orchestrator_service/fulfillment_optimizer.py /app/fulfillment_optimiz
 COPY code/orchestrator_service/_v23_adapter.py     /app/_v23_adapter.py
 COPY code/orchestrator_service/main.py             /app/main.py
 COPY code/orchestrator_service/logging_config.py   /app/logging_config.py
+
+# Deployment package v2 — data seam, LLM provider factory, Option-B mapping
+# (imported by the running app, so they must sit on the flat /app path)
+COPY code/orchestrator_service/silver_target.py    /app/silver_target.py
+COPY code/orchestrator_service/model_provider.py   /app/model_provider.py
+COPY code/mapping_tools.py                          /app/mapping_tools.py
+COPY code/platform_adapters/                        /app/platform_adapters/
 
 # Log directory — writable by the app user. The RotatingFileHandler writes
 # here if LOG_FILE_PATH is set; silently skipped if not mounted in Cloud Run.

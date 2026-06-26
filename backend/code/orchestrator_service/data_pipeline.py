@@ -40,7 +40,14 @@ except Exception:  # never let an absent optional module break the whole pipelin
     sap_translation = None  # type: ignore
 
 PROJECT_ID   = os.environ.get("PROJECT_ID", "resilience-riskradar")
-SEMANTIC_DS  = f"{PROJECT_ID}.tiger_semantic"
+# Silver (read) layer id — resolved via the silver_target seam (env-overridable for
+# a virtual Silver layer; DEPLOY.md Option B). Defensive fallback = identical default.
+try:
+    from silver_target import SEMANTIC_DS, semantic_dataset
+except Exception:
+    SEMANTIC_DS = os.environ.get("SEMANTIC_DS") or f"{PROJECT_ID}.tiger_semantic"
+    def semantic_dataset() -> str:
+        return SEMANTIC_DS.split(".")[-1]
 
 log = logging.getLogger(__name__)
 
@@ -1843,17 +1850,27 @@ _case_log_ready = {"submission": False, "suggestion": False, "acceptance": False
 
 # Per-1M-token USD prices — illustrative; tune to the contract. Used for est_cost_usd.
 MODEL_PRICES = {
-    "gemini-2.5-pro":   {"in": 1.25, "cached_in": 0.31,  "out": 10.0},
-    "gemini-2.5-flash": {"in": 0.30, "cached_in": 0.075, "out": 2.50},
-    "_default":         {"in": 0.30, "cached_in": 0.075, "out": 2.50},
+    "gemini-2.5-pro":    {"in": 1.25, "cached_in": 0.31,  "out": 10.0},
+    "gemini-2.5-flash":  {"in": 0.30, "cached_in": 0.075, "out": 2.50},
+    # Other providers (LLM_PROVIDER != gemini) — illustrative per-1M USD; tune to contract.
+    "gpt-4o-mini":       {"in": 0.15, "cached_in": 0.075, "out": 0.60},
+    "gpt-4o":            {"in": 2.50, "cached_in": 1.25,  "out": 10.0},
+    "claude-3-5-haiku":  {"in": 0.80, "cached_in": 0.08,  "out": 4.00},
+    "claude-3-5-sonnet": {"in": 3.00, "cached_in": 0.30,  "out": 15.0},
+    "_default":          {"in": 0.30, "cached_in": 0.075, "out": 2.50},
 }
 
 
 def _est_cost(model, input_tokens, cached_tokens, output_tokens) -> float:
     m = (model or "").lower()
-    price = (MODEL_PRICES["gemini-2.5-pro"] if "pro" in m
-             else MODEL_PRICES["gemini-2.5-flash"] if "flash" in m
-             else MODEL_PRICES["_default"])
+    bare = m.split("/")[-1]   # strip any provider prefix (e.g. "openai/gpt-4o")
+    # Longest matching model key wins; else fall back to the pro/flash family or default.
+    price = next((v for k, v in sorted(MODEL_PRICES.items(), key=lambda kv: -len(kv[0]))
+                  if k != "_default" and k in bare), None)
+    if price is None:
+        price = (MODEL_PRICES["gemini-2.5-pro"] if "pro" in m
+                 else MODEL_PRICES["gemini-2.5-flash"] if "flash" in m
+                 else MODEL_PRICES["_default"])
     billable_in = max(0, _safe_int(input_tokens) - _safe_int(cached_tokens))
     return round((billable_in * price["in"]
                   + _safe_int(cached_tokens) * price["cached_in"]
@@ -2298,17 +2315,17 @@ def fetch_data_dictionary() -> dict:
     not document are returned null (the UI shows '—').
     """
     cc = _bq_client()
-    cols = _run(cc, """
+    cols = _run(cc, f"""
         SELECT table_name, column_name, data_type, is_nullable, ordinal_position
-        FROM tiger_semantic.INFORMATION_SCHEMA.COLUMNS
+        FROM {semantic_dataset()}.INFORMATION_SCHEMA.COLUMNS
         ORDER BY table_name, ordinal_position
     """)
     # Parse lineage from each view's DDL (best-effort; degrades to null per field).
     lineage: dict[str, dict] = {}
     try:
-        for vr in _run(cc, """
+        for vr in _run(cc, f"""
             SELECT table_name, view_definition
-            FROM tiger_semantic.INFORMATION_SCHEMA.VIEWS
+            FROM {semantic_dataset()}.INFORMATION_SCHEMA.VIEWS
         """):
             lineage[vr.get("table_name") or ""] = _parse_view_lineage(vr.get("view_definition") or "")
     except Exception as exc:
